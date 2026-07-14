@@ -1,5 +1,9 @@
 # Infrared Small Target Detection with Scale and Location Sensitivity
 
+> The result in the notice below is the original upstream MSHNet/IRSTD-1K
+> release result. It is not an RC-IRSTD result and is not evidence for the
+> experimental risk-calibration extension documented later in this README.
+
 ## Notice! 📰
 First of all, thank you to all relevant workers for your attention. Recently, many people have discovered some obvious errors in the code, so we re-checked, modified and debugged the code. Surprisingly, we unexpectedly obtained a pretty good result on the IRSTD-1k data set. The results are published below for your reference.
 | Dataset         | mIoU (x10(-2)) | Pd (x10(-2))|  Fa (x10(-6)) | Weights|
@@ -63,7 +67,14 @@ official test split.
 
 ## RC-IRSTD research extension (experimental)
 
-This worktree also contains an experimental, budget-aware cross-domain deployment pipeline. It is not part of the original CVPR 2024 release. The direct threshold calibrator remains a baseline. An end-to-end `monotone_pixel` calibrator is available as a method candidate, but its current objective is still asymmetric oracle-threshold regression plus reject BCE; the query risk-aligned loss remains a separate evidence gate and must not be claimed as completed.
+This worktree also contains an experimental, budget-aware cross-domain
+deployment pipeline. It is not part of the original CVPR 2024 release. The
+direct and reject-based calibrators remain baselines. The primary Stage-2 path
+is now `monotone_pixel_no_reject`: it predicts the complete inverse pixel-risk
+curve, trains against hash-bound query risk/Pd curves, and selects checkpoints
+by native-resolution exact replay in the fixed order BSR, LogExcess, then Pd.
+This is an implemented method candidate, not evidence of accuracy; paper
+claims still require the registered real-data LODO experiments.
 
 Install the local requirements and run the regression suite:
 
@@ -84,13 +95,12 @@ python -m scripts.audit_aaai_protocol \
 ```
 
 Train a balanced multi-source detector without constructing any target/test
-loader or selecting a checkpoint on target labels. The explicit `margin`
-candidate compares hard target-object logits against the background local-peak
-tail in logit-difference space; a common logit shift therefore cancels. Its
-reduction order is fixed as image first, equal-image domain mean, then the
-normalized smooth worst-domain aggregation. `--risk-objective separate`
-remains the default compatibility baseline and keeps the original probability-
-space background-tail and miss losses separate.
+loader or selecting a checkpoint on target labels. The final `margin`
+objective first forms domain-level target lower-tail and background local-peak
+upper-tail statistics, then applies the separation hinge and normalized smooth
+worst-domain aggregation. GT dilation excludes ambiguous near-target
+background and deterministic plateau collapse prevents repeated equal-score
+peaks. `--risk-objective separate` remains the compatibility baseline.
 
 ```bash
 python -m scripts.train_multisource_tail \
@@ -151,9 +161,10 @@ ordered IDs, and every selected raw-image hash. Any train/test ID or image-byte
 overlap is fatal. Meta episodes using this proof are schema v4; legacy v3
 episodes remain readable only for diagnostics and cannot train a calibrator.
 
-The monotone method path uses the pixel false-alarm budget only. It predicts
-threshold and rejection curves that cannot decrease as the pixel budget is
-tightened, and prohibits extrapolation outside the frozen grid. Traditional
+The primary monotone method uses the pixel false-alarm budget only. It predicts
+a complete threshold curve that cannot decrease as the pixel budget is
+tightened, has no Reject head, and prohibits budget extrapolation outside the
+frozen grid. Traditional
 connected-component false alarms remain a compatibility evaluation metric:
 their counts can rise when a threshold fragments one region, so they must not
 be presented as a strictly monotone inverse-risk constraint.
@@ -162,15 +173,15 @@ grid; grid coverage, ordering, interpolation policy, and policy SHA are bound
 into the checkpoint and independently replayed online.
 
 ```bash
-python -m rc.train_calibrator \
+python -m rc.train_calibrator_risk_aligned \
   --episodes outputs/episodes/outer-nuaa.jsonl \
   --val-pseudo-target <HELD_OUT_PSEUDO_TARGET> \
+  --artifact-root outputs/episodes \
   --output-dir outputs/rc/outer-nuaa \
   --deployment-detector-checkpoint-sha <SHA256> \
   --deployment-detector-source-domain IRSTD-1K \
   --deployment-detector-source-domain NUDT-SIRST \
   --deployment-source-reference outputs/references/outer-nuaa.npz \
-  --calibrator-model monotone_pixel \
   --pixel-budget-grid 1e-4 1e-5 1e-6
 ```
 
@@ -183,8 +194,8 @@ manifests and meta episodes before any claim-bearing calibration run.
 Export native-resolution continuous score maps. This inference stage is
 structurally label-free: it neither resolves masks nor embeds them in score
 NPZ files. Before opening final-target labels, freeze the calibrator,
-context/query sizes, budgets, rejection rule, and the resulting online adapter
-JSON:
+context/query sizes, budgets, evaluation contract, and the resulting
+no-Reject online adapter JSON:
 
 ```bash
 python -m evaluation.export_score_maps \
@@ -244,9 +255,10 @@ sweep is globally exact. Verified episode construction rederives the threshold
 plan and every curve field from the bound query scores and labels before
 selecting an oracle. Hand-asserted or mismatched provenance is rejected.
 
-Replay verifies the actual calibrator checkpoint SHA and deterministically reruns
-the context-to-threshold/reject decision on CPU before opening the independent
-query-label artifact. A rejected decision returns without opening that artifact.
+Replay verifies the actual calibrator checkpoint SHA and deterministically
+reruns the context-to-threshold decision on CPU before opening the independent
+query-label artifact. Legacy reject-based baselines retain coverage-aware
+handling; the v5 primary path contains no reject score, cutoff, or decision.
 Manifest order is reported as `prefix_holdout` by default; the optional
 `--assert-temporal-order` records a user assertion, not independent temporal
 verification.

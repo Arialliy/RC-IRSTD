@@ -14,4 +14,5 @@ exec "$python_bin" -m scripts.train_multisource_tail \
   --device cuda \
   --data-parallel \
   --batch-per-domain 3 \
+  --risk-objective margin \
   "$@"

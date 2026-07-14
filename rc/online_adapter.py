@@ -16,7 +16,9 @@ import torch.nn as nn
 
 from data_ext.dataset_identity import sha256_file
 from data_ext.score_manifest_artifacts import verify_score_manifest_artifacts
+from losses.calibrator_risk import calibrator_risk_capability_contract
 from model.monotone_pixel_calibrator import (
+    MonotoneNoRejectPixelRiskCalibrator,
     MonotonePixelRiskCalibrator,
     pixel_budget_from_spec,
 )
@@ -36,13 +38,21 @@ from .schema import (
     DeploymentProtocolContract,
     EVALUATION_MATCHING_CONTRACT_VERSION,
     FoldContract,
+    NO_REJECT_ONLINE_DECISION_CONTRACT_VERSION,
+    NoRejectDeploymentProtocolContract,
     ONLINE_DECISION_CONTRACT_VERSION,
+    OFFICIAL_TRAIN_SPLIT_ROLE,
     REJECT_COMPARISON_RULE,
     REJECT_SCORE_RULE,
     SCHEMA_VERSION,
     SourceReference,
     StatisticsConfig,
+    canonicalize_episode_score_split_contract,
 )
+
+
+NO_REJECT_CALIBRATOR_FORMAT = "rc-irstd.calibrator.v5"
+NO_REJECT_CALIBRATOR_MODEL = "monotone_pixel_no_reject"
 
 
 def causal_partition(
@@ -263,6 +273,308 @@ def _deployment_protocol_contract(
     return contract
 
 
+def _no_reject_deployment_protocol_contract(
+    checkpoint: Mapping[str, Any],
+    *,
+    required: bool,
+) -> NoRejectDeploymentProtocolContract | None:
+    """Load the no-abstention protocol without inventing a reject cutoff."""
+
+    payload = checkpoint.get("deployment_protocol_contract")
+    if payload is None:
+        if required:
+            raise ValueError(
+                "claim-bearing no-reject adaptation requires a frozen "
+                "deployment_protocol_contract"
+            )
+        return None
+    if not isinstance(payload, Mapping):
+        raise TypeError("checkpoint deployment_protocol_contract must be a mapping")
+    contract = NoRejectDeploymentProtocolContract.from_dict(payload)
+    training_config = checkpoint.get("training_config")
+    if not isinstance(training_config, Mapping):
+        raise TypeError("checkpoint training_config must be a mapping")
+    forbidden_top_level = {
+        "reject_probability",
+        "reject_cutoff",
+        "reject_score",
+        "reject_comparison",
+        "p_min",
+    }.intersection(checkpoint)
+    forbidden_training = {
+        "reject_probability",
+        "reject_cutoff",
+        "reject_weight",
+        "threshold_on_reject",
+        "reject_score",
+        "reject_comparison",
+        "p_min",
+    }.intersection(training_config)
+    if forbidden_top_level or forbidden_training:
+        raise ValueError(
+            "no-reject checkpoint contains abstention metadata: "
+            f"top_level={sorted(forbidden_top_level)}, "
+            f"training_config={sorted(forbidden_training)}"
+        )
+    if "evaluation_matching_rule" in training_config and str(
+        training_config["evaluation_matching_rule"]
+    ) != contract.matching_rule:
+        raise ValueError(
+            "deployment protocol matching rule conflicts with training_config"
+        )
+    if "evaluation_centroid_distance" in training_config and not math.isclose(
+        float(training_config["evaluation_centroid_distance"]),
+        contract.centroid_distance,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "deployment protocol centroid distance conflicts with training_config"
+        )
+    return contract
+
+
+def _sha256_contract_value(value: Any, name: str) -> str:
+    result = str(value).lower()
+    if len(result) != 64 or any(
+        character not in "0123456789abcdef" for character in result
+    ):
+        raise ValueError(f"{name} must be 64 lowercase hexadecimal characters")
+    return result
+
+
+def _validated_no_reject_training_contract(
+    checkpoint: Mapping[str, Any],
+    budget_contract: Mapping[str, Any],
+) -> None:
+    """Prove that a v5 artifact is the integrated final method, not a relabel.
+
+    Architecture identity alone cannot establish query-risk-aligned training
+    or official-train-only model selection.  These immutable records are
+    therefore mandatory before a v5 bundle is accepted for deployment.
+    """
+
+    required = {
+        "risk_loss_contract",
+        "official_train_score_provenance",
+        "reject_head",
+        "artifact_root_persisted",
+        "train_pseudo_targets",
+        "validation_pseudo_targets",
+        "train_group_provenance",
+        "validation_group_provenance",
+        "checkpoint_selection_order",
+        "risk_guarantee",
+        "epoch",
+        "best_epoch",
+        "best_rank",
+        "validation_metrics",
+    }
+    missing = required.difference(checkpoint)
+    if missing:
+        raise KeyError(
+            "schema-v5 checkpoint is missing integrated-method evidence: "
+            f"{sorted(missing)}"
+        )
+    if checkpoint["reject_head"] is not False:
+        raise ValueError("schema-v5 checkpoint must declare reject_head=false")
+    if checkpoint["artifact_root_persisted"] is not False:
+        raise ValueError("schema-v5 checkpoint must not persist artifact_root")
+    if not isinstance(checkpoint["risk_loss_contract"], Mapping):
+        raise TypeError("schema-v5 risk_loss_contract must be a mapping")
+    if dict(checkpoint["risk_loss_contract"]) != (
+        calibrator_risk_capability_contract()
+    ):
+        raise ValueError("schema-v5 risk_loss_contract is invalid")
+    if checkpoint["checkpoint_selection_order"] != ["BSR", "LogExcess", "Pd"]:
+        raise ValueError("schema-v5 checkpoint selection order is invalid")
+    if checkpoint["risk_guarantee"] != "empirical_meta_calibration_not_certified":
+        raise ValueError("schema-v5 risk guarantee must remain empirical")
+    for name, expected in (
+        ("method_supports_reject", False),
+        ("grouped_complete_curve_supervision", True),
+        ("query_supervision", "verified_event_exact_or_global_exact"),
+        ("checkpoint_selection", "exact_native_replay_BSR_LogExcess_Pd"),
+    ):
+        if budget_contract.get(name) != expected:
+            raise ValueError(f"schema-v5 monotone budget contract has invalid {name}")
+
+    training = checkpoint["training_config"]
+    if not isinstance(training, Mapping):
+        raise TypeError("schema-v5 training_config must be a mapping")
+    required_training = {
+        "query_curve_mode": "verified_event_exact",
+        "hard_replay": "native_resolution_every_epoch",
+        "threshold_semantics": "prediction = probability > threshold",
+    }
+    for name, expected in required_training.items():
+        if training.get(name) != expected:
+            raise ValueError(f"schema-v5 training_config has invalid {name}")
+    if tuple(float(value) for value in training.get("pixel_budget_grid", ())) != tuple(
+        float(value) for value in budget_contract["grid"]
+    ):
+        raise ValueError("schema-v5 training and monotone budget grids disagree")
+
+    train_targets = tuple(str(value) for value in checkpoint["train_pseudo_targets"])
+    validation_targets = tuple(
+        str(value) for value in checkpoint["validation_pseudo_targets"]
+    )
+    if (
+        not train_targets
+        or not validation_targets
+        or len(set(train_targets)) != len(train_targets)
+        or len(set(validation_targets)) != len(validation_targets)
+        or set(train_targets).intersection(validation_targets)
+    ):
+        raise ValueError("schema-v5 train/validation pseudo-target split is invalid")
+    calibration_targets = tuple(
+        str(value) for value in checkpoint["calibration_pseudo_targets"]
+    )
+    if set(calibration_targets) != set(train_targets).union(validation_targets):
+        raise ValueError("schema-v5 calibration pseudo-target union is invalid")
+
+    audit = checkpoint["official_train_score_provenance"]
+    if not isinstance(audit, Mapping):
+        raise TypeError("schema-v5 official_train_score_provenance must be a mapping")
+    if (
+        audit.get("schema_version")
+        != "rc-irstd.calibrator-official-train-provenance.v1"
+        or audit.get("required_episode_schema") != SCHEMA_VERSION
+        or audit.get("required_score_split_role") != OFFICIAL_TRAIN_SPLIT_ROLE
+        or audit.get("pseudo_target_validation_may_select_best_checkpoint") is not True
+        or audit.get("official_test_scores_consumed") is not False
+    ):
+        raise ValueError("schema-v5 official-train provenance header is invalid")
+    target_audit = audit.get("pseudo_targets")
+    if not isinstance(target_audit, Mapping) or set(target_audit) != set(
+        calibration_targets
+    ):
+        raise ValueError("schema-v5 official-train pseudo-target audit is incomplete")
+    total_episodes = 0
+    for target in calibration_targets:
+        row = target_audit[target]
+        if not isinstance(row, Mapping):
+            raise TypeError("official-train pseudo-target audit rows must be mappings")
+        expected_partition = (
+            "calibrator_train" if target in train_targets else "pseudo_target_validation"
+        )
+        if row.get("partition") != expected_partition:
+            raise ValueError("official-train pseudo-target partition is invalid")
+        count = row.get("num_episodes")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("official-train num_episodes must be positive")
+        total_episodes += count
+        split = canonicalize_episode_score_split_contract(row.get("split_contract"))
+        if split["role"] != OFFICIAL_TRAIN_SPLIT_ROLE:
+            raise ValueError("schema-v5 calibration consumed a non-train score split")
+        canonical = json.dumps(
+            split,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        if _sha256_contract_value(
+            row.get("split_contract_sha256"), "split_contract_sha256"
+        ) != hashlib.sha256(canonical).hexdigest():
+            raise ValueError("official-train split contract SHA-256 is invalid")
+    if audit.get("num_episodes") != total_episodes:
+        raise ValueError("official-train aggregate episode count is invalid")
+
+    provenance_targets: set[str] = set()
+    for partition_name, expected_targets in (
+        ("train_group_provenance", set(train_targets)),
+        ("validation_group_provenance", set(validation_targets)),
+    ):
+        rows = checkpoint[partition_name]
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(f"schema-v5 {partition_name} must be a non-empty list")
+        observed_targets: set[str] = set()
+        group_ids: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise TypeError(f"schema-v5 {partition_name} rows must be mappings")
+            group_id = str(row.get("group_id", ""))
+            target = str(row.get("pseudo_target", ""))
+            if not group_id or group_id in group_ids or not target:
+                raise ValueError(f"schema-v5 {partition_name} group identity is invalid")
+            group_ids.add(group_id)
+            observed_targets.add(target)
+            context_ids = tuple(str(value) for value in row.get("context_image_ids", ()))
+            query_ids = tuple(str(value) for value in row.get("query_image_ids", ()))
+            if (
+                not context_ids
+                or not query_ids
+                or set(context_ids).intersection(query_ids)
+            ):
+                raise ValueError("schema-v5 group context/query binding is invalid")
+            for hash_name in (
+                "curve_file_sha256",
+                "curve_manifest_sha256",
+                "query_score_manifest_sha256",
+                "label_manifest_sha256",
+                "label_manifest_content_sha256",
+            ):
+                _sha256_contract_value(row.get(hash_name), hash_name)
+        if observed_targets != expected_targets:
+            raise ValueError(f"schema-v5 {partition_name} target set is invalid")
+        provenance_targets.update(observed_targets)
+    if provenance_targets != set(calibration_targets):
+        raise ValueError("schema-v5 group provenance target coverage is invalid")
+
+    raw_protocol = checkpoint.get("deployment_protocol_contract")
+    if not isinstance(raw_protocol, Mapping):
+        raise TypeError("schema-v5 deployment_protocol_contract must be a mapping")
+    protocol = NoRejectDeploymentProtocolContract.from_dict(raw_protocol)
+    for partition_name in (
+        "train_group_provenance",
+        "validation_group_provenance",
+    ):
+        for row in checkpoint[partition_name]:
+            if row.get("matching_rule") != protocol.matching_rule or not math.isclose(
+                float(row.get("centroid_distance", float("nan"))),
+                protocol.centroid_distance,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "schema-v5 query-curve matching differs from deployment protocol"
+                )
+
+    epoch = checkpoint["epoch"]
+    best_epoch = checkpoint["best_epoch"]
+    if (
+        isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or epoch < 0
+        or epoch != best_epoch
+    ):
+        raise ValueError("schema-v5 deployment requires the selected best checkpoint")
+    best_rank = checkpoint["best_rank"]
+    metrics = checkpoint["validation_metrics"]
+    if not isinstance(best_rank, list) or len(best_rank) != 3:
+        raise ValueError("schema-v5 best_rank must contain BSR, -LogExcess, and Pd")
+    if not isinstance(metrics, Mapping) or metrics.get("checkpoint_selection_order") != [
+        "BSR",
+        "LogExcess",
+        "Pd",
+    ]:
+        raise ValueError("schema-v5 validation exact-replay record is invalid")
+    metric_rank = metrics.get("rank_key")
+    if not isinstance(metric_rank, list) or len(metric_rank) != 3:
+        raise ValueError("schema-v5 validation exact replay is missing rank_key")
+    if any(
+        not math.isfinite(float(observed))
+        or not math.isclose(
+            float(observed), float(expected), rel_tol=0.0, abs_tol=1e-12
+        )
+        for observed, expected in zip(best_rank, metric_rank)
+    ):
+        raise ValueError("schema-v5 best_rank differs from exact hard replay")
+
+
 def _validated_monotone_budget_contract(
     checkpoint: Mapping[str, Any],
     model: MonotonePixelRiskCalibrator,
@@ -346,7 +658,6 @@ def load_calibrator_bundle(
         "statistics_feature_names",
         "input_feature_names",
         "statistics_config",
-        "p_min",
         "outer_fold_id",
         "outer_target",
         "episode_collection_provenance",
@@ -366,6 +677,7 @@ def load_calibrator_bundle(
     if format_version not in {
         "rc-irstd.calibrator.v3",
         "rc-irstd.calibrator.v4",
+        NO_REJECT_CALIBRATOR_FORMAT,
     }:
         raise ValueError("unsupported calibrator checkpoint format_version")
     collection_sha = str(checkpoint["episode_collection_sha256"])
@@ -384,6 +696,8 @@ def load_calibrator_bundle(
         )
     )
     if format_version == "rc-irstd.calibrator.v3":
+        if "p_min" not in checkpoint:
+            raise KeyError("schema-v3 calibrator checkpoint is missing p_min")
         if calibrator_model != "direct":
             raise ValueError("schema-v3 calibrator checkpoint must use direct model")
         model: nn.Module = ThresholdCalibrator(
@@ -391,7 +705,9 @@ def load_calibrator_bundle(
             hidden_dim=int(checkpoint["hidden_dim"]),
             dropout=float(checkpoint["dropout"]),
         )
-    else:
+    elif format_version == "rc-irstd.calibrator.v4":
+        if "p_min" not in checkpoint:
+            raise KeyError("schema-v4 calibrator checkpoint is missing p_min")
         if calibrator_model != "monotone_pixel":
             raise ValueError(
                 "schema-v4 calibrator checkpoint must use monotone_pixel model"
@@ -412,14 +728,39 @@ def load_calibrator_bundle(
         if dict(capability) != expected_capability:
             raise ValueError("schema-v4 calibrator capability contract disagrees")
         _validated_monotone_budget_contract(checkpoint, model)
+    else:
+        if calibrator_model != NO_REJECT_CALIBRATOR_MODEL:
+            raise ValueError(
+                "schema-v5 calibrator checkpoint must use "
+                f"{NO_REJECT_CALIBRATOR_MODEL}"
+            )
+        raw_model_config = checkpoint.get("model_config")
+        if not isinstance(raw_model_config, Mapping):
+            raise TypeError("schema-v5 checkpoint model_config must be a mapping")
+        model = MonotoneNoRejectPixelRiskCalibrator(**dict(raw_model_config))
+        if model.context_feature_dim != int(checkpoint["input_dim"]):
+            raise ValueError("schema-v5 model_config input dimension disagrees")
+        capability = checkpoint.get("capability_contract")
+        if not isinstance(capability, Mapping):
+            raise TypeError(
+                "schema-v5 checkpoint capability_contract must be a mapping"
+            )
+        expected_capability = model.capability_contract()
+        if dict(capability) != expected_capability:
+            raise ValueError("schema-v5 calibrator capability contract disagrees")
+        budget_contract = _validated_monotone_budget_contract(checkpoint, model)
+        _validated_no_reject_training_contract(checkpoint, budget_contract)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()
     standardizer = FeatureStandardizer.from_dict(checkpoint["standardizer"])
     if tuple(checkpoint["input_feature_names"]) != standardizer.feature_names:
         raise ValueError("checkpoint input feature names disagree with standardizer")
     _deployment_contract(checkpoint)
-    _checkpoint_reject_cutoff(checkpoint)
-    _deployment_protocol_contract(checkpoint, required=False)
+    if format_version == NO_REJECT_CALIBRATOR_FORMAT:
+        _no_reject_deployment_protocol_contract(checkpoint, required=False)
+    else:
+        _checkpoint_reject_cutoff(checkpoint)
+        _deployment_protocol_contract(checkpoint, required=False)
     return model, standardizer, checkpoint
 
 
@@ -458,47 +799,67 @@ def adapt_context_to_query(
     deployment_fold, embedded_reference = _deployment_contract(checkpoint_metadata)
     if not isinstance(claim_bearing, bool):
         raise TypeError("claim_bearing must be boolean")
-    checkpoint_cutoff = _checkpoint_reject_cutoff(checkpoint_metadata)
-    frozen_protocol = _deployment_protocol_contract(
-        checkpoint_metadata,
-        required=claim_bearing,
-    )
-    override_requested = reject_probability is not None
-    requested_cutoff = (
-        checkpoint_cutoff
-        if reject_probability is None
-        else float(reject_probability)
-    )
-    if not math.isfinite(requested_cutoff) or not 0.0 <= requested_cutoff <= 1.0:
-        raise ValueError("reject_probability must lie in [0, 1]")
+    no_reject_model = isinstance(model, MonotoneNoRejectPixelRiskCalibrator)
+    if no_reject_model:
+        if str(checkpoint_metadata["format_version"]) != NO_REJECT_CALIBRATOR_FORMAT:
+            raise ValueError("no-reject model requires a schema-v5 checkpoint")
+        if reject_probability is not None:
+            raise ValueError(
+                "--reject-probability is invalid for the no-reject calibrator"
+            )
+        frozen_protocol: (
+            DeploymentProtocolContract | NoRejectDeploymentProtocolContract | None
+        ) = _no_reject_deployment_protocol_contract(
+            checkpoint_metadata,
+            required=claim_bearing,
+        )
+        override_requested = False
+        cutoff = None
+        cutoff_source = None
+    else:
+        checkpoint_cutoff = _checkpoint_reject_cutoff(checkpoint_metadata)
+        frozen_protocol = _deployment_protocol_contract(
+            checkpoint_metadata,
+            required=claim_bearing,
+        )
+        override_requested = reject_probability is not None
+        requested_cutoff = (
+            checkpoint_cutoff
+            if reject_probability is None
+            else float(reject_probability)
+        )
+        if not math.isfinite(requested_cutoff) or not 0.0 <= requested_cutoff <= 1.0:
+            raise ValueError("reject_probability must lie in [0, 1]")
+        if claim_bearing:
+            assert isinstance(frozen_protocol, DeploymentProtocolContract)
+            if not math.isclose(
+                requested_cutoff,
+                frozen_protocol.reject_cutoff,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "claim-bearing final-target adaptation cannot override the "
+                    "checkpoint reject cutoff"
+                )
+            cutoff = frozen_protocol.reject_cutoff
+            cutoff_source = "checkpoint.deployment_protocol_contract.reject_cutoff"
+        else:
+            cutoff = requested_cutoff
+            cutoff_source = (
+                "diagnostic_runtime_override"
+                if override_requested
+                else (
+                    "checkpoint.reject_probability"
+                    if "reject_probability" in checkpoint_metadata
+                    else "checkpoint.training_config.reject_probability"
+                )
+            )
     if claim_bearing:
         assert frozen_protocol is not None
         frozen_protocol.assert_runtime_sizes(
             context_size=len(context_ids),
             query_size=len(query_ids),
-        )
-        if not math.isclose(
-            requested_cutoff,
-            frozen_protocol.reject_cutoff,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            raise ValueError(
-                "claim-bearing final-target adaptation cannot override the "
-                "checkpoint reject cutoff"
-            )
-        cutoff = frozen_protocol.reject_cutoff
-        cutoff_source = "checkpoint.deployment_protocol_contract.reject_cutoff"
-    else:
-        cutoff = requested_cutoff
-        cutoff_source = (
-            "diagnostic_runtime_override"
-            if override_requested
-            else (
-                "checkpoint.reject_probability"
-                if "reject_probability" in checkpoint_metadata
-                else "checkpoint.training_config.reject_probability"
-            )
         )
     matching_override_requested = (
         matching_rule is not None or centroid_distance is not None
@@ -636,7 +997,10 @@ def adapt_context_to_query(
     expected_statistics_names = tuple(checkpoint_metadata["statistics_feature_names"])
     if statistics.feature_names != expected_statistics_names:
         raise ValueError("online statistics schema differs from calibrator checkpoint")
-    if isinstance(model, MonotonePixelRiskCalibrator):
+    if isinstance(
+        model,
+        (MonotonePixelRiskCalibrator, MonotoneNoRejectPixelRiskCalibrator),
+    ):
         pixel_budget = pixel_budget_from_spec(budgets)
         raw_feature_values = tuple(float(value) for value in statistics.vector)
     elif isinstance(model, ThresholdCalibrator):
@@ -649,7 +1013,22 @@ def adapt_context_to_query(
     raw_features = np.asarray(raw_feature_values, dtype=np.float64)[None, :]
     normalised = standardizer.transform(raw_features).astype(np.float32)
     features = torch.from_numpy(normalised).to(device)
-    if isinstance(model, MonotonePixelRiskCalibrator):
+    if isinstance(model, MonotoneNoRejectPixelRiskCalibrator):
+        assert pixel_budget is not None
+        budget_model_contract = _validated_monotone_budget_contract(
+            checkpoint_metadata, model
+        )
+        output = model(
+            features,
+            pixel_budgets=torch.tensor(
+                [[pixel_budget]], dtype=torch.float64, device=device
+            ),
+        )
+        if output.requested_thresholds is None:
+            raise RuntimeError("no-reject monotone calibrator returned no threshold")
+        threshold_value = float(output.requested_thresholds[0, 0].cpu())
+        probability = None
+    elif isinstance(model, MonotonePixelRiskCalibrator):
         assert pixel_budget is not None
         budget_model_contract: dict[str, Any] | None = (
             _validated_monotone_budget_contract(checkpoint_metadata, model)
@@ -680,8 +1059,12 @@ def adapt_context_to_query(
         "target_override_allowed": False if claim_bearing else True,
         "runtime_override_requested": matching_override_requested,
     }
-    decision_contract = {
-        "schema_version": ONLINE_DECISION_CONTRACT_VERSION,
+    decision_contract: dict[str, Any] = {
+        "schema_version": (
+            NO_REJECT_ONLINE_DECISION_CONTRACT_VERSION
+            if no_reject_model
+            else ONLINE_DECISION_CONTRACT_VERSION
+        ),
         "claim_bearing": claim_bearing,
         "claim_eligibility": (
             "claim_eligible_frozen_checkpoint_protocol"
@@ -700,26 +1083,35 @@ def adapt_context_to_query(
             if claim_bearing
             else "diagnostic_runtime"
         ),
-        "reject_rule": {
+        "evaluation_matching": evaluation_contract,
+        "budget_model": budget_model_contract,
+    }
+    if no_reject_model:
+        decision_contract["reject_supported"] = False
+    else:
+        assert probability is not None and cutoff is not None
+        legacy_protocol = (
+            frozen_protocol
+            if isinstance(frozen_protocol, DeploymentProtocolContract)
+            else None
+        )
+        decision_contract["reject_rule"] = {
             "score": (
-                frozen_protocol.reject_score
-                if frozen_protocol is not None
+                legacy_protocol.reject_score
+                if legacy_protocol is not None
                 else REJECT_SCORE_RULE
             ),
             "comparison": (
-                frozen_protocol.reject_comparison
-                if frozen_protocol is not None
+                legacy_protocol.reject_comparison
+                if legacy_protocol is not None
                 else REJECT_COMPARISON_RULE
             ),
             "cutoff": cutoff,
             "cutoff_source": cutoff_source,
             "target_override_allowed": False if claim_bearing else True,
             "runtime_override_requested": override_requested,
-        },
-        "evaluation_matching": evaluation_contract,
-        "budget_model": budget_model_contract,
-    }
-    return {
+        }
+    result = {
         "schema_version": SCHEMA_VERSION,
         "mode": "asserted_temporal_prefix" if temporal_order_asserted else "prefix_holdout",
         "protocol": (
@@ -771,16 +1163,25 @@ def adapt_context_to_query(
             "query_first_image_id": query_ids[0],
         },
         "budgets": budgets.to_dict(),
-        "p_min": float(checkpoint_metadata["p_min"]),
         "statistics_config": statistics_config.to_dict(),
         "source_reference": source_reference.to_dict(),
         "threshold": threshold_value,
-        "reject_probability": probability,
-        "reject_cutoff": cutoff,
-        "reject": probability >= cutoff,
         "statistics_feature_names": list(statistics.feature_names),
         "statistics_metadata": dict(statistics.metadata or {}),
     }
+    if no_reject_model:
+        result["no_reject"] = True
+    else:
+        assert probability is not None and cutoff is not None
+        result.update(
+            {
+                "p_min": float(checkpoint_metadata["p_min"]),
+                "reject_probability": probability,
+                "reject_cutoff": cutoff,
+                "reject": probability >= cutoff,
+            }
+        )
+    return result
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -807,8 +1208,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--reject-probability",
         type=float,
         help=(
-            "Diagnostic cutoff override. In claim-bearing mode, an explicitly "
-            "supplied value must equal the checkpoint-frozen cutoff."
+            "Legacy reject-baseline diagnostic cutoff override. In claim-bearing "
+            "legacy mode it must equal the checkpoint-frozen cutoff; it is "
+            "invalid for schema-v5 no-reject checkpoints."
         ),
     )
     parser.add_argument(

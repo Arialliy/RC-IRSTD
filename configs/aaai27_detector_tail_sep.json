@@ -1,0 +1,21 @@
+{
+  "schema_version": "rc-irstd.aaai27-detector-config.v1",
+  "risk_objective": "margin",
+  "objective": "domain_target_background_tail_separation",
+  "lambda_margin": 0.1,
+  "target_background_margin_logit": 1.0,
+  "background_tail_fraction": 0.01,
+  "hard_object_fraction": 0.2,
+  "object_top_pixel_fraction": 0.25,
+  "peak_kernel_size": 3,
+  "gt_exclusion_radius": 2,
+  "plateau_atol": 0.0,
+  "smooth_worst_domain_gamma": 10.0,
+  "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+  "gpu_contract": {
+    "physical_devices": [0, 1, 2],
+    "launcher": "scripts/train_rc_3gpu.sh",
+    "data_parallel": true,
+    "batch_per_domain": 3
+  }
+}

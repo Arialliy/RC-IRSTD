@@ -30,6 +30,10 @@ DETECTOR_PROTOCOL_SCOPES = (
 )
 DEPLOYMENT_PROTOCOL_CONTRACT_VERSION = "rc-irstd.deployment-protocol.v1"
 ONLINE_DECISION_CONTRACT_VERSION = "rc-irstd.online-decision.v1"
+NO_REJECT_DEPLOYMENT_PROTOCOL_CONTRACT_VERSION = (
+    "rc-irstd.no-reject-deployment-protocol.v1"
+)
+NO_REJECT_ONLINE_DECISION_CONTRACT_VERSION = "rc-irstd.no-reject-online-decision.v1"
 CAUSAL_PARTITION_RULE = "ordered_manifest_prefix_context_then_contiguous_query"
 REJECT_SCORE_RULE = "sigmoid_reject_logit"
 REJECT_COMPARISON_RULE = "greater_than_or_equal"
@@ -726,6 +730,132 @@ class DeploymentProtocolContract:
             matching_rule=str(evaluation_matching["matching_rule"]),
             centroid_distance=float(evaluation_matching["centroid_distance"]),
             target_reject_cutoff_override_allowed=override_allowed,
+        )
+
+
+@dataclass(frozen=True)
+class NoRejectDeploymentProtocolContract:
+    """Frozen target-time protocol for the final no-abstention method.
+
+    Unlike :class:`DeploymentProtocolContract`, this contract deliberately has
+    no reject score, cutoff, comparison, or target override.  Keeping a
+    separate schema makes the absence of a reject head machine-verifiable
+    instead of encoding no-reject as a special cutoff value.
+    """
+
+    context_size: int
+    query_size: int
+    partition_rule: str = CAUSAL_PARTITION_RULE
+    matching_rule: str = DEFAULT_MATCHING_RULE
+    centroid_distance: float = DEFAULT_CENTROID_DISTANCE
+    schema_version: str = NO_REJECT_DEPLOYMENT_PROTOCOL_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != NO_REJECT_DEPLOYMENT_PROTOCOL_CONTRACT_VERSION:
+            raise ValueError(
+                "unsupported no-reject deployment protocol schema_version: "
+                f"{self.schema_version!r}"
+            )
+        for name, value in (
+            ("context_size", self.context_size),
+            ("query_size", self.query_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"deployment {name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"deployment {name} must be positive")
+        if self.partition_rule != CAUSAL_PARTITION_RULE:
+            raise ValueError("unsupported deployment causal partition rule")
+        if self.matching_rule not in {"overlap", "centroid"}:
+            raise ValueError("deployment matching_rule must be 'overlap' or 'centroid'")
+        distance = _finite_float(
+            self.centroid_distance, "deployment centroid_distance"
+        )
+        if distance <= 0.0:
+            raise ValueError("deployment centroid_distance must be positive")
+
+    def assert_runtime_sizes(self, *, context_size: int, query_size: int) -> None:
+        observed = (int(context_size), int(query_size))
+        expected = (self.context_size, self.query_size)
+        if observed != expected:
+            raise ValueError(
+                "online context/query sizes differ from the frozen no-reject "
+                f"deployment contract: observed={observed}, expected={expected}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "context_size": self.context_size,
+            "query_size": self.query_size,
+            "partition_rule": self.partition_rule,
+            "reject_supported": False,
+            "evaluation_matching": {
+                "schema_version": EVALUATION_MATCHING_CONTRACT_VERSION,
+                "matching_rule": self.matching_rule,
+                "centroid_distance": self.centroid_distance,
+            },
+        }
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, Any]
+    ) -> "NoRejectDeploymentProtocolContract":
+        forbidden = {
+            "reject_cutoff",
+            "reject_probability",
+            "reject_score",
+            "reject_comparison",
+            "reject_rule",
+            "target_reject_cutoff_override_allowed",
+            "p_min",
+        }.intersection(payload)
+        if forbidden:
+            raise ValueError(
+                "no-reject deployment protocol contains abstention fields: "
+                f"{sorted(forbidden)}"
+            )
+        required = {
+            "schema_version",
+            "context_size",
+            "query_size",
+            "partition_rule",
+            "reject_supported",
+            "evaluation_matching",
+        }
+        missing = required.difference(payload)
+        if missing:
+            raise KeyError(
+                "no-reject deployment protocol contract is missing: "
+                f"{sorted(missing)}"
+            )
+        if payload["reject_supported"] is not False:
+            raise ValueError(
+                "no-reject deployment protocol must declare reject_supported=false"
+            )
+        matching = payload["evaluation_matching"]
+        if not isinstance(matching, Mapping):
+            raise TypeError("deployment evaluation_matching must be a mapping")
+        matching_required = {
+            "schema_version",
+            "matching_rule",
+            "centroid_distance",
+        }
+        matching_missing = matching_required.difference(matching)
+        if matching_missing:
+            raise KeyError(
+                "deployment evaluation matching contract is missing: "
+                f"{sorted(matching_missing)}"
+            )
+        if matching["schema_version"] != EVALUATION_MATCHING_CONTRACT_VERSION:
+            raise ValueError("unsupported evaluation matching contract schema_version")
+        return cls(
+            schema_version=str(payload["schema_version"]),
+            context_size=payload["context_size"],
+            query_size=payload["query_size"],
+            partition_rule=str(payload["partition_rule"]),
+            matching_rule=str(matching["matching_rule"]),
+            centroid_distance=float(matching["centroid_distance"]),
         )
 
 

@@ -41,7 +41,10 @@ from losses.hard_target_loss import hard_target_miss_loss
 from losses.local_peak_cvar import domain_pixel_tail_risks, domain_tail_risks
 from losses.schedules import linear_risk_weight
 from losses.smooth_worst_domain import smooth_worst_domain
-from losses.target_background_margin import domain_target_background_margin_risks
+from losses.target_background_margin import (
+    DomainTailSeparationOutput,
+    domain_tail_separation_loss,
+)
 from model.MSHNet import MSHNet
 from model.loss import SLSIoULoss
 from utils.data import IRSTD_Dataset
@@ -102,13 +105,13 @@ def parse_args() -> argparse.Namespace:
         "--risk-warmup-epochs",
         type=int,
         default=6,
-        help="Number of initial epochs with zero tail/miss risk gradient.",
+        help="Number of initial epochs with zero auxiliary risk gradient.",
     )
     parser.add_argument(
         "--risk-ramp-epochs",
         type=int,
         default=10,
-        help="Linear ramp length for tail/miss weights after risk warm-up.",
+        help="Linear ramp length for the selected risk objective after warm-up.",
     )
     parser.add_argument("--base-size", type=int, default=256)
     parser.add_argument("--crop-size", type=int, default=256)
@@ -119,8 +122,9 @@ def parse_args() -> argparse.Namespace:
         choices=("separate", "margin"),
         default="separate",
         help=(
-            "Risk formulation: the unchanged separate background-tail + hard-miss "
-            "baseline, or the shift-invariant target--background logit margin candidate."
+            "Risk formulation: 'separate' keeps the legacy background-tail + "
+            "hard-miss baseline; 'margin' is the final domain-level two-tail "
+            "logit-separation objective (domain tails are formed before the hinge)."
         ),
     )
     parser.add_argument(
@@ -136,13 +140,25 @@ def parse_args() -> argparse.Namespace:
         "--target-background-margin",
         type=float,
         default=1.0,
-        help="Required hard-target minus background-tail separation in logit units.",
+        help=(
+            "Required domain target-lower-tail minus domain background-upper-tail "
+            "separation in logit units."
+        ),
     )
     parser.add_argument("--tail-q", type=float, default=0.01)
     parser.add_argument("--miss-q", type=float, default=0.2)
     parser.add_argument("--object-pixel-q", type=float, default=0.25)
     parser.add_argument("--tail-gamma", type=float, default=10.0)
     parser.add_argument("--peak-kernel-size", type=int, default=3)
+    parser.add_argument(
+        "--exclusion-radius",
+        type=int,
+        default=2,
+        help=(
+            "GT dilation radius in pixels for background candidates in the final "
+            "margin objective."
+        ),
+    )
     parser.add_argument("--peak-min-score", type=float, default=0.05)
     parser.add_argument("--plateau-atol", type=float, default=0.0)
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
@@ -187,6 +203,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         or not np.isfinite(args.target_background_margin)
     ):
         raise ValueError("--target-background-margin must be finite and non-negative")
+    if args.exclusion_radius < 0:
+        raise ValueError("--exclusion-radius must be non-negative")
     if args.grad_clip_norm < 0.0:
         raise ValueError("--grad-clip-norm cannot be negative")
     canonical_sources = [
@@ -400,26 +418,40 @@ def compute_domain_tail_risks(
     )
 
 
+def compute_domain_margin_output(
+    args: argparse.Namespace,
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    domain_ids: torch.Tensor,
+) -> DomainTailSeparationOutput:
+    """Final two-tail margin with the hinge applied after domain aggregation."""
+
+    return domain_tail_separation_loss(
+        logits,
+        masks,
+        domain_ids,
+        margin=args.target_background_margin,
+        background_tail_fraction=args.tail_q,
+        hard_object_fraction=args.miss_q,
+        object_top_fraction=args.object_pixel_q,
+        peak_kernel_size=args.peak_kernel_size,
+        exclusion_radius=getattr(args, "exclusion_radius", 2),
+        worst_gamma=args.tail_gamma,
+        plateau_atol=args.plateau_atol,
+    )
+
+
 def compute_domain_margin_risks(
     args: argparse.Namespace,
     logits: torch.Tensor,
     masks: torch.Tensor,
     domain_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Image-first, domain-balanced target--background logit margins."""
+    """Return valid domain gaps and IDs for backward-compatible diagnostics."""
 
-    return domain_target_background_margin_risks(
-        logits,
-        masks,
-        domain_ids,
-        background_q=args.tail_q,
-        target_q=args.miss_q,
-        object_pixel_fraction=args.object_pixel_q,
-        margin=args.target_background_margin,
-        kernel_size=args.peak_kernel_size,
-        plateau_atol=args.plateau_atol,
-        return_domain_ids=True,
-    )
+    output = compute_domain_margin_output(args, logits, masks, domain_ids)
+    valid = output.valid_domain_mask
+    return output.domain_gap[valid], output.domain_ids[valid]
 
 
 def risk_objective_contract(args: argparse.Namespace) -> Dict[str, object]:
@@ -427,17 +459,29 @@ def risk_objective_contract(args: argparse.Namespace) -> Dict[str, object]:
 
     if args.risk_objective == "margin":
         return {
-            "name": "target_background_tail_margin",
-            "candidate_status": "explicit_nondefault_candidate",
+            "name": "domain_target_background_tail_separation",
+            "candidate_status": "final_primary_objective_explicit_nondefault_cli",
             "score_space": "logit_difference",
             "common_logit_shift_invariant": True,
-            "background_summary": "deterministic_local_peak_top_fraction",
-            "target_summary": "hard_object_bottom_fraction_of_top_pixel_logits",
-            "aggregation": "image_first_then_equal_image_domain_mean_then_normalized_smooth_worst_domain",
-            "empty_target_or_background": "graph_connected_zero",
+            "background_summary": (
+                "per_image_deterministic_local_peak_top_fraction_after_gt_dilation"
+            ),
+            "target_summary": "domain_hard_object_bottom_fraction_of_top_pixel_logits",
+            "aggregation": (
+                "equal_image_background_domain_mean_and_equal_object_target_tail_"
+                "then_domain_hinge_then_normalized_smooth_worst_valid_domain"
+            ),
+            "hinge_level": "domain_after_two_tail_aggregation",
+            "target_free_image": "contributes_background_tail",
+            "target_free_domain": "background_diagnostic_only_excluded_from_hinge",
+            "plateau_rule": "one_deterministic_8_connected_representative",
             "background_q": args.tail_q,
             "target_q": args.miss_q,
             "object_pixel_fraction": args.object_pixel_q,
+            "peak_kernel_size": getattr(args, "peak_kernel_size", 3),
+            "gt_exclusion_radius": getattr(args, "exclusion_radius", 2),
+            "plateau_atol": getattr(args, "plateau_atol", 0.0),
+            "normalized_smooth_max_gamma": getattr(args, "tail_gamma", 10.0),
             "margin_logit": args.target_background_margin,
             "lambda_margin": args.lambda_margin,
         }
@@ -597,18 +641,21 @@ def train_one_epoch(
         )
         graph_zero = final_logits.sum() * 0.0
         if args.risk_objective == "margin":
-            per_domain_risks, represented_ids = compute_domain_margin_risks(
+            margin_output = compute_domain_margin_output(
                 args,
                 final_logits,
                 masks,
                 domain_ids,
             )
-            loss_margin = smooth_worst_domain(
-                per_domain_risks,
-                gamma=args.tail_gamma,
-            )
-            # Do not silently blend the separate probability objectives into
-            # the explicit margin candidate.
+            valid_domains = margin_output.valid_domain_mask
+            per_domain_risks = margin_output.domain_gap[valid_domains]
+            represented_ids = margin_output.domain_ids[valid_domains]
+            # The output already applies the normalized smooth worst-domain
+            # reduction over valid domain-level hinges.  Reducing it again
+            # here would change the declared final objective.
+            loss_margin = margin_output.loss
+            # Do not silently blend legacy probability objectives into the
+            # final domain-level margin objective.
             loss_tail = graph_zero
             loss_miss = graph_zero
             loss = loss_sls + risk_weight * args.lambda_margin * loss_margin

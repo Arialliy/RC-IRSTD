@@ -1,0 +1,32 @@
+{
+  "schema_version": "rc-irstd.aaai27-calibrator-config.v1",
+  "method": "monotone_pixel_no_reject",
+  "format_version": "rc-irstd.calibrator.v5",
+  "pixel_budget_grid": [0.0001, 0.00001, 0.000001],
+  "hidden_dim": 192,
+  "dropout": 0.1,
+  "loss": {
+    "lambda_violation": 4.0,
+    "lambda_utility": 1.0,
+    "lambda_oracle": 0.1,
+    "lambda_smoothness": 0.01,
+    "lambda_coverage": 4.0,
+    "oracle_huber_delta": 1.0
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 5.0,
+    "batch_size": 16,
+    "epochs": 100,
+    "patience": 20
+  },
+  "query_supervision": "verified_event_exact_or_global_exact",
+  "hard_replay": "native_resolution_every_epoch",
+  "threshold_semantics": "prediction = probability > threshold",
+  "checkpoint_selection_order": ["BSR_max", "LogExcess_min", "Pd_max"],
+  "reject_head": false,
+  "component_budget_role": "compatibility_evaluation_only",
+  "guarantee_claim": "empirical_meta_calibration_not_certified"
+}

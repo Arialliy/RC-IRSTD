@@ -14,6 +14,19 @@ review_basis: "2026-07-14 local code audit + official AAAI-27 timetable"
 > 分析日期：2026 年 7 月 14 日  
 > 核心判断：**方向可以冲 AAAI，但不建议按当前方案原样投稿。**
 
+> **2026-07-14 实施更新：** 本文建议的 two-stage/no-Reject 主路径现已在
+> 当前工作树完成代码闭环：Stage 1 域级双尾分离、Stage 2 完整预算单调曲线、
+> verified query-risk-aligned loss、原尺寸 exact replay、BSR → LogExcess → Pd
+> 选点以及 v5 无 Reject 在线协议均已实现并加入回归测试。这里的“已实现”仅指
+> 工程与协议可执行；真实 LODO、基线、消融、统计显著性和理论分析仍未完成，
+> 因而总体投稿判断仍保持“完成证据后再投”。实现契约见
+> `docs/AAAI27_TWO_STAGE_NO_REJECT_IMPLEMENTATION.md`。
+
+> **阅读约定：** 第 4--9 节保留的是实施前的审查推理，其中未特别标注的
+> “当前方案/当前损失/当前实现”均指原审查对象，而不是上面的已更新工作树。
+> 实际代码状态以本更新、1.2 节和第 10 节状态表为准；保留原问题描述是为了
+> 让设计选择可追溯，而不是再次声称这些模块尚未实现。
+
 ---
 
 ## 目录
@@ -22,12 +35,12 @@ review_basis: "2026-07-14 local code audit + official AAAI-27 timetable"
 2. [AAAI-27 投稿约束](#2-aaai-27-投稿约束)
 3. [为什么该方向具备 AAAI 潜力](#3-为什么该方向具备-aaai-潜力)
 4. [当前方案中应保留的部分](#4-当前方案中应保留的部分)
-5. [当前版本最严重的技术问题](#5-当前版本最严重的技术问题)
+5. [修改前版本的关键技术问题](#5-修改前版本的关键技术问题)
 6. [推荐的 AAAI 版核心方法](#6-推荐的-aaai-版核心方法)
 7. [Reject 机制的处理建议](#7-reject-机制的处理建议)
 8. [AAAI 所需实验包](#8-aaai-所需实验包)
 9. [评价指标的重新组织](#9-评价指标的重新组织)
-10. [代码方案中必须立即修正的问题](#10-代码方案中必须立即修正的问题)
+10. [原审计问题与当前落实状态](#10-原审计问题与当前落实状态)
 11. [论文定位、题目与投稿关键词](#11-论文定位题目与投稿关键词)
 12. [推荐的三条论文贡献](#12-推荐的三条论文贡献)
 13. [建议加入的理论结果](#13-建议加入的理论结果)
@@ -81,7 +94,7 @@ review_basis: "2026-07-14 local code audit + official AAAI-27 timetable"
 | 问题重要性 | 高 | 基本满足 |
 | IRSTD 领域内新颖性 | 较高 | 基本满足 |
 | 对广义 AI 社区的意义 | 中等 | 需要重新抽象问题 |
-| 方法严谨性 | 中等偏低 | 必须修正 episode、oracle 与损失 |
+| 方法严谨性 | 代码合同已闭环，科学证据未闭环 | 完成真实 outer-fold 实证与形式化边界分析 |
 | 理论完整性 | 偏弱 | 至少加入不可识别性命题 |
 | 实验说服力 | 尚未形成闭环 | 需要严格 external unseen-domain 与 causal protocol |
 | 工程可复现性 | 较好 | 保持，具体实现细节放补充材料 |
@@ -89,13 +102,14 @@ review_basis: "2026-07-14 local code audit + official AAAI-27 timetable"
 
 ## 1.2 代码审计后的边界（2026-07-14）
 
-本文后续的“建议方法”不等于“已实现方法”。当前工作树应按以下三层理解：
+原审查稿中的“建议方法”当时不等于“已实现方法”；经本轮落实后，当前工作树
+应按以下三层理解：
 
 | 层级 | 当前状态 | 可用范围 |
 |---|---|---|
 | 评估与协议基础 | 已有原分辨率、严格无标签 score export，独立 hash-bound label attachment，双虚警指标、support/query 拆分、固定最后 checkpoint 和无标签统计的代码 | 可做可重复性 smoke test 与基线实验；仍不等于已得到科学结果 |
 | RC 直接阈值校准器 | 作为最小基线保留；必须通过跨域溯源、query replay 和独立外层目标审计后才能进入主表 | 不得写成单调逆风险曲线 |
-| AAAI 升级版 | 单调逆风险曲线、风险对齐损失、尾部间隔学习和可识别性分析尚待独立实现与实证 | 只能作为 RC-v2/候选主方法，不得标记为已完成 |
+| AAAI 升级版 | 单调逆风险曲线、风险对齐损失与域级尾部间隔学习已实现；可识别性分析与真实实证仍缺 | 可标记为“方法实现完成/实验 TBD”，不得写成有效性已证实 |
 
 截至本次审计，本地可直接验证的数据域只有 IRSTD-1K、NUDT-SIRST 和 NUAA-SIRST。固定一个 outer target 后只剩两个源域，再做 inner LODO 时 detector 只有一个训练域。这可用于显式标记的诊断/smoke test，但不足以支撑 AAAI 主结论。第四个合法独立域只是严格 inner-LODO 能运行的最低配置；推荐主证据仍是至少 4 个 meta-source 加 3 个额外 external unseen targets。
 
@@ -313,11 +327,14 @@ P_t(S>\tau,Y=1).
 
 ---
 
-# 5. 当前版本最严重的技术问题
+# 5. 修改前版本的关键技术问题
 
-# 5.1 元训练 episode 与 causal 测试不一致
+> 本节保留实施前的风险定义与评审理由。对应问题是否已经在代码层处理，
+> 统一以第 10 节状态表为准；尚缺真实实验的项目仍不得视为科学结论。
 
-当前元训练逻辑大致是：
+# 5.1 修改前元训练 episode 与 causal 测试不一致
+
+修改前的元训练逻辑大致是：
 
 1. 从伪目标域抽取一个窗口；
 2. 用该窗口的无标签图像计算统计；
@@ -380,13 +397,15 @@ g_\phi(z(S),B)
 \text{future query}.
 \]
 
-这是整个方案最优先、最不能妥协的修正。
+这是整个方案最优先、最不能妥协的修正。当前 schema-v4 builder 与 grouped
+loader 已强制 disjoint context/query、official-train-only 和 hash-bound query
+labels；真实 nested-LODO artifacts 仍须按该合同生成并归档。
 
 ---
 
-# 5.2 Oracle threshold 与 reject 定义存在逻辑矛盾
+# 5.2 旧 direct/reject 基线的 Oracle 与 reject 矛盾
 
-当前方案定义：
+修改前 direct/reject 路径定义：
 
 \[
 \tau_B^*
@@ -431,6 +450,10 @@ P_{\min}
 其含义是：
 
 > 预算可以通过空预测满足，但当前域不存在同时具有安全性和有效检测能力的非退化工作点。
+
+v5 主路径已经删除 Reject head、cutoff、`p_min` 与 target-time override；本节
+仅保留为旧 v3/v4 reject 基线的定义审计。旧基线若进入消融表，仍必须遵守
+下述 oracle/reject 语义。
 
 ## Oracle 的建议定义
 
@@ -485,9 +508,9 @@ F_a^Q(\tau)\le B.
 
 ---
 
-# 5.4 直接回归阈值与非对称 MSE 不足以支撑风险校准
+# 5.4 旧直接阈值回归与非对称 MSE 不足以支撑风险校准
 
-当前损失主要惩罚：
+旧直接阈值基线的损失主要惩罚：
 
 \[
 (\widehat\tau-\tau^*)^2,
@@ -561,9 +584,9 @@ F_a^Q(\tau)\le B.
 
 ---
 
-# 5.5 多预算输入缺少单调性保证
+# 5.5 修改前多预算输入缺少单调性保证
 
-当前方案把 \(\log_{10}B\) 作为普通 MLP 输入，但没有保证：
+修改前方案把 \(\log_{10}B\) 作为普通 MLP 输入，但没有保证：
 
 \[
 B_1<B_2
@@ -618,11 +641,13 @@ B_1>B_2>\cdots>B_J.
 
 对训练网格之外的预算，在 \(\log B\) 空间做单调插值。
 
-这比“预算作为普通特征输入 MLP”更像完整的方法贡献。
+这比“预算作为普通特征输入 MLP”更像完整的方法贡献。当前 v5 已采用有界
+正间隔构造完整 `[J]` 曲线，并在 `log10(B)` 空间内插且禁止外推；尚待真实
+outer folds 证明这种结构约束带来风险收益，而不只是满足形状合同。
 
 ---
 
-# 5.6 Tail-CVaR 可能只学到全局降分
+# 5.6 旧 separate Tail-CVaR 可能只学到全局降分
 
 背景 Tail-CVaR 的目标是压低最高背景响应，Miss-CVaR 的目标是提高困难目标响应。方向合理，但存在退化解：
 
@@ -663,7 +688,10 @@ m
 
 > 最困难真实目标的分数仍高于最危险背景候选至少一个 margin。
 
-相较于两个独立损失，这更能解释为何低虚警区域会改善。
+相较于两个独立损失，这更能解释为何低虚警区域会改善。当前 Stage 1
+`margin` 路径已实现域级目标下尾—背景上尾间隔、GT 邻域排除与确定性 plateau
+collapse，并保持共同 logit 平移不变；是否实际改善低虚警排序仍须通过真实
+消融回答。
 
 ## 实现上还应修正
 
@@ -945,7 +973,7 @@ g_\phi(z_S,\log B).
 
 # 7. Reject 机制的处理建议
 
-当前简单 BCE reject head 会成为第三个松散模块，而且 reject 标签的原定义不充分。
+旧 v4/BCE reject head 会成为第三个松散模块，而且 reject 标签的原定义不充分。
 
 有两个可行选择。
 
@@ -1226,7 +1254,7 @@ B
 
 ---
 
-# 10. 代码方案中必须立即修正的问题
+# 10. 原审计问题与当前落实状态
 
 当前工作树对本节问题的处理状态如下。后文保留原审查理由，便于追溯为什么需要这些契约：
 
@@ -1236,12 +1264,12 @@ B
 | 10.2 空预测/高尾网格 | 已加 `0/1`、adaptive/exact query events 及 cap 审计 | 主实验需报告覆盖下界，capped 不得写 global exact |
 | 10.3 原图预算 | 已在阈值与 matching 前恢复原始 canvas；score 不再嵌入 mask，离线 label attachment 独立记录 nearest-neighbor 对齐和原 mask 尺寸 | 需在方法/补充材料报告 interpolation 与对齐统计 |
 | 10.4 plateau | detector 与 RC 统计统一为 `kernel_local_row_major_rank_nms` | 需消融证明该候选定义合理 |
-| 10.5 support/query 泄漏 | schema-v3 强制同一无标签 score manifest 的连续 context-first/query-second 窗口；query label 来自独立 attachment。Builder 重建 threshold plan、全量重扫 curve 并逐列核对，手写/篡改产物不能训练主结果 | 需生成真实 nested-LODO artifacts |
-| 10.6 sigmoid/direct head | 仍保留为 RC 最小基线 | 单调逆风险曲线尚未实现 |
+| 10.5 support/query 泄漏 | schema-v4 强制同一无标签 score manifest 的连续 context-first/query-second 窗口；query label 来自独立 attachment。Builder 重建 threshold plan、全量重扫 curve 并逐列核对，手写/篡改产物不能训练主结果 | 需生成真实 nested-LODO artifacts |
+| 10.6 sigmoid/direct head | direct/reject 路径保留为基线；v5 `monotone_pixel_no_reject` 已输出完整 `[J]` 曲线并接入风险对齐训练与部署 | 需真实实验比较 direct、旧 monotone+reject 与最终 no-Reject |
 | 10.7 source distance | 已用 permutation-invariant aggregate，并将 fold-specific domains/centers/scale/hash 嵌入 checkpoint | 需证明不只是 dataset fingerprint |
-| 10.8 component/candidate | pixel 与 8-connected component metrics 已分开 | 严格单调 candidate-risk 路径尚未实现 |
+| 10.8 component/candidate | pixel 与 8-connected component metrics 已分开；v5 严格单调约束只作用于 pixel-risk | candidate/component count 可能随阈值碎裂而非单调，因此仅作兼容评估，不伪装成逆风险约束 |
 | 数据域污染 | detector source record 已绑定 split 顺序、逐图像内容 SHA 和所选 image+mask 训练产物；target export 对所有 source image leaves 求交，改名/复制/子集碰撞均 fail closed | 需对真实数据集生成并归档 collision audit |
-| 在线后 query 评估 | 已新增 calibrator/score/label hash-bound replay；reject 时不解析、不打开 label manifest，也不输出标签指标 | 需完整外层结果与置信区间 |
+| 在线后 query 评估 | v5 主路径以 CPU 确定性重放阈值后才打开独立 query label；评估使用重放阈值而非 JSON 容差值。旧 reject 基线仍保持 rejected 分支不打开标签 | 需完整外层结果与置信区间 |
 
 ## 10.1 `SampleMeta` dataclass 与 DataLoader collate
 
@@ -1797,24 +1825,27 @@ B_1<B_2
 
 **当前方案可以发展成 AAAI 论文，但不能按现有形式直接投稿。**
 
-经过本轮代码修正，support/query、oracle/reject 和 provenance 已有可审计契约，但这些还只是“代码条件具备”，不是“论文证据已完成”。当前最可能导致 Phase 1 拒稿的原因依次是：
+经过本轮代码修正，support/query、oracle、v5 no-Reject 与 provenance 已有可审计契约，但这些还只是“代码条件具备”，不是“论文证据已完成”。当前最可能导致 Phase 1 拒稿的原因依次是：
 
-1. 手工统计加 MLP 回归阈值显得启发式；
+1. 手工统计驱动的单调曲线模型仍带有启发式色彩；
 2. 尚无完整 nested-LODO artifacts 和 external target 结果证明协议确实被遵守；
-3. 当前直接阈值基线尚未通过 query replay 证明安全性与效用的联合收益；
-4. component 风险的非单调性未处理；
-5. 阈值回归损失与真实风险不对齐；
-6. 多预算预测缺少单调性约束；
-7. 独立域数量少，窗口数量造成伪样本规模；
-8. Tail-CVaR 可能只造成整体 logit 平移；
+3. v5 尚无真实 outer-fold replay 结果证明 BSR、LogExcess 与 Pd 的联合收益；
+4. direct、旧 monotone+reject 与最终 no-Reject 尚未完成同协议对比；
+5. component/candidate count 只作为兼容指标，论文必须解释为何主约束选择 pixel risk；
+6. 风险对齐损失与结构单调性虽已实现，但其增益尚无真实消融；
+7. 独立域数量少，窗口数量可能造成伪样本规模；
+8. 域级双尾间隔能否实际改善低虚警排序尚待消融；
 9. “Risk-Calibrated” 容易被误解为形式化保证；
-10. 方法只在 IRSTD 与 MSHNet 上验证，广义 AI 意义不足。
+10. 方法若只在 IRSTD 与 MSHNet 上验证，广义 AI 意义仍不足。
 
-完成以下三项后，论文的 AAAI 匹配度会发生实质提升：
+前两项方法机制已经完成代码闭环。论文的 AAAI 匹配度现在取决于以下三个
+证据门：
 
-> **Disjoint causal meta-episodes**  
-> **Monotone inverse risk curve**  
-> **Formal identifiability analysis**
+> **真实 disjoint causal nested-LODO 与 external unseen-domain 结果**
+>
+> **单调逆风险曲线、risk loss 与域级双尾间隔的完整消融**
+>
+> **Formal identifiability analysis 与保守 claim 边界**
 
 推荐最终论文定位：
 
@@ -1928,15 +1959,20 @@ assumption, not distribution-free risk certification.
 
 # 附录 C：投稿前检查清单
 
-- [ ] support 与 query 完全独立；
-- [ ] final target 不参与任何模型选择；
-- [ ] 明确 transductive 与 causal 的区别；
-- [ ] 阈值预测满足预算单调性；
-- [ ] oracle 定义允许空预测但不把它误写为不可行；
-- [ ] reject 定义基于安全性与效用同时不可满足；
-- [ ] 主风险指标具有单调性；
-- [ ] component metric 与 candidate metric 分开；
-- [ ] 使用原始分辨率或明确等价变换；
+代码合同与回归测试已完成：
+
+- [x] schema-v4 强制 support/context 与 query 完全独立；
+- [x] claim-bearing calibration 只接受 `official_train`，最终冻结后评估只接受 `official_test`；
+- [x] v5 阈值曲线在固定 pixel-budget grid 上结构单调并禁止外推；
+- [x] oracle 允许 `threshold=1` 空预测，不把预算可满足性误写为不可行；
+- [x] v5 主方法没有 Reject head、cutoff、decision 或 `p_min`；旧 reject 路径仅作基线；
+- [x] 主约束使用单调 pixel risk，component metric 仅作兼容评估；
+- [x] 原分辨率 score/label exact replay 与 CPU 阈值复算已接通；
+
+真实投稿证据仍待完成：
+
+- [ ] 对每个真实 fold 归档 split、artifact、checkpoint 与 replay hash，证明 final target 不参与任何模型选择；
+- [ ] 在论文中明确 transductive 与 causal 的区别；
 - [ ] 报告 \(P_d\)、BSR、LogExcess 与 worst-domain result；
 - [ ] 使用至少 3 个真正 unseen domains；
 - [ ] 使用至少 3 个随机种子；

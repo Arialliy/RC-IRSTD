@@ -3,12 +3,15 @@
 > 更新：2026-07-14  
 > 性质：工程验收记录，**不是论文结果表**。除非明确写明，下列数字均不得用于支撑方法有效性或 AAAI 投稿主张。
 
-## 1. 环境
+## 1. 历史 detector smoke 环境
 
 - 容器：`rrunet-course:latest`；
 - PyTorch：2.1.2；
 - GPU：3 × NVIDIA GeForce RTX 3090（24 GiB）；
 - 工作树：包含本轮未提交修改，因此不将当前 Git revision 声称为可复现结果标识。
+
+本节环境对应第 3--4 节的历史 smoke 记录；第 5 节当前回归使用另一项目虚拟
+环境，二者不可混作同一次可复现实验。
 
 ## 2. 本地数据入口
 
@@ -21,6 +24,11 @@
 这三个域足以检查代码路径，但不足以支撑“严格 nested LODO + 至少 3 个 final unseen targets”的主结论。固定一个 outer target 后仅剩两源域，inner LODO detector 只有一个训练域；此情形只允许标记为 `single_source_inner_smoke_not_main_result`。
 
 ## 3. 风险训练 smoke test
+
+> 本节数字来自旧 `separate` Tail/Miss 路径的本地一步记录，不是最终
+> `margin` 方法。当前工作树未保留可逐项核验这些数值的原始日志、命令和
+> artifact hash，因此只作为 legacy locally-unverified engineering note
+> 留档；重新运行并归档前不得进入论文或补充材料结果表。
 
 ### 三域、单 GPU、一步
 
@@ -67,14 +75,15 @@
 
 该 5-image 曲线只用于验证高尾 event 与 manifest 契约，不是数据集性能结果。
 
-这组导出产生于严格 score/label 拆分之前，只是历史工程记录。当前 schema-v2 主协议不允许 score NPZ 嵌入 mask，因此不得把该旧产物直接改名为 verified curve/episode；必须用当前 `export_score_maps` 重新生成无标签 score，再用 `export_label_maps` 生成独立标签附件。
+这组导出产生于严格 score/label 拆分之前，只是历史工程记录。当前 schema-v3 score 主协议不允许 score NPZ 嵌入 mask，因此不得把该旧产物直接改名为 verified curve/episode；必须用当前 `export_score_maps` 重新生成无标签 score，再用 `export_label_maps` 生成独立标签附件。
 
 ## 5. 协议回归验收
 
-2026-07-14 在 `rrunet-course:latest` 中执行全量测试：
+2026-07-14 使用项目虚拟环境（Python 3.12.3，PyTorch 2.9.1+cu130）对当前
+工作树执行全量测试：
 
 ```text
-67 passed, 10 subtests passed
+139 passed, 10 subtests passed
 ```
 
 已覆盖的关键 fail-closed 路径包括：
@@ -83,7 +92,9 @@
 - 训练 source split 的逐图像内容 SHA、mask SHA 与 target/source leaf collision audit；
 - 错数据根、错 label attachment、score/label 同目录、文件篡改均被拒绝；
 - curve threshold plan、event audit、matching contract 和所有风险/计数列均从 query score+label 独立重算；
-- adapter 在 CPU 确定性复算 context 决策，reject 分支不打开 label manifest。
+- Stage 1 域级双尾分离、GT 邻域排除与 plateau collapse；
+- Stage 2 完整预算单调曲线、verified query-risk loss、原分辨率 exact replay 和 v5 no-Reject checkpoint 合同；
+- adapter 在 CPU 确定性复算 context 决策，v5 使用复算阈值评估；旧 reject 基线的 reject 分支不打开 label manifest。
 
 这些是协议与实现验收，仍不是检测/校准方法有效性证据。
 

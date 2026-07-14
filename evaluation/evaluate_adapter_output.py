@@ -46,6 +46,36 @@ _RAW_METRIC_FIELDS = (
 )
 
 
+def _is_no_reject_adapter(adapter: Mapping[str, Any]) -> bool:
+    """Validate and identify the schema-v5 no-abstention adapter."""
+
+    model = str(adapter.get("calibrator_model", ""))
+    capability = adapter.get("calibrator_capability_contract")
+    declared = adapter.get("no_reject")
+    if model != "monotone_pixel_no_reject":
+        if declared is not None:
+            raise ValueError("no_reject is only valid for monotone_pixel_no_reject")
+        return False
+    if declared is not True:
+        raise ValueError("no-reject adapter must declare no_reject=true")
+    if not isinstance(capability, Mapping):
+        raise TypeError("no-reject adapter capability contract must be a mapping")
+    if capability.get("supports_reject") is not False:
+        raise ValueError("no-reject capability must declare supports_reject=false")
+    forbidden = {
+        "reject",
+        "reject_probability",
+        "reject_cutoff",
+        "p_min",
+    }.intersection(adapter)
+    if forbidden:
+        raise ValueError(
+            "no-reject adapter must not contain abstention fields: "
+            f"{sorted(forbidden)}"
+        )
+    return True
+
+
 def evaluate_adapter_output(
     adapter_output: str | Path | Mapping[str, Any],
     score_manifest: str | Path,
@@ -111,9 +141,10 @@ def evaluate_adapter_output(
         calibrator_sha256=calibrator_sha256,
     )
     budgets = _normalise_budgets(adapter.get("budgets"))
-    rejected = _require_bool(adapter, "reject")
-    threshold = _finite_probability(adapter.get("threshold"), "threshold")
-    _verify_recomputed_calibrator_decision(
+    no_reject = _is_no_reject_adapter(adapter)
+    rejected = False if no_reject else _require_bool(adapter, "reject")
+    adapter_threshold = _finite_probability(adapter.get("threshold"), "threshold")
+    recomputed_decision = _verify_recomputed_calibrator_decision(
         adapter,
         manifest,
         manifest_path=manifest_path,
@@ -124,6 +155,12 @@ def evaluate_adapter_output(
         query_ids=query_ids,
         budgets=budgets,
         required_split_role=required_split_role,
+    )
+    # The independently replayed CPU value is authoritative for all label
+    # evaluation.  A tolerated GPU/CPU numeric delta can therefore never move
+    # the operating point across dense extreme-tail score events.
+    threshold = _finite_probability(
+        recomputed_decision.get("threshold"), "recomputed threshold"
     )
     result: dict[str, Any] = {
         "schema_version": ADAPTER_EVALUATION_SCHEMA_VERSION,
@@ -147,11 +184,15 @@ def evaluate_adapter_output(
         "num_query_images": len(query_ids),
         "budgets": budgets,
         "threshold": threshold,
+        "adapter_reported_threshold": adapter_threshold,
+        "threshold_replay_source": "deterministic_cpu_calibrator_replay",
         "threshold_semantics": THRESHOLD_SEMANTICS,
         "matching_rule": effective_matching_rule,
         "centroid_distance": effective_centroid_distance,
         "rejected": rejected,
     }
+    if no_reject:
+        result["no_reject"] = True
     if rejected:
         return result
 
@@ -444,16 +485,29 @@ def _verify_binding(
         adapter["calibrator_model"], "calibrator_model"
     )
     budget_contract = adapter["calibrator_budget_contract"]
-    if calibrator_model == "monotone_pixel":
+    if calibrator_model in {"monotone_pixel", "monotone_pixel_no_reject"}:
         if not isinstance(budget_contract, Mapping):
             raise TypeError(
-                "monotone_pixel adapter requires calibrator_budget_contract"
+                "monotone pixel adapter requires calibrator_budget_contract"
             )
     elif calibrator_model == "direct":
         if budget_contract is not None:
             raise ValueError("direct adapter must not declare a monotone budget contract")
     else:
         raise ValueError("unsupported adapter calibrator_model")
+    no_reject = _is_no_reject_adapter(adapter)
+    if no_reject:
+        if decision_contract.get("reject_supported") is not False:
+            raise ValueError("Adapter decision contract reject capability mismatch")
+        if "reject_rule" in decision_contract:
+            raise ValueError("no-reject decision contract must not contain reject_rule")
+    else:
+        # Older v3/v4 adapter artifacts predate the explicit capability bit;
+        # their reject_rule remains the authoritative compatibility contract.
+        if decision_contract.get("reject_supported", True) is not True:
+            raise ValueError("legacy decision contract must support rejection")
+        if not isinstance(decision_contract.get("reject_rule"), Mapping):
+            raise TypeError("legacy decision contract requires reject_rule")
     if decision_contract.get("budget_model") != budget_contract:
         raise ValueError("Adapter decision/budget model contracts disagree")
     if decision_contract.get("claim_bearing") is not claim_bearing:
@@ -502,7 +556,7 @@ def _verify_recomputed_calibrator_decision(
     query_ids: Sequence[str],
     budgets: Mapping[str, Any],
     required_split_role: str | None,
-) -> None:
+) -> Mapping[str, Any]:
     """Replay context inference on CPU before any query label is consumed."""
 
     try:
@@ -517,16 +571,14 @@ def _verify_recomputed_calibrator_decision(
     )
     from rc.schema import BudgetSpec, DeploymentProtocolContract, SourceReference
 
-    for field in (
-        "reject_probability",
-        "reject_cutoff",
+    no_reject = _is_no_reject_adapter(adapter)
+    common_replay_fields = (
         "temporal_order_asserted",
         "source_reference",
         "statistics_config",
         "calibration_pseudo_targets",
         "held_out_domains",
         "protocol_scope",
-        "p_min",
         "calibrator_format_version",
         "calibrator_model",
         "calibrator_capability_contract",
@@ -538,7 +590,13 @@ def _verify_recomputed_calibrator_decision(
         "evaluation_contract",
         "context_size",
         "query_size",
-    ):
+    )
+    legacy_replay_fields = (
+        "reject_probability",
+        "reject_cutoff",
+        "p_min",
+    )
+    for field in common_replay_fields + (() if no_reject else legacy_replay_fields):
         if field not in adapter:
             raise KeyError(f"Adapter output is missing replay field: {field}")
     if not isinstance(adapter["temporal_order_asserted"], bool):
@@ -594,9 +652,6 @@ def _verify_recomputed_calibrator_decision(
         values=tuple(float(value) for value in budgets["values"]),  # type: ignore[arg-type]
         active=tuple(bool(value) for value in budgets["active"]),  # type: ignore[arg-type]
     )
-    reject_cutoff = _finite_probability(
-        adapter["reject_cutoff"], "reject_cutoff"
-    )
     claim_bearing = _require_bool(adapter, "claim_bearing")
     evaluation_contract = _normalise_evaluation_contract(
         adapter["evaluation_contract"]
@@ -604,19 +659,32 @@ def _verify_recomputed_calibrator_decision(
     raw_decision_contract = adapter["decision_contract"]
     if not isinstance(raw_decision_contract, Mapping):
         raise TypeError("decision_contract must be a mapping")
-    raw_reject_rule = raw_decision_contract.get("reject_rule")
-    if not isinstance(raw_reject_rule, Mapping):
-        raise TypeError("decision_contract.reject_rule must be a mapping")
-    reject_override_requested = raw_reject_rule.get("runtime_override_requested")
-    if not isinstance(reject_override_requested, bool):
-        raise TypeError(
-            "decision_contract.reject_rule.runtime_override_requested must be boolean"
+    reject_cutoff = None
+    reject_override_requested = False
+    if no_reject:
+        if raw_decision_contract.get("reject_supported") is not False:
+            raise ValueError("no-reject decision must disable reject support")
+        if "reject_rule" in raw_decision_contract:
+            raise ValueError("no-reject decision must not contain reject_rule")
+    else:
+        reject_cutoff = _finite_probability(
+            adapter["reject_cutoff"], "reject_cutoff"
         )
+        raw_reject_rule = raw_decision_contract.get("reject_rule")
+        if not isinstance(raw_reject_rule, Mapping):
+            raise TypeError("decision_contract.reject_rule must be a mapping")
+        reject_override_requested = raw_reject_rule.get(
+            "runtime_override_requested"
+        )
+        if not isinstance(reject_override_requested, bool):
+            raise TypeError(
+                "decision_contract.reject_rule.runtime_override_requested must be boolean"
+            )
     matching_override_requested = evaluation_contract[
         "runtime_override_requested"
     ]
     frozen_protocol = None
-    if claim_bearing:
+    if claim_bearing and not no_reject:
         raw_frozen_protocol = checkpoint.get("deployment_protocol_contract")
         if not isinstance(raw_frozen_protocol, Mapping):
             raise TypeError(
@@ -625,6 +693,7 @@ def _verify_recomputed_calibrator_decision(
         frozen_protocol = DeploymentProtocolContract.from_dict(raw_frozen_protocol)
     replay_reject_cutoff = None
     if reject_override_requested:
+        assert reject_cutoff is not None
         replay_reject_cutoff = (
             frozen_protocol.reject_cutoff
             if frozen_protocol is not None
@@ -664,7 +733,13 @@ def _verify_recomputed_calibrator_decision(
         claim_bearing=claim_bearing,
     )
 
-    for field in ("threshold", "reject_probability", "reject_cutoff", "p_min"):
+    numeric_fields = ("threshold",) if no_reject else (
+        "threshold",
+        "reject_probability",
+        "reject_cutoff",
+        "p_min",
+    )
+    for field in numeric_fields:
         observed = float(adapter[field])
         expected = float(recomputed[field])
         if not math.isclose(observed, expected, rel_tol=0.0, abs_tol=1e-6):
@@ -672,7 +747,7 @@ def _verify_recomputed_calibrator_decision(
                 f"Adapter {field} differs from deterministic calibrator replay: "
                 f"{observed} != {expected}"
             )
-    if _require_bool(adapter, "reject") != bool(recomputed["reject"]):
+    if not no_reject and _require_bool(adapter, "reject") != bool(recomputed["reject"]):
         raise ValueError("Adapter reject decision differs from deterministic calibrator replay")
     for field in (
         "source_reference",
@@ -696,6 +771,7 @@ def _verify_recomputed_calibrator_decision(
             raise ValueError(
                 f"Adapter {field} differs from deterministic calibrator replay"
             )
+    return recomputed
 
 
 def _normalise_budgets(value: Any) -> dict[str, Any]:

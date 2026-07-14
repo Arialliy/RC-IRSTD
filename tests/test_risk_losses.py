@@ -18,6 +18,8 @@ from losses.local_peak_cvar import (
 from losses.smooth_worst_domain import smooth_max
 from losses.schedules import linear_risk_weight
 from losses.target_background_margin import (
+    background_local_peak_mask,
+    domain_tail_separation_loss,
     domain_target_background_margin_risks,
     image_target_background_margin_risks,
 )
@@ -243,6 +245,121 @@ class RiskLossTests(unittest.TestCase):
         self.assertIsNotNone(logits.grad)
         self.assertTrue(torch.equal(logits.grad, torch.zeros_like(logits.grad)))
 
+    def test_final_domain_margin_uses_target_free_images_and_is_shift_invariant(self):
+        logits = torch.full((4, 1, 9, 9), -12.0, requires_grad=True)
+        masks = torch.zeros_like(logits)
+        masks[0, 0, 4, 4] = 1.0
+        masks[2, 0, 2, 2] = 1.0
+        with torch.no_grad():
+            # Difficult targets keep both domain hinges active so gradients
+            # expose the no-target images' background contribution.
+            logits[0, 0, 4, 4] = -8.0
+            logits[2, 0, 2, 2] = -8.0
+            # Images 1 and 3 contain no target, but their peaks must contribute
+            # to the corresponding domain background summaries.
+            logits[1, 0, 7, 7] = 2.0
+            logits[3, 0, 6, 6] = 1.5
+        domain_ids = torch.tensor([0, 0, 1, 1])
+        first = domain_tail_separation_loss(
+            logits,
+            masks,
+            domain_ids,
+            margin=1.0,
+            background_tail_fraction=0.5,
+            object_top_fraction=1.0,
+            hard_object_fraction=1.0,
+            peak_kernel_size=3,
+            exclusion_radius=1,
+        )
+        shifted = domain_tail_separation_loss(
+            logits + 7.0,
+            masks,
+            domain_ids,
+            margin=1.0,
+            background_tail_fraction=0.5,
+            object_top_fraction=1.0,
+            hard_object_fraction=1.0,
+            peak_kernel_size=3,
+            exclusion_radius=1,
+        )
+        self.assertTrue(torch.allclose(first.loss, shifted.loss, atol=1e-6))
+        self.assertGreaterEqual(first.image_background_tail[1].item(), 1.9)
+        self.assertGreaterEqual(first.image_background_tail[3].item(), 1.4)
+        self.assertEqual(first.valid_domain_mask.tolist(), [True, True])
+        first.loss.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertGreater(logits.grad[1, 0, 7, 7].item(), 0.0)
+
+    def test_final_margin_collapses_constant_plateau_and_dilates_gt(self):
+        logits = torch.zeros((1, 1, 11, 11))
+        masks = torch.zeros_like(logits)
+        peaks, valid_background = background_local_peak_mask(
+            logits,
+            masks,
+            kernel_size=3,
+            exclusion_radius=0,
+        )
+        self.assertEqual(int(peaks.sum()), 1)
+        self.assertTrue(valid_background.all())
+
+        masks[0, 0, 5, 5] = 1.0
+        with torch.no_grad():
+            logits.fill_(-4.0)
+            logits[0, 0, 5, 6] = 9.0
+            logits[0, 0, 1, 1] = 3.0
+        peaks, valid_background = background_local_peak_mask(
+            logits,
+            masks,
+            kernel_size=3,
+            exclusion_radius=1,
+        )
+        self.assertFalse(valid_background[0, 0, 5, 6])
+        self.assertFalse(peaks[0, 0, 5, 6])
+        self.assertTrue(peaks[0, 0, 1, 1])
+
+    def test_final_margin_forms_domain_tails_before_hinge(self):
+        logits, masks = self._margin_example([3.0, -3.0], [2.0, 0.0])
+        domain_ids = torch.tensor([4, 4])
+        legacy = domain_target_background_margin_risks(
+            logits,
+            masks,
+            domain_ids,
+            background_q=0.01,
+            target_q=1.0,
+            object_pixel_fraction=1.0,
+            margin=0.0,
+        )
+        final = domain_tail_separation_loss(
+            logits,
+            masks,
+            domain_ids,
+            margin=0.0,
+            background_tail_fraction=0.01,
+            object_top_fraction=1.0,
+            hard_object_fraction=1.0,
+            peak_kernel_size=3,
+            exclusion_radius=0,
+        )
+        self.assertAlmostEqual(legacy.item(), 0.5)
+        self.assertAlmostEqual(final.domain_background_tail.item(), 0.0)
+        self.assertAlmostEqual(final.domain_target_tail.item(), 1.0)
+        self.assertAlmostEqual(final.domain_gap.item(), 0.0)
+        self.assertAlmostEqual(final.loss.item(), 0.0)
+
+    def test_final_margin_excludes_target_free_domain_without_fake_positive(self):
+        logits = torch.randn((2, 1, 7, 7), requires_grad=True)
+        masks = torch.zeros_like(logits)
+        output = domain_tail_separation_loss(
+            logits,
+            masks,
+            torch.tensor([3, 7]),
+        )
+        self.assertEqual(output.valid_domain_mask.tolist(), [False, False])
+        self.assertEqual(output.loss.item(), 0.0)
+        output.loss.backward()
+        self.assertIsNotNone(logits.grad)
+        self.assertTrue(torch.equal(logits.grad, torch.zeros_like(logits.grad)))
+
     def test_margin_capability_contract_is_persisted_in_detector_checkpoint(self):
         from scripts.train_multisource_tail import save_checkpoint
 
@@ -283,6 +400,14 @@ class RiskLossTests(unittest.TestCase):
             )
         self.assertEqual(checkpoint["risk_objective"], "margin")
         capability = checkpoint["detector_capability_contract"]["risk_objective"]
+        self.assertEqual(
+            capability["name"],
+            "domain_target_background_tail_separation",
+        )
+        self.assertEqual(
+            capability["hinge_level"],
+            "domain_after_two_tail_aggregation",
+        )
         self.assertEqual(capability["score_space"], "logit_difference")
         self.assertTrue(capability["common_logit_shift_invariant"])
         self.assertEqual(capability["margin_logit"], 1.5)

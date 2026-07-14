@@ -1,11 +1,10 @@
-"""Experimental monotone threshold foundation for pixel budgets only.
+"""Monotone threshold calibrators for one-dimensional pixel-risk budgets.
 
 This module is deliberately separate from :mod:`model.threshold_calibrator`.
-The existing ``ThresholdCalibrator`` remains the deployed baseline for the
-two-budget episode schema and its rejection decision.  The model below only
-maps unlabeled context statistics to thresholds on a one-dimensional pixel
-false-alarm budget grid.  It does not model component budgets, does not emit a
-rejection decision, and is not wired into the training or online pipelines.
+The direct and reject-aware models remain compatibility baselines.  The final
+``MonotoneNoRejectPixelRiskCalibrator`` maps unlabeled context statistics to a
+complete inverse pixel-risk curve and is integrated with the v5 training and
+online pipelines.  Component budgets are not treated as a monotone axis.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from rc.schema import BudgetSpec
 
 
 PIXEL_BUDGET_ONLY_SCOPE = "pixel_budget_only_no_component_no_reject"
+PIXEL_RISK_NO_REJECT_SCOPE = "pixel_risk_full_curve_no_component_no_reject"
 PIXEL_RISK_WITH_REJECT_SCOPE = "pixel_budget_only_no_component_with_reject"
 
 
@@ -54,6 +54,17 @@ class PixelBudgetCalibratorOutput:
     requested_pixel_budgets: torch.Tensor | None = None
     requested_logits: torch.Tensor | None = None
     requested_thresholds: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class NoRejectPixelRiskCalibratorOutput(PixelBudgetCalibratorOutput):
+    """Complete ``[B, J]`` inverse-risk curve with no abstention output.
+
+    This deliberately inherits only threshold-curve fields.  In particular,
+    there is no reject logit, reject probability, or component-risk output
+    that a caller could accidentally use as part of the primary Stage-2
+    method.
+    """
 
 
 @dataclass(frozen=True)
@@ -396,6 +407,72 @@ class MonotonePixelBudgetCalibrator(nn.Module):
             "supports_component_budget": self.supports_component_budget,
             "supports_reject": self.supports_reject,
             "training_pipeline_integrated": self.training_pipeline_integrated,
+        }
+
+
+class MonotoneNoRejectPixelRiskCalibrator(MonotonePixelBudgetCalibrator):
+    """Primary Stage-2 model: a complete no-Reject pixel-risk curve.
+
+    The architecture is the same tested bounded-spacing construction as
+    :class:`MonotonePixelBudgetCalibrator`, but this class makes the intended
+    paper capability explicit: one context produces all ``J`` operating
+    points, query labels are consumed only by the separate meta-training loss,
+    and deployment emits thresholds rather than an abstention decision.
+
+    This class is the checkpoint-v5 Stage-2 target.  Legacy reject-aware APIs
+    remain separate baselines and retain their original contracts.
+    """
+
+    budget_scope = PIXEL_RISK_NO_REJECT_SCOPE
+    supports_component_budget = False
+    supports_reject = False
+    supports_complete_budget_curve = True
+    supports_query_risk_aligned_loss = True
+    training_pipeline_integrated = True
+
+    def forward(
+        self,
+        context_features: torch.Tensor,
+        *,
+        pixel_budgets: torch.Tensor | None = None,
+    ) -> NoRejectPixelRiskCalibratorOutput:
+        output = super().forward(
+            context_features,
+            pixel_budgets=pixel_budgets,
+        )
+        return NoRejectPixelRiskCalibratorOutput(
+            pixel_budget_grid=output.pixel_budget_grid,
+            grid_logits=output.grid_logits,
+            grid_thresholds=output.grid_thresholds,
+            requested_pixel_budgets=output.requested_pixel_budgets,
+            requested_logits=output.requested_logits,
+            requested_thresholds=output.requested_thresholds,
+        )
+
+    def capability_contract(self) -> dict[str, object]:
+        return {
+            "stage": "stage2_final_no_reject",
+            "budget_scope": self.budget_scope,
+            "budget_axis": "pixel_false_alarm_rate",
+            "supports_component_budget": self.supports_component_budget,
+            "supports_reject": self.supports_reject,
+            "supports_complete_budget_curve": self.supports_complete_budget_curve,
+            "curve_output_shape": "[batch,J]",
+            "supports_query_risk_aligned_loss": (
+                self.supports_query_risk_aligned_loss
+            ),
+            "training_objective": (
+                "query_violation_plus_utility_plus_oracle_logit_plus_"
+                "curve_smoothness_plus_exact_suffix_coverage"
+            ),
+            "training_pipeline_integrated": self.training_pipeline_integrated,
+            "curve_compute_dtype": "float64",
+            "budget_interpolation": "piecewise_linear_log10_no_extrapolation",
+            "deployment_output": "threshold_curve_no_reject",
+            "risk_guarantee": "empirical_not_certified",
+            "component_budget_reason": (
+                "connected-component false-alarm counts are not monotone in threshold"
+            ),
         }
 
 
