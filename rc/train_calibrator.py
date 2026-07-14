@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from data_ext.dataset_identity import sha256_file
 from model.threshold_calibrator import ThresholdCalibrator, asymmetric_threshold_loss
 
 from .meta_dataset import (
@@ -286,6 +288,40 @@ def _save_checkpoint_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _episode_input_provenance(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+    if args.episodes:
+        path = Path(args.episodes).expanduser().resolve()
+        sha256 = sha256_file(path)
+        return (
+            {
+                "mode": "combined",
+                "combined": {"file": path.name, "sha256": sha256},
+            },
+            sha256,
+        )
+    train_path = Path(args.train_file).expanduser().resolve()
+    validation_path = Path(args.val_file).expanduser().resolve()
+    train_sha = sha256_file(train_path)
+    validation_sha = sha256_file(validation_path)
+    digest = hashlib.sha256()
+    digest.update(b"train\0")
+    digest.update(train_sha.encode("ascii"))
+    digest.update(b"\0validation\0")
+    digest.update(validation_sha.encode("ascii"))
+    return (
+        {
+            "mode": "split",
+            "train": {"file": train_path.name, "sha256": train_sha},
+            "validation": {
+                "file": validation_path.name,
+                "sha256": validation_sha,
+            },
+            "aggregate_rule": "sha256('train\\0' + train_sha + '\\0validation\\0' + validation_sha)",
+        },
+        digest.hexdigest(),
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episodes", help="Combined JSON/JSONL episodes to split by pseudo-target")
@@ -324,7 +360,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 0.0 <= args.reject_probability <= 1.0:
         raise ValueError("reject-probability must lie in [0, 1]")
     seed_everything(args.seed)
+    episode_collection_provenance, episode_collection_sha256 = (
+        _episode_input_provenance(args)
+    )
     train_episodes, validation_episodes = resolve_episode_splits(args)
+    provenance_after_load, collection_sha_after_load = _episode_input_provenance(args)
+    if (
+        provenance_after_load != episode_collection_provenance
+        or collection_sha_after_load != episode_collection_sha256
+    ):
+        raise RuntimeError("episode input files changed while loading the collection")
     assert_pseudo_target_isolation(train_episodes, validation_episodes)
     validate_episode_collection(train_episodes + validation_episodes)
     assert_verified_provenance(train_episodes + validation_episodes)
@@ -406,6 +451,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         "p_min": train_episodes[0].p_min,
         "outer_fold_id": outer_fold_id,
         "outer_target": outer_target,
+        "episode_collection_provenance": episode_collection_provenance,
+        "episode_collection_sha256": episode_collection_sha256,
+        "training_config": {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "hidden_dim": args.hidden_dim,
+            "dropout": args.dropout,
+            "under_weight": args.under_weight,
+            "reject_weight": args.reject_weight,
+            "threshold_on_reject": bool(args.threshold_on_reject),
+            "threshold_transform": threshold_transform,
+            "reject_probability": args.reject_probability,
+            "num_workers": args.num_workers,
+            "seed": args.seed,
+            "device_requested": args.device,
+            "device_resolved": str(device),
+        },
         "standardizer": standardizer.to_dict(),
         "train_pseudo_targets": sorted(train_dataset.pseudo_targets),
         "validation_pseudo_targets": sorted(validation_dataset.pseudo_targets),
@@ -487,6 +551,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "p_min": train_episodes[0].p_min,
         "outer_fold_id": outer_fold_id,
         "outer_target": outer_target,
+        "episode_collection_sha256": episode_collection_sha256,
         "deployment_detector_checkpoint_sha": deployment_fold.detector_checkpoint_sha,
         "deployment_detector_source_domains": list(deployment_fold.detector_source_domains),
         "deployment_held_out_domains": list(deployment_fold.held_out_domains),

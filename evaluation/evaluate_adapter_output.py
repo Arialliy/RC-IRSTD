@@ -10,16 +10,23 @@ reports native-resolution object and false-alarm counts.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
+from data_ext.dataset_identity import sha256_file
+from data_ext.label_manifest_artifacts import (
+    load_label_mask,
+    verify_label_attachment,
+)
+from data_ext.score_manifest_artifacts import verify_score_manifest_artifacts
 from .budget_metrics import relative_budget_excess
 from .component_matching import aggregate_match_results, match_components
-from .threshold_sweep import THRESHOLD_SEMANTICS, load_score_map
+from .threshold_sweep import THRESHOLD_SEMANTICS
 
 
 ADAPTER_EVALUATION_SCHEMA_VERSION = "rc-irstd.adapter-evaluation.v1"
@@ -42,6 +49,8 @@ def evaluate_adapter_output(
     adapter_output: str | Path | Mapping[str, Any],
     score_manifest: str | Path,
     *,
+    calibrator_checkpoint: str | Path,
+    label_manifest: str | Path,
     matching_rule: str = "overlap",
     centroid_distance: float = 3.0,
 ) -> dict[str, Any]:
@@ -58,31 +67,42 @@ def evaluate_adapter_output(
 
     adapter, adapter_name = _load_adapter_output(adapter_output)
     manifest_path = Path(score_manifest).expanduser().resolve()
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Score manifest does not exist: {manifest_path}")
-    if (manifest_path.parent / ".export_incomplete").exists():
-        raise RuntimeError(
-            f"Score export under {manifest_path.parent} is incomplete; replay is unsafe"
+    verified_manifest = verify_score_manifest_artifacts(
+        manifest_path,
+        require_mask=False,
+        require_native_contract=True,
+        verify_artifact_bytes=False,
+    )
+    manifest = verified_manifest.payload
+    manifest_sha256 = verified_manifest.manifest_sha256
+    calibrator_path = Path(calibrator_checkpoint).expanduser().resolve()
+    if not calibrator_path.is_file():
+        raise FileNotFoundError(
+            f"Calibrator checkpoint does not exist: {calibrator_path}"
         )
-    manifest = _read_json_mapping(manifest_path, "score manifest")
-    manifest_sha256 = _sha256(manifest_path)
+    calibrator_sha256 = sha256_file(calibrator_path)
 
     target_domain, context_ids, query_ids = _verify_binding(
         adapter,
         manifest,
         manifest_path=manifest_path,
         manifest_sha256=manifest_sha256,
+        calibrator_sha256=calibrator_sha256,
     )
     budgets = _normalise_budgets(adapter.get("budgets"))
     rejected = _require_bool(adapter, "reject")
     threshold = _finite_probability(adapter.get("threshold"), "threshold")
-    query_paths = _resolve_bound_query_paths(
+    _verify_recomputed_calibrator_decision(
+        adapter,
         manifest,
         manifest_path=manifest_path,
+        manifest_sha256=manifest_sha256,
+        calibrator_path=calibrator_path,
+        target_domain=target_domain,
         context_ids=context_ids,
         query_ids=query_ids,
+        budgets=budgets,
     )
-
     result: dict[str, Any] = {
         "schema_version": ADAPTER_EVALUATION_SCHEMA_VERSION,
         "adapter_output_file": adapter_name,
@@ -90,6 +110,9 @@ def evaluate_adapter_output(
         "target_domain": target_domain,
         "score_manifest_file": manifest_path.name,
         "score_manifest_sha256": manifest_sha256,
+        "calibrator_checkpoint_file": calibrator_path.name,
+        "calibrator_checkpoint_sha256": calibrator_sha256,
+        "calibrator_replay_verified": True,
         "query_image_ids": list(query_ids),
         "num_query_images": len(query_ids),
         "budgets": budgets,
@@ -102,22 +125,55 @@ def evaluate_adapter_output(
     if rejected:
         return result
 
+    # The label artifact is deliberately not resolved, opened, or hashed
+    # until the context-only decision has been replayed and accepted.
+    label_manifest_path = Path(label_manifest).expanduser().resolve()
+    attachment = verify_label_attachment(
+        manifest_path,
+        label_manifest_path,
+        image_ids=query_ids,
+    )
+    if attachment.score_manifest.manifest_sha256 != manifest_sha256:
+        raise RuntimeError("score manifest changed between decision replay and label replay")
+    if tuple(item.image_id for item in attachment.selected_items) != tuple(query_ids):
+        raise RuntimeError("verified query-label order differs from adapter binding")
+    if tuple(
+        item.image_id for item in attachment.score_manifest.selected_items
+    ) != tuple(query_ids):
+        raise RuntimeError("verified query-score order differs from adapter binding")
+
     matches = []
-    for expected_id, path in zip(query_ids, query_paths):
-        record = load_score_map(path)
-        if record.image_id != expected_id:
+    for expected_id, score_item, label_item in zip(
+        query_ids,
+        attachment.score_manifest.selected_items,
+        attachment.selected_items,
+    ):
+        if score_item.image_id != expected_id or label_item.image_id != expected_id:
+            raise RuntimeError("score/label/query image-ID binding changed after verification")
+        with np.load(score_item.score_path, allow_pickle=False) as score_payload:
+            probability = np.asarray(score_payload["prob"], dtype=np.float32)
+        mask = load_label_mask(label_item)
+        if probability.shape != mask.shape:
             raise ValueError(
-                "Score-map image_id disagrees with its bound manifest item: "
-                f"expected {expected_id!r}, found {record.image_id!r} in {path.name!r}"
+                f"verified score/label shape mismatch for {expected_id!r}: "
+                f"{probability.shape} != {mask.shape}"
             )
         matches.append(
             match_components(
-                record.probability > threshold,
-                record.mask,
+                probability > threshold,
+                mask,
                 rule=matching_rule,
                 centroid_distance=centroid_distance,
             )
         )
+    result.update(
+        {
+            "label_manifest_file": label_manifest_path.name,
+            "label_manifest_sha256": attachment.manifest_sha256,
+            "label_manifest_content_sha256": attachment.content_sha256,
+            "label_attachment_verified": True,
+        }
+    )
     result.update(aggregate_match_results(matches))
     return result
 
@@ -220,6 +276,7 @@ def _verify_binding(
     *,
     manifest_path: Path,
     manifest_sha256: str,
+    calibrator_sha256: str,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     required = (
         "outer_fold_id",
@@ -227,6 +284,7 @@ def _verify_binding(
         "target_domain",
         "detector_source_domains",
         "detector_checkpoint_sha",
+        "calibrator_checkpoint_sha256",
         "score_manifest_sha256",
         "score_manifest_target_dataset",
         "score_manifest_detector_checkpoint_sha",
@@ -244,6 +302,15 @@ def _verify_binding(
         raise ValueError(
             "Score manifest SHA-256 mismatch: adapter output is not bound to "
             f"{manifest_path.name!r}"
+        )
+    expected_calibrator_sha = _sha256_value(
+        adapter["calibrator_checkpoint_sha256"],
+        "calibrator_checkpoint_sha256",
+    )
+    if expected_calibrator_sha != calibrator_sha256:
+        raise ValueError(
+            "Calibrator checkpoint SHA-256 mismatch: adapter output is not bound "
+            "to the supplied calibrator"
         )
 
     target_domain = _nonempty_string(adapter["target_domain"], "target_domain")
@@ -321,49 +388,140 @@ def _verify_binding(
     return target_domain, context_ids, query_ids
 
 
-def _resolve_bound_query_paths(
+def _verify_recomputed_calibrator_decision(
+    adapter: Mapping[str, Any],
     manifest: Mapping[str, Any],
     *,
     manifest_path: Path,
+    manifest_sha256: str,
+    calibrator_path: Path,
+    target_domain: str,
     context_ids: Sequence[str],
     query_ids: Sequence[str],
-) -> tuple[Path, ...]:
-    raw_items = manifest.get("items", manifest.get("records"))
-    if not isinstance(raw_items, list) or not raw_items:
-        raise ValueError("Score manifest requires a non-empty items/records list")
-    if "num_images" in manifest and int(manifest["num_images"]) != len(raw_items):
-        raise ValueError("Score manifest num_images disagrees with its item count")
+    budgets: Mapping[str, Any],
+) -> None:
+    """Replay context inference on CPU before any query label is consumed."""
 
-    ordered_ids: list[str] = []
-    by_id: dict[str, Path] = {}
-    for item in raw_items:
-        if not isinstance(item, Mapping) or "image_id" not in item:
-            raise ValueError("Every score manifest item must contain image_id")
-        image_id = _nonempty_string(item["image_id"], "manifest item image_id")
-        if image_id in by_id:
-            raise ValueError(f"Duplicate image_id in score manifest: {image_id!r}")
-        file_value = item.get("file", item.get("prob_path", item.get("score_path")))
-        if file_value is None:
-            raise KeyError(f"Score manifest item {image_id!r} has no score-map file")
-        path = Path(str(file_value)).expanduser()
-        if not path.is_absolute():
-            path = manifest_path.parent / path
-        by_id[image_id] = path.resolve()
-        ordered_ids.append(image_id)
+    try:
+        import torch
+    except ModuleNotFoundError as error:  # pragma: no cover - deployment guard
+        raise RuntimeError("Calibrator replay requires PyTorch") from error
 
-    bound_prefix = list(context_ids) + list(query_ids)
-    if ordered_ids[: len(bound_prefix)] != bound_prefix:
-        raise ValueError(
-            "Adapter context/query IDs do not exactly match the score-manifest prefix"
-        )
-    missing = [image_id for image_id in query_ids if image_id not in by_id]
+    from rc.online_adapter import (
+        adapt_context_to_query,
+        load_calibrator_bundle,
+        load_ordered_score_records,
+    )
+    from rc.schema import BudgetSpec, SourceReference
+
+    for field in (
+        "reject_probability",
+        "reject_cutoff",
+        "temporal_order_asserted",
+        "source_reference",
+        "statistics_config",
+        "calibration_pseudo_targets",
+        "held_out_domains",
+        "protocol_scope",
+        "p_min",
+        "calibrator_format_version",
+        "episode_collection_sha256",
+    ):
+        if field not in adapter:
+            raise KeyError(f"Adapter output is missing replay field: {field}")
+    if not isinstance(adapter["temporal_order_asserted"], bool):
+        raise TypeError("temporal_order_asserted must be boolean")
+
+    device = torch.device("cpu")
+    model, standardizer, checkpoint = load_calibrator_bundle(
+        calibrator_path,
+        device=device,
+    )
+    records, replay_manifest = load_ordered_score_records(
+        manifest_path,
+    )
+    if replay_manifest != manifest:
+        raise RuntimeError("score manifest changed while preparing calibrator replay")
+    by_id = {str(record["image_id"]): record for record in records}
+    missing = [
+        image_id
+        for image_id in tuple(context_ids) + tuple(query_ids)
+        if image_id not in by_id
+    ]
     if missing:
-        raise KeyError(f"Query image IDs are absent from score manifest: {missing}")
-    paths = tuple(by_id[image_id] for image_id in query_ids)
-    absent = [str(path) for path in paths if not path.is_file()]
-    if absent:
-        raise FileNotFoundError(f"Query score maps are missing: {absent}")
-    return paths
+        raise KeyError(f"Adapter context/query IDs are absent from manifest: {missing}")
+    context_records = [by_id[image_id] for image_id in context_ids]
+    query_records = [by_id[image_id] for image_id in query_ids]
+    verified_context = verify_score_manifest_artifacts(
+        manifest_path,
+        image_ids=context_ids,
+        require_mask=False,
+        require_native_contract=True,
+    )
+    if (
+        verified_context.manifest_sha256 != manifest_sha256
+        or verified_context.payload != manifest
+    ):
+        raise RuntimeError("score manifest changed while verifying replay context")
+    verified_context_paths = tuple(
+        (str(item.score_path), str(item.gray_path))
+        for item in verified_context.selected_items
+    )
+    replay_context_paths = tuple(
+        (str(record["prob_path"]), str(record["gray_path"]))
+        for record in context_records
+    )
+    if verified_context_paths != replay_context_paths:
+        raise RuntimeError("verified replay context paths differ from manifest binding")
+    source_reference = SourceReference.from_dict(
+        checkpoint["deployment_source_reference"]
+    )
+    replay_budgets = BudgetSpec(
+        values=tuple(float(value) for value in budgets["values"]),  # type: ignore[arg-type]
+        active=tuple(bool(value) for value in budgets["active"]),  # type: ignore[arg-type]
+    )
+    reject_cutoff = _finite_probability(
+        adapter["reject_cutoff"], "reject_cutoff"
+    )
+    recomputed = adapt_context_to_query(
+        model=model,
+        standardizer=standardizer,
+        checkpoint_metadata=checkpoint,
+        context_records=context_records,
+        query_records=query_records,
+        budgets=replay_budgets,
+        source_reference=source_reference,
+        score_manifest=manifest,
+        score_manifest_sha256=manifest_sha256,
+        device=device,
+        target_domain=target_domain,
+        reject_probability=reject_cutoff,
+        temporal_order_asserted=bool(adapter["temporal_order_asserted"]),
+    )
+
+    for field in ("threshold", "reject_probability", "reject_cutoff", "p_min"):
+        observed = float(adapter[field])
+        expected = float(recomputed[field])
+        if not math.isclose(observed, expected, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(
+                f"Adapter {field} differs from deterministic calibrator replay: "
+                f"{observed} != {expected}"
+            )
+    if _require_bool(adapter, "reject") != bool(recomputed["reject"]):
+        raise ValueError("Adapter reject decision differs from deterministic calibrator replay")
+    for field in (
+        "source_reference",
+        "statistics_config",
+        "calibration_pseudo_targets",
+        "held_out_domains",
+        "protocol_scope",
+        "calibrator_format_version",
+        "episode_collection_sha256",
+    ):
+        if adapter[field] != recomputed[field]:
+            raise ValueError(
+                f"Adapter {field} differs from deterministic calibrator replay"
+            )
 
 
 def _normalise_budgets(value: Any) -> dict[str, Any]:
@@ -502,14 +660,6 @@ def _sha256_value(value: Any, name: str) -> str:
     return result
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _safe_ratio(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
@@ -547,6 +697,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Cryptographically bound score manifest; repeat in matching order",
     )
+    parser.add_argument(
+        "--calibrator-checkpoint",
+        action="append",
+        required=True,
+        help="Actual calibrator checkpoint; repeat in matching order",
+    )
+    parser.add_argument(
+        "--label-manifest",
+        action="append",
+        required=True,
+        help=(
+            "Independent score-bound label manifest; repeat in matching order. "
+            "Rejected records do not open this artifact."
+        ),
+    )
     parser.add_argument("--matching-rule", choices=("overlap", "centroid"), default="overlap")
     parser.add_argument("--centroid-distance", type=float, default=3.0)
     parser.add_argument("--output")
@@ -559,14 +724,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "--adapter-output and --score-manifest must be repeated the same number of times"
         )
+    if len(args.adapter_output) != len(args.calibrator_checkpoint):
+        raise ValueError(
+            "--adapter-output and --calibrator-checkpoint must be repeated the same number of times"
+        )
+    if len(args.adapter_output) != len(args.label_manifest):
+        raise ValueError(
+            "--adapter-output and --label-manifest must be repeated the same number of times"
+        )
     evaluations = [
         evaluate_adapter_output(
             adapter_path,
             manifest_path,
+            calibrator_checkpoint=calibrator_path,
+            label_manifest=label_path,
             matching_rule=args.matching_rule,
             centroid_distance=args.centroid_distance,
         )
-        for adapter_path, manifest_path in zip(args.adapter_output, args.score_manifest)
+        for adapter_path, manifest_path, calibrator_path, label_path in zip(
+            args.adapter_output,
+            args.score_manifest,
+            args.calibrator_checkpoint,
+            args.label_manifest,
+        )
     ]
     payload: Mapping[str, Any]
     if len(evaluations) == 1:

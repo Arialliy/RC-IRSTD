@@ -17,6 +17,12 @@ SCHEMA_VERSION = "rc-irstd.meta-episode.v3"
 BUDGET_NAMES = ("pixel", "component")
 VALID_THRESHOLD_TRANSFORMS = ("identity", "logit", "tail")
 PROVENANCE_STATUSES = ("verified", "asserted_unverified")
+MULTI_SOURCE_PROTOCOL_SCOPE = "multi_source_protocol_candidate"
+SINGLE_SOURCE_SMOKE_SCOPE = "single_source_inner_smoke_not_main_result"
+DETECTOR_PROTOCOL_SCOPES = (
+    MULTI_SOURCE_PROTOCOL_SCOPE,
+    SINGLE_SOURCE_SMOKE_SCOPE,
+)
 
 
 def _finite_float(value: Any, name: str) -> float:
@@ -33,6 +39,30 @@ def _validate_sha256(value: str, name: str) -> str:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError(f"{name} must be a lowercase 64-character SHA-256 digest")
     return value
+
+
+def _validate_protocol_scope_cardinality(
+    detector_source_domains: Sequence[str],
+    protocol_scope: str | None,
+    *,
+    name: str,
+    allow_none: bool,
+) -> None:
+    """Keep detector source count and the declared protocol scope inseparable."""
+
+    if protocol_scope is None:
+        if allow_none:
+            return
+        raise ValueError(f"{name} must be present")
+    if protocol_scope not in DETECTOR_PROTOCOL_SCOPES:
+        raise ValueError(
+            f"{name} must be one of {DETECTOR_PROTOCOL_SCOPES}, got {protocol_scope!r}"
+        )
+    source_count = len(tuple(detector_source_domains))
+    if protocol_scope == MULTI_SOURCE_PROTOCOL_SCOPE and source_count < 2:
+        raise ValueError(f"{name}=multi-source requires at least two detector sources")
+    if protocol_scope == SINGLE_SOURCE_SMOKE_SCOPE and source_count != 1:
+        raise ValueError(f"{name}=single-source smoke requires exactly one detector source")
 
 
 @dataclass(frozen=True)
@@ -146,6 +176,12 @@ class SourceContract:
                 raise ValueError(f"source_contract.{name} must be non-empty when set")
         if self.outer_target is not None and self.outer_target not in self.held_out_domains:
             raise ValueError("source contract outer_target must occur in held_out_domains")
+        _validate_protocol_scope_cardinality(
+            self.detector_source_domains,
+            self.protocol_scope,
+            name="source_contract.protocol_scope",
+            allow_none=True,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -170,18 +206,24 @@ class SourceContract:
         missing = required.difference(payload)
         if missing:
             raise KeyError(f"source contract is missing: {sorted(missing)}")
+        source_domains = payload["detector_source_domains"]
+        held_out_domains = payload["held_out_domains"]
+        for name, value in (
+            ("detector_source_domains", source_domains),
+            ("held_out_domains", held_out_domains),
+        ):
+            if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+                raise TypeError(f"source_contract.{name} must be a sequence of strings")
         return cls(
             detector_checkpoint_sha=str(payload["detector_checkpoint_sha"]),
-            detector_source_domains=tuple(
-                str(value) for value in payload["detector_source_domains"]
-            ),
+            detector_source_domains=tuple(str(value) for value in source_domains),
             outer_fold_id=(
                 None if payload["outer_fold_id"] is None else str(payload["outer_fold_id"])
             ),
             outer_target=(
                 None if payload["outer_target"] is None else str(payload["outer_target"])
             ),
-            held_out_domains=tuple(str(value) for value in payload["held_out_domains"]),
+            held_out_domains=tuple(str(value) for value in held_out_domains),
             protocol_scope=(
                 None if payload["protocol_scope"] is None else str(payload["protocol_scope"])
             ),
@@ -274,6 +316,12 @@ class FoldContract:
             )
         if not self.protocol_scope or self.protocol_scope != self.protocol_scope.strip():
             raise ValueError("protocol_scope must be non-empty")
+        _validate_protocol_scope_cardinality(
+            self.detector_source_domains,
+            self.protocol_scope,
+            name="protocol_scope",
+            allow_none=False,
+        )
         _validate_sha256(self.detector_checkpoint_sha, "detector_checkpoint_sha")
 
     def assert_matches_source_reference(self, reference: SourceReference) -> None:
@@ -331,6 +379,8 @@ class EpisodeProvenance:
     context_score_manifest_sha256: str
     query_score_manifest_sha256: str
     query_score_target_dataset: str
+    label_manifest_sha256: str = ""
+    label_manifest_content_sha256: str = ""
 
     def __post_init__(self) -> None:
         if self.status not in PROVENANCE_STATUSES:
@@ -343,12 +393,20 @@ class EpisodeProvenance:
             _validate_sha256(getattr(self, name), name)
         if self.status == "verified":
             _validate_sha256(self.curve_manifest_sha256, "curve_manifest_sha256")
+            _validate_sha256(self.label_manifest_sha256, "label_manifest_sha256")
+            _validate_sha256(
+                self.label_manifest_content_sha256,
+                "label_manifest_content_sha256",
+            )
             if self.context_score_manifest_sha256 != self.query_score_manifest_sha256:
                 raise ValueError(
                     "verified provenance requires one shared context/query score manifest"
                 )
         elif self.curve_manifest_sha256:
             _validate_sha256(self.curve_manifest_sha256, "curve_manifest_sha256")
+        for name in ("label_manifest_sha256", "label_manifest_content_sha256"):
+            if getattr(self, name):
+                _validate_sha256(getattr(self, name), name)
         if not self.query_score_target_dataset:
             raise ValueError("query_score_target_dataset must be non-empty")
 
@@ -360,11 +418,26 @@ class EpisodeProvenance:
             "context_score_manifest_sha256": self.context_score_manifest_sha256,
             "query_score_manifest_sha256": self.query_score_manifest_sha256,
             "query_score_target_dataset": self.query_score_target_dataset,
+            "label_manifest_sha256": self.label_manifest_sha256,
+            "label_manifest_content_sha256": self.label_manifest_content_sha256,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "EpisodeProvenance":
-        return cls(**{key: str(payload[key]) for key in cls.__dataclass_fields__})
+        return cls(
+            status=str(payload["status"]),
+            curve_file_sha256=str(payload["curve_file_sha256"]),
+            curve_manifest_sha256=str(payload["curve_manifest_sha256"]),
+            context_score_manifest_sha256=str(
+                payload["context_score_manifest_sha256"]
+            ),
+            query_score_manifest_sha256=str(payload["query_score_manifest_sha256"]),
+            query_score_target_dataset=str(payload["query_score_target_dataset"]),
+            label_manifest_sha256=str(payload.get("label_manifest_sha256", "")),
+            label_manifest_content_sha256=str(
+                payload.get("label_manifest_content_sha256", "")
+            ),
+        )
 
 
 @dataclass(frozen=True)

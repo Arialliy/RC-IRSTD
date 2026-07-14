@@ -31,6 +31,8 @@ from torch.optim import Adagrad
 from tqdm import tqdm
 
 from data_ext.balanced_domain_loader import BalancedDomainLoader
+from data_ext.dataset_identity import build_dataset_record
+from data_ext.split_utils import sample_id_from_entry
 from losses.hard_target_loss import hard_target_miss_loss
 from losses.local_peak_cvar import domain_pixel_tail_risks, domain_tail_risks
 from losses.smooth_worst_domain import smooth_worst_domain
@@ -212,6 +214,74 @@ def build_source_datasets(
     return datasets
 
 
+def build_detector_source_records(
+    names: Iterable[str],
+    datasets: Dict[str, IRSTD_Dataset],
+) -> List[Dict[str, object]]:
+    """Bind logical source names to the concrete datasets and train splits.
+
+    Dataset identities are content-addressed and deliberately independent of
+    the absolute source directory.  This catches the same physical dataset
+    supplied through a copy, symlink or renamed directory, which canonical
+    path checks alone cannot detect.
+    """
+
+    records: List[Dict[str, object]] = []
+    for name in names:
+        dataset = datasets[name]
+        sample_ids = [sample_id_from_entry(entry) for entry in dataset.names]
+        # Resolve exactly the selected train entries.  These helpers try only
+        # deterministic per-sample candidates, so provenance generation never
+        # enumerates or reads masks outside the selected training split.
+        training_artifacts: list[tuple[str, str]] = []
+        for entry in dataset.names:
+            entry_stem = os.path.splitext(str(entry).strip())[0]
+            training_artifacts.append(
+                (
+                    dataset._resolve_image_path(dataset.imgs_dir, entry_stem),
+                    dataset._resolve_mask_path(dataset.label_dir, entry_stem),
+                )
+            )
+        record = build_dataset_record(
+            Path(dataset.imgs_dir).resolve().parent,
+            dataset.list_dir,
+            sample_ids,
+            source_name=name,
+            training_artifacts=training_artifacts,
+        )
+        if int(record["num_samples"]) != len(dataset):
+            raise RuntimeError(
+                f"source record sample count does not match dataset {name!r}"
+            )
+        records.append(record)
+
+    identities = [str(record["dataset_identity_sha256"]) for record in records]
+    if len(set(identities)) != len(identities):
+        aliases: Dict[str, List[str]] = {}
+        for record in records:
+            aliases.setdefault(
+                str(record["dataset_identity_sha256"]), []
+            ).append(str(record["source_name"]))
+        duplicates = [values for values in aliases.values() if len(values) > 1]
+        raise ValueError(
+            "detector sources contain duplicate dataset content under different "
+            f"logical names: {duplicates}"
+        )
+    # Reject partial aliases too.  Dataset roots and filenames can be changed;
+    # raw image-content leaves are the invariant contamination boundary.
+    for left_index, left in enumerate(records):
+        left_leaves = set(left["image_content_sha256_leaves"])
+        for right in records[left_index + 1 :]:
+            overlap = sorted(left_leaves & set(right["image_content_sha256_leaves"]))
+            if overlap:
+                raise ValueError(
+                    "detector sources share raw image content under different "
+                    f"logical names {left['source_name']!r} and "
+                    f"{right['source_name']!r}; collision_count={len(overlap)}"
+                )
+    return records
+
+
 def multiscale_sls_loss(
     sls_loss: SLSIoULoss,
     final_logits: torch.Tensor,
@@ -318,6 +388,7 @@ def save_checkpoint(
     epoch: int,
     args: argparse.Namespace,
     names: List[str],
+    detector_source_records: List[Dict[str, object]],
     epoch_metrics: Dict[str, object],
 ) -> None:
     payload = {
@@ -327,6 +398,7 @@ def save_checkpoint(
         "seed": args.seed,
         "source_names": names,
         "detector_source_domains": names,
+        "detector_source_records": detector_source_records,
         "outer_fold_id": args.outer_fold_id,
         "outer_target": args.outer_target,
         "held_out_domains": sorted(set(args.held_out_domains or [])),
@@ -463,6 +535,7 @@ def main() -> None:
     device = select_device(args.device)
 
     datasets = build_source_datasets(args, names)
+    detector_source_records = build_detector_source_records(names, datasets)
     loader = BalancedDomainLoader(
         datasets,
         args.batch_per_domain,
@@ -500,6 +573,7 @@ def main() -> None:
         "source_names": names,
         "domain_ids": loader.domain_ids,
         "dataset_sizes": {name: len(dataset) for name, dataset in datasets.items()},
+        "detector_source_records": detector_source_records,
         "steps_per_epoch": len(loader),
         "total_batch_size": loader.total_batch_size,
         "loader_seed_rule": "seed + epoch*1000003 + domain_position*10007",
@@ -537,6 +611,7 @@ def main() -> None:
             epoch,
             args,
             names,
+            detector_source_records,
             epoch_metrics,
         )
         print(json.dumps(epoch_metrics, sort_keys=True))

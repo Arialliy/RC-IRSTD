@@ -113,15 +113,19 @@ python -m rc.online_adapter \
 python -m evaluation.evaluate_adapter_output \
   --adapter-output outputs/rc/outer-nuaa/online.json \
   --score-manifest outputs/scores/outer-nuaa/manifest.json \
+  --calibrator-checkpoint outputs/rc/outer-nuaa/calibrator.pt \
   --output outputs/rc/outer-nuaa/evaluation.json
 ```
+
+Replay verifies the actual calibrator checkpoint SHA and deterministically reruns
+the context-to-threshold/reject decision on CPU before reading query labels.
 
 The complete nested-LODO artifact contract and episode JSON example are in [02_RC-IRSTD_方案_代码_步骤.md](02_RC-IRSTD_方案_代码_步骤.md). Engineering-only smoke results and unresolved evidence gaps are recorded in [baseline_results.md](baseline_results.md).
 
 ## Visual Results
 ![](assert/visual_result.png)
 
-## Quantative Results
+## Original MSHNet release results (not RC-IRSTD)
 | Dataset         | mIoU (x10(-2)) | Pd (x10(-2))|  Fa (x10(-6)) | Weights|
 | ------------- |:-------------:|:-----:|:-----:|:-----:|
 | IRSTD-1k | 67.16 | 93.88 | 15.03 | [IRSTD-1k_weights](https://drive.google.com/file/d/1q3zfzJRczodGQb0dZ3y3KmLn0zz4F8ra/view?usp=drive_link) |

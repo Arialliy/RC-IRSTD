@@ -95,6 +95,36 @@ class SampleMeta:
         }
 
 
+@dataclass(frozen=True)
+class ImageSampleMeta:
+    """Label-free inference metadata for one image.
+
+    Mask paths and dimensions are deliberately absent.  Keeping a distinct
+    type makes accidental label access during score export structurally
+    impossible instead of relying on a caller convention.
+    """
+
+    image_id: str
+    dataset_name: str
+    image_path: str
+    transform: SpatialTransform
+
+    def to_collatable(self) -> dict[str, Any]:
+        return {
+            "image_id": self.image_id,
+            "dataset_name": self.dataset_name,
+            "image_path": self.image_path,
+            "resize_mode": self.transform.mode,
+            "original_hw": torch.tensor(self.transform.original_hw, dtype=torch.int64),
+            "input_hw": torch.tensor(self.transform.input_hw, dtype=torch.int64),
+            "resized_hw": torch.tensor(self.transform.resized_hw, dtype=torch.int64),
+            "padding_ltrb": torch.tensor(
+                self.transform.padding_ltrb,
+                dtype=torch.int64,
+            ),
+        }
+
+
 def build_spatial_transform(
     original_hw: Sequence[int],
     input_hw: int | Sequence[int],
@@ -174,6 +204,46 @@ def sample_meta_from_batch(
             index,
             2,
         ),
+        transform=transform,
+    )
+
+
+def image_meta_from_batch(
+    metadata_batch: Mapping[str, Any],
+    index: int = 0,
+) -> ImageSampleMeta:
+    """Recover label-free inference metadata from a collated batch."""
+
+    required = {
+        "image_id",
+        "dataset_name",
+        "image_path",
+        "resize_mode",
+        "original_hw",
+        "input_hw",
+        "resized_hw",
+        "padding_ltrb",
+    }
+    missing = required.difference(metadata_batch)
+    if missing:
+        raise KeyError(f"Image metadata batch is missing fields: {sorted(missing)}")
+    forbidden = {"mask_path", "mask_original_hw"}.intersection(metadata_batch)
+    if forbidden:
+        raise ValueError(
+            "label-free image metadata unexpectedly contains mask fields: "
+            f"{sorted(forbidden)}"
+        )
+    transform = SpatialTransform(
+        mode=str(_batch_item(metadata_batch["resize_mode"], index)),
+        original_hw=_batch_int_tuple(metadata_batch["original_hw"], index, 2),
+        input_hw=_batch_int_tuple(metadata_batch["input_hw"], index, 2),
+        resized_hw=_batch_int_tuple(metadata_batch["resized_hw"], index, 2),
+        padding_ltrb=_batch_int_tuple(metadata_batch["padding_ltrb"], index, 4),
+    )
+    return ImageSampleMeta(
+        image_id=str(_batch_item(metadata_batch["image_id"], index)),
+        dataset_name=str(_batch_item(metadata_batch["dataset_name"], index)),
+        image_path=str(_batch_item(metadata_batch["image_path"], index)),
         transform=transform,
     )
 

@@ -13,6 +13,15 @@ from typing import Iterable, Literal, Mapping, Sequence
 
 import numpy as np
 
+from data_ext.label_manifest_artifacts import (
+    load_label_mask,
+    verify_label_attachment,
+)
+from data_ext.score_manifest_artifacts import (
+    STRICT_THRESHOLD_SEMANTICS,
+    verify_score_manifest_artifacts,
+)
+
 from .component_matching import (
     aggregate_match_results,
     match_components,
@@ -20,9 +29,9 @@ from .component_matching import (
 )
 
 
-CURVE_SCHEMA_VERSION = 1
+CURVE_SCHEMA_VERSION = 2
 THRESHOLD_GRID_VERSION = "rc-tail-grid-v1"
-THRESHOLD_SEMANTICS = "prediction = probability > threshold"
+THRESHOLD_SEMANTICS = STRICT_THRESHOLD_SEMANTICS
 THRESHOLD_MODES = ("fixed", "adaptive", "exact")
 DEFAULT_HIGH_TAIL_LOWER_BOUND = 0.99
 DEFAULT_EVENT_THRESHOLD_CAP = 4096
@@ -62,7 +71,13 @@ class ThresholdPlan:
 
 
 def default_threshold_grid() -> np.ndarray:
-    """Return a dense tail-aware grid with explicit empty/full endpoints."""
+    """Return a dense grid with both legal probability-domain endpoints.
+
+    Under strict ``probability > threshold`` semantics, 1 is the guaranteed
+    empty-prediction endpoint.  Zero is only the lowest legal threshold; it is
+    not a guaranteed full-prediction endpoint because zero-score pixels remain
+    excluded.
+    """
 
     return np.unique(
         np.concatenate(
@@ -300,6 +315,8 @@ def validate_score_map(record: ScoreMapRecord) -> ScoreMapRecord:
 def discover_score_maps(
     score_dir: str | Path,
     image_ids: Sequence[str] | None = None,
+    *,
+    allow_legacy_combined_diagnostic: bool = False,
 ) -> list[Path]:
     """Resolve score maps in manifest order and ignore stale unlisted files.
 
@@ -321,31 +338,14 @@ def discover_score_maps(
 
     manifest_path = root / "manifest.json"
     if manifest_path.is_file():
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        items = payload.get("items", payload.get("records"))
-        if not isinstance(items, list) or not items:
-            raise ValueError(f"Invalid or empty score manifest: {manifest_path}")
-        by_id: dict[str, Path] = {}
-        ordered_ids: list[str] = []
-        for item in items:
-            if not isinstance(item, Mapping) or "image_id" not in item:
-                raise ValueError("Every score manifest item must contain image_id")
-            image_id = str(item["image_id"])
-            if image_id in by_id:
-                raise ValueError(f"Duplicate image_id in score manifest: {image_id}")
-            value = item.get("file", item.get("prob_path", item.get("score_path")))
-            if value is None:
-                raise ValueError(f"Score manifest item {image_id!r} has no file path")
-            path = Path(value)
-            if not path.is_absolute():
-                path = manifest_path.parent / path
-            by_id[image_id] = path
-            ordered_ids.append(image_id)
-        selected_ids = ordered_ids if requested is None else requested
-        missing = [image_id for image_id in selected_ids if image_id not in by_id]
-        if missing:
-            raise KeyError(f"Requested image IDs are absent from score manifest: {missing}")
-        paths = [by_id[image_id] for image_id in selected_ids]
+        verified = verify_score_manifest_artifacts(
+            manifest_path,
+            image_ids=requested,
+            require_mask=allow_legacy_combined_diagnostic,
+            require_native_contract=True,
+            allow_legacy_combined_diagnostic=allow_legacy_combined_diagnostic,
+        )
+        paths = [item.score_path for item in verified.selected_items]
     else:
         paths = sorted(root.glob("*.npz"), key=lambda path: path.name)
         if requested is not None:
@@ -361,6 +361,42 @@ def discover_score_maps(
     if missing_paths:
         raise FileNotFoundError(f"Score manifest references missing files: {missing_paths}")
     return paths
+
+
+def load_attached_score_maps(
+    score_manifest: str | Path,
+    label_manifest: str | Path,
+    *,
+    image_ids: Sequence[str] | None = None,
+) -> tuple[list[ScoreMapRecord], str]:
+    """Load strict label-free scores and their independently bound labels."""
+
+    attachment = verify_label_attachment(
+        score_manifest,
+        label_manifest,
+        image_ids=image_ids,
+    )
+    score_items = attachment.score_manifest.selected_items
+    label_items = attachment.selected_items
+    if len(score_items) != len(label_items):
+        raise RuntimeError("verified score/label selections have different lengths")
+    records: list[ScoreMapRecord] = []
+    for score_item, label_item in zip(score_items, label_items):
+        if score_item.image_id != label_item.image_id:
+            raise RuntimeError("verified score/label selection order changed")
+        with np.load(score_item.score_path, allow_pickle=False) as payload:
+            probability = np.asarray(payload["prob"], dtype=np.float32)
+        records.append(
+            validate_score_map(
+                ScoreMapRecord(
+                    probability=probability,
+                    mask=load_label_mask(label_item),
+                    image_id=score_item.image_id,
+                    path=str(score_item.score_path),
+                )
+            )
+        )
+    return records, attachment.manifest_sha256
 
 
 def sweep_thresholds(
@@ -434,10 +470,25 @@ def write_curve_csv(
     image_ids: Sequence[str] | None = None,
     score_manifest: str | Path | None = None,
     threshold_audit: Mapping[str, object] | None = None,
+    matching_rule: str = "overlap",
+    centroid_distance: float = 3.0,
+    label_manifest: str | Path | None = None,
+    diagnostic_legacy_combined: bool = False,
 ) -> Path:
     rows = list(rows)
     if not rows:
         raise ValueError("Cannot write an empty threshold curve")
+    if matching_rule not in {"overlap", "centroid"}:
+        raise ValueError("matching_rule must be 'overlap' or 'centroid'")
+    if isinstance(centroid_distance, bool):
+        raise TypeError("centroid_distance must be a finite positive number")
+    centroid_distance = float(centroid_distance)
+    if not np.isfinite(centroid_distance) or centroid_distance <= 0.0:
+        raise ValueError("centroid_distance must be a finite positive number")
+    if label_manifest is not None and diagnostic_legacy_combined:
+        raise ValueError(
+            "label_manifest and diagnostic_legacy_combined are mutually exclusive"
+        )
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     invariant_fields = ("gt_objects", "total_pixels", "num_images")
@@ -467,6 +518,13 @@ def write_curve_csv(
         manifest["num_images"] = int(rows[0]["num_images"])
         manifest["gt_objects"] = int(rows[0]["gt_objects"])
         manifest["total_pixels"] = int(rows[0]["total_pixels"])
+        manifest["matching_rule"] = matching_rule
+        manifest["centroid_distance"] = centroid_distance
+        manifest["evaluation_scope"] = (
+            "score_bound_label_attachment_verified"
+            if label_manifest is not None
+            else "legacy_combined_npz_diagnostic"
+        )
         if image_ids is not None:
             ids = [str(value) for value in image_ids]
             if len(ids) != int(rows[0].get("num_images", len(ids))):
@@ -486,6 +544,38 @@ def write_curve_csv(
             manifest["target_dataset"] = source_payload.get("target_dataset")
             manifest["detector_weight_sha256"] = source_payload.get("weight_sha256")
             manifest["score_manifest_num_images"] = source_payload.get("num_images")
+        if label_manifest is not None:
+            if score_manifest is None:
+                raise ValueError("label_manifest requires score_manifest")
+            label_source = Path(label_manifest).expanduser().resolve()
+            if not label_source.is_file():
+                raise FileNotFoundError(
+                    f"Label manifest does not exist: {label_source}"
+                )
+            label_attachment = verify_label_attachment(
+                Path(score_manifest).expanduser().resolve(),
+                label_source,
+                image_ids=image_ids,
+            )
+            label_payload = label_attachment.payload
+            manifest["label_manifest_file"] = Path(
+                os.path.relpath(label_source, start=path.parent.resolve())
+            ).as_posix()
+            manifest["label_manifest_sha256"] = (
+                label_attachment.manifest_sha256
+            )
+            manifest["label_manifest_content_sha256"] = (
+                label_attachment.content_sha256
+            )
+            manifest["label_manifest_num_images"] = label_payload.get("num_images")
+            manifest["label_manifest_target_dataset"] = label_payload.get(
+                "target_dataset"
+            )
+        elif not diagnostic_legacy_combined:
+            raise ValueError(
+                "claim-bearing curve manifests require an independent label_manifest; "
+                "set diagnostic_legacy_combined=True only for legacy diagnostics"
+            )
         manifest_path = path.with_suffix(path.suffix + ".manifest.json")
         manifest_temporary = manifest_path.with_name(f".{manifest_path.name}.tmp")
         try:
@@ -560,6 +650,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--score-dir", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--label-manifest",
+        help="Independent score-bound label manifest required for verified curves.",
+    )
+    parser.add_argument(
+        "--diagnostic-allow-embedded-mask",
+        action="store_true",
+        help="Allow legacy combined score/mask NPZs only for diagnostics.",
+    )
     parser.add_argument("--matching-rule", choices=("overlap", "centroid"), default="overlap")
     parser.add_argument("--centroid-distance", type=float, default=3.0)
     parser.add_argument(
@@ -610,11 +709,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if len(set(requested_ids)) != len(requested_ids):
         raise ValueError("Requested image IDs contain duplicates")
-    score_paths = discover_score_maps(
-        args.score_dir,
-        requested_ids or None,
-    )
-    records = [load_score_map(path) for path in score_paths]
+    score_manifest = Path(args.score_dir) / "manifest.json"
+    if args.label_manifest:
+        if args.diagnostic_allow_embedded_mask:
+            raise ValueError(
+                "--label-manifest and --diagnostic-allow-embedded-mask are mutually exclusive"
+            )
+        if not score_manifest.is_file():
+            raise FileNotFoundError(
+                "--label-manifest requires <score-dir>/manifest.json"
+            )
+        records, _ = load_attached_score_maps(
+            score_manifest,
+            args.label_manifest,
+            image_ids=requested_ids or None,
+        )
+    else:
+        if not args.diagnostic_allow_embedded_mask:
+            raise ValueError(
+                "verified threshold sweeps require --label-manifest; use "
+                "--diagnostic-allow-embedded-mask only for legacy diagnostics"
+            )
+        score_paths = discover_score_maps(
+            args.score_dir,
+            requested_ids or None,
+            allow_legacy_combined_diagnostic=True,
+        )
+        records = [load_score_map(path) for path in score_paths]
     if args.event_threshold_cap < 0:
         raise ValueError("--event-threshold-cap must be non-negative")
     event_threshold_cap = args.event_threshold_cap or None
@@ -627,13 +748,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         event_threshold_cap=event_threshold_cap,
         return_metadata=True,
     )
-    score_manifest = Path(args.score_dir) / "manifest.json"
     output_path = write_curve_csv(
         rows,
         args.output,
         image_ids=[record.image_id for record in records],
         score_manifest=score_manifest if score_manifest.is_file() else None,
         threshold_audit=threshold_audit,
+        matching_rule=args.matching_rule,
+        centroid_distance=args.centroid_distance,
+        label_manifest=args.label_manifest,
+        diagnostic_legacy_combined=args.diagnostic_allow_embedded_mask,
     )
     print(
         f"Wrote {len(rows)} operating points to {output_path} "

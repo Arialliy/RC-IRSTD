@@ -11,6 +11,24 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from data_ext.label_manifest_artifacts import (
+    VerifiedLabelItem,
+    load_label_mask,
+    verify_label_attachment,
+)
+from data_ext.score_manifest_artifacts import (
+    VerifiedScoreItem,
+    verify_score_manifest_artifacts,
+)
+from evaluation.threshold_sweep import (
+    CURVE_FIELDS,
+    ScoreMapRecord,
+    build_threshold_plan,
+    default_threshold_grid,
+    sweep_thresholds,
+    threshold_grid_metadata,
+)
+
 from .domain_statistics import (
     DomainStatistics,
     extract_unlabeled_statistics,
@@ -177,15 +195,24 @@ def _read_json(path: Path) -> Mapping[str, Any]:
 
 
 def _checkpoint_sha(payload: Mapping[str, Any]) -> str:
-    for key in (
-        "weight_sha256",
-        "detector_checkpoint_sha",
-        "detector_weight_sha256",
-        "checkpoint_sha256",
-    ):
-        if key in payload:
-            return str(payload[key]).lower()
-    raise KeyError("manifest is missing detector checkpoint SHA-256")
+    values = [
+        str(payload[key]).lower()
+        for key in (
+            "weight_sha256",
+            "detector_checkpoint_sha",
+            "detector_weight_sha256",
+            "checkpoint_sha256",
+        )
+        if key in payload
+    ]
+    if not values:
+        raise KeyError("manifest is missing detector checkpoint SHA-256")
+    if len(set(values)) != 1:
+        raise ValueError("manifest contains conflicting detector checkpoint SHA fields")
+    value = values[0]
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError("manifest detector checkpoint SHA must be 64 hexadecimal characters")
+    return value
 
 
 def _manifest_contract_value(payload: Mapping[str, Any], key: str) -> Any:
@@ -213,8 +240,14 @@ def _verify_score_manifest(
     expected_protocol_scope: str,
     expected_image_ids: Sequence[str] | None = None,
     exact_image_ids: bool,
-) -> tuple[Mapping[str, Any], str]:
-    payload = _read_json(path)
+) -> tuple[Mapping[str, Any], str, tuple[VerifiedScoreItem, ...]]:
+    verified_manifest = verify_score_manifest_artifacts(
+        path,
+        image_ids=expected_image_ids,
+        require_mask=False,
+        require_native_contract=True,
+    )
+    payload = verified_manifest.payload
     target = str(payload.get("target_dataset", ""))
     if target != expected_target:
         raise ValueError(
@@ -248,11 +281,11 @@ def _verify_score_manifest(
         )
     if _manifest_contract_value(payload, "target_exclusion_verified") is not True:
         raise ValueError("score manifest does not verify target exclusion from detector sources")
-    manifest_ids = _manifest_image_ids(payload)
-    if len(set(manifest_ids)) != len(manifest_ids):
-        raise ValueError("score manifest image IDs must be unique")
-    if int(payload.get("num_images", len(manifest_ids))) != len(manifest_ids):
-        raise ValueError("score manifest num_images disagrees with its image IDs")
+    manifest_ids = tuple(str(item["image_id"]) for item in verified_manifest.items)
+    if "image_ids" in payload:
+        declared_ids = tuple(str(value) for value in payload["image_ids"])
+        if declared_ids != manifest_ids:
+            raise ValueError("score manifest image_ids disagree with its ordered items")
     if expected_image_ids is not None:
         expected = tuple(str(value) for value in expected_image_ids)
         if exact_image_ids:
@@ -262,19 +295,27 @@ def _verify_score_manifest(
             selected = tuple(image_id for image_id in manifest_ids if image_id in set(expected))
             if selected != expected:
                 raise ValueError("context IDs must occur in score manifest order")
-    return payload, _sha256(path)
+    return (
+        payload,
+        verified_manifest.manifest_sha256,
+        verified_manifest.selected_items,
+    )
 
 
 def _causal_window_status(
     *,
     context_manifest_sha: str,
     query_manifest_sha: str,
+    context_manifest_path: Path,
+    query_manifest_path: Path,
     manifest: Mapping[str, Any],
     context_ids: Sequence[str],
     query_ids: Sequence[str],
 ) -> tuple[bool, str | None]:
     """Verify one contiguous context-then-query window in one ordered export."""
 
+    if context_manifest_path.resolve() != query_manifest_path.resolve():
+        return False, "context/query use different resolved score-manifest paths"
     if context_manifest_sha != query_manifest_sha:
         return False, "context/query use different score manifests"
     manifest_ids = _manifest_image_ids(manifest)
@@ -399,6 +440,208 @@ def _verify_oracle_event_coverage(
         )
 
 
+def _audit_values_equal(expected: object, observed: object) -> bool:
+    """Compare JSON-restored threshold-plan metadata without loose coercion."""
+
+    if expected is None:
+        return observed is None
+    if isinstance(expected, bool):
+        return isinstance(observed, bool) and observed == expected
+    if isinstance(expected, int):
+        return (
+            isinstance(observed, int)
+            and not isinstance(observed, bool)
+            and observed == expected
+        )
+    if isinstance(expected, float):
+        if isinstance(observed, bool):
+            return False
+        try:
+            value = float(observed)
+        except (TypeError, ValueError):
+            return False
+        return np.isfinite(value) and value == expected
+    return observed == expected
+
+
+def _load_query_score_records(
+    verified_items: Sequence[VerifiedScoreItem],
+    label_items: Sequence[VerifiedLabelItem],
+) -> list[ScoreMapRecord]:
+    """Load verified query probabilities and masks for independent replay.
+
+    ``exact`` mode materialises all selected query scores inside
+    :func:`build_threshold_plan`; its peak memory and sort cost scale with the
+    total number of query pixels.  Verified construction then deliberately
+    repeats the full connected-component sweep over every planned threshold,
+    trading compute for an oracle label that is independent of the curve CSV.
+    """
+
+    if len(verified_items) != len(label_items):
+        raise RuntimeError("verified query score/label selections differ in length")
+    records: list[ScoreMapRecord] = []
+    for item, label_item in zip(verified_items, label_items):
+        if item.image_id != label_item.image_id:
+            raise RuntimeError("verified query score/label selection order changed")
+        with np.load(item.score_path, allow_pickle=False) as score_payload:
+            # Match evaluation.threshold_sweep.load_score_map's probability
+            # precision so event identities are reproduced byte-for-byte.
+            probability = np.asarray(score_payload["prob"], dtype=np.float32)
+        mask = load_label_mask(label_item)
+        records.append(
+            ScoreMapRecord(
+                probability=probability,
+                mask=mask,
+                image_id=item.image_id,
+                path=str(item.score_path),
+            )
+        )
+    return records
+
+
+def _verify_rederived_threshold_plan(
+    curve_manifest: Mapping[str, Any],
+    curve: Mapping[str, np.ndarray],
+    *,
+    query_items: Sequence[VerifiedScoreItem],
+    query_label_items: Sequence[VerifiedLabelItem],
+) -> list[dict[str, float | int]]:
+    """Rebuild, replay, and return the only curve eligible for oracle use."""
+
+    mode = curve_manifest.get("threshold_mode_requested")
+    if mode not in {"adaptive", "exact"}:
+        raise ValueError(
+            "verified episodes require threshold_mode_requested in {adaptive, exact}"
+        )
+    candidate_lower_bound = _audit_probability(
+        curve_manifest, "event_candidate_score_lower_bound"
+    )
+    cap_value = curve_manifest.get("event_threshold_cap")
+    if cap_value is None:
+        event_threshold_cap = None
+    else:
+        event_threshold_cap = _audit_integer(
+            curve_manifest, "event_threshold_cap"
+        )
+        if event_threshold_cap <= 0:
+            raise ValueError(
+                "curve manifest event_threshold_cap must be positive or null"
+            )
+
+    matching_rule = curve_manifest.get("matching_rule")
+    if matching_rule not in {"overlap", "centroid"}:
+        raise ValueError(
+            "curve manifest matching_rule must be 'overlap' or 'centroid'"
+        )
+    centroid_raw = curve_manifest.get("centroid_distance")
+    if isinstance(centroid_raw, bool):
+        raise TypeError(
+            "curve manifest centroid_distance must be a finite positive number"
+        )
+    try:
+        centroid_distance = float(centroid_raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "curve manifest centroid_distance must be a finite positive number"
+        ) from error
+    if not np.isfinite(centroid_distance) or centroid_distance <= 0.0:
+        raise ValueError(
+            "curve manifest centroid_distance must be a finite positive number"
+        )
+
+    records = _load_query_score_records(query_items, query_label_items)
+    plan = build_threshold_plan(
+        records,
+        default_threshold_grid(),
+        mode=mode,
+        high_tail_lower_bound=candidate_lower_bound,
+        event_threshold_cap=event_threshold_cap,
+    )
+    expected_metadata = threshold_grid_metadata(
+        plan.thresholds,
+        threshold_audit=plan.audit,
+    )
+
+    raw_manifest_thresholds = curve_manifest.get("thresholds")
+    if not isinstance(raw_manifest_thresholds, list) or not raw_manifest_thresholds:
+        raise ValueError("curve manifest must contain a non-empty thresholds list")
+    try:
+        manifest_thresholds = np.asarray(
+            raw_manifest_thresholds, dtype=np.float64
+        ).reshape(-1)
+    except (TypeError, ValueError) as error:
+        raise ValueError("curve manifest thresholds must be numeric") from error
+    if not np.isfinite(manifest_thresholds).all():
+        raise ValueError("curve manifest thresholds contain NaN/Inf")
+    if "threshold" not in curve:
+        raise ValueError("curve CSV is missing threshold column")
+    csv_thresholds = np.asarray(curve["threshold"], dtype=np.float64).reshape(-1)
+
+    if not np.array_equal(manifest_thresholds, csv_thresholds):
+        raise ValueError(
+            "curve CSV threshold column differs from curve manifest thresholds"
+        )
+    if not np.array_equal(manifest_thresholds, plan.thresholds):
+        raise ValueError(
+            "curve thresholds differ from the threshold plan rederived from "
+            "verified query scores"
+        )
+
+    # Verify every canonical grid/audit field emitted by write_curve_csv.  The
+    # curve may add unrelated provenance fields, but cannot hand-author any
+    # aspect of the event-plan contract.
+    for name, expected in expected_metadata.items():
+        if name == "thresholds":
+            continue
+        if name not in curve_manifest:
+            raise KeyError(f"curve manifest is missing threshold-plan field {name}")
+        if not _audit_values_equal(expected, curve_manifest[name]):
+            raise ValueError(
+                f"curve manifest {name} differs from the threshold plan "
+                "rederived from verified query scores"
+            )
+
+    recomputed_rows = sweep_thresholds(
+        records,
+        plan.thresholds,
+        matching_rule=str(matching_rule),
+        centroid_distance=centroid_distance,
+        threshold_mode="fixed",
+    )
+    integer_fields = {
+        "tp_objects",
+        "gt_objects",
+        "pred_components",
+        "fp_components",
+        "fp_pixels",
+        "total_pixels",
+        "num_images",
+    }
+    for field in CURVE_FIELDS:
+        if field not in curve:
+            raise ValueError(f"curve CSV is missing audited field {field!r}")
+        observed = np.asarray(curve[field], dtype=np.float64).reshape(-1)
+        expected = np.asarray(
+            [row[field] for row in recomputed_rows], dtype=np.float64
+        )
+        if field in integer_fields:
+            equal = np.array_equal(observed, expected)
+        else:
+            equal = np.allclose(
+                observed,
+                expected,
+                rtol=1e-12,
+                atol=1e-15,
+                equal_nan=False,
+            ) if observed.shape == expected.shape else False
+        if observed.shape != expected.shape or not equal:
+            raise ValueError(
+                f"curve CSV field {field!r} differs from independently "
+                "recomputed query sweep"
+            )
+    return recomputed_rows
+
+
 def _budget_from_spec(payload: Mapping[str, Any]) -> BudgetSpec:
     if "budgets" in payload:
         return BudgetSpec.from_dict(payload["budgets"])
@@ -447,7 +690,7 @@ def _episode_from_spec(
     if "context_manifest" not in payload:
         raise ValueError("verified episode construction requires context_manifest")
     context_manifest_path = _resolve_path(root, payload["context_manifest"])
-    context_manifest, context_manifest_sha = _verify_score_manifest(
+    context_manifest, context_manifest_sha, context_verified_items = _verify_score_manifest(
         context_manifest_path,
         expected_target=pseudo_target,
         expected_checkpoint_sha=fold.detector_checkpoint_sha,
@@ -461,45 +704,20 @@ def _episode_from_spec(
     )
     if str(payload.get("context_score_manifest_sha256", "")).lower() != context_manifest_sha:
         raise ValueError("spec context_score_manifest_sha256 does not match context manifest")
-    manifest_items = context_manifest.get("items", context_manifest.get("records"))
-    if not isinstance(manifest_items, list):
-        raise ValueError("context manifest requires items/records")
-    by_id = {str(item["image_id"]): item for item in manifest_items}
-    records = [by_id[image_id] for image_id in context_ids_requested]
-    record_root = context_manifest_path.parent
-    manifest_dataset_dir = context_manifest.get("dataset_dir")
     probabilities = []
     grays = []
     context_ids = []
     context_paths = []
-    for record in records:
-        if not isinstance(record, Mapping):
-            raise TypeError("context records must be mappings")
-        probability_value = record.get(
-            "prob_path", record.get("score_path", record.get("file"))
-        )
-        if probability_value is None:
-            raise KeyError("context record requires file, prob_path, or score_path")
-        probability_path = _resolve_path(record_root, probability_value)
-        grayscale_value = record.get("gray_path", record.get("image_path"))
-        if grayscale_value is None and manifest_dataset_dir is not None:
-            image_root = Path(manifest_dataset_dir)
-            if not image_root.is_absolute():
-                image_root = context_manifest_path.parent / image_root
-            image_root = image_root / "images"
-            matches = sorted(image_root.glob(f"{record['image_id']}.*"))
-            grayscale_path = matches[0] if matches else None
-        else:
-            grayscale_path = (
-                None if grayscale_value is None else _resolve_path(record_root, grayscale_value)
-            )
+    for verified_item in context_verified_items:
+        probability_path = verified_item.score_path
+        grayscale_path = verified_item.gray_path
         probability, grayscale = load_probability_and_grayscale(
             probability_path, grayscale_path
         )
         probabilities.append(probability)
         grays.append(grayscale)
         context_paths.append(_portable_path(probability_path, root))
-        context_ids.append(str(record.get("image_id", probability_path.stem)))
+        context_ids.append(verified_item.image_id)
     if any(value is None for value in grays) and not all(value is None for value in grays):
         raise ValueError("either every context record or no context record must provide grayscale")
     grayscale_images = None if all(value is None for value in grays) else grays
@@ -512,6 +730,9 @@ def _episode_from_spec(
     if tuple(context_ids) != context_ids_requested:
         raise ValueError("context_image_ids disagree with context record order")
 
+    label_manifest_path: Path | None = None
+    label_manifest_sha = ""
+    label_manifest_content_sha = ""
     if "curve_manifest" in payload:
         curve_manifest_path = _resolve_path(root, payload["curve_manifest"])
         curve_manifest = _read_json(curve_manifest_path)
@@ -534,7 +755,7 @@ def _episode_from_spec(
         query_manifest_path = _resolve_path(
             curve_manifest_path.parent, curve_manifest["score_manifest_file"]
         )
-        query_manifest, query_manifest_sha = _verify_score_manifest(
+        query_manifest, query_manifest_sha, query_verified_items = _verify_score_manifest(
             query_manifest_path,
             expected_target=pseudo_target,
             expected_checkpoint_sha=fold.detector_checkpoint_sha,
@@ -550,9 +771,55 @@ def _episode_from_spec(
             raise ValueError("query score manifest SHA-256 does not match curve manifest")
         if str(payload.get("query_score_manifest_sha256", "")).lower() != query_manifest_sha:
             raise ValueError("spec query_score_manifest_sha256 does not match query manifest")
+        if curve_manifest.get("evaluation_scope") != (
+            "score_bound_label_attachment_verified"
+        ):
+            raise ValueError(
+                "verified episodes require a score-bound label attachment curve"
+            )
+        if "label_manifest_file" not in curve_manifest:
+            raise KeyError("curve manifest is missing label_manifest_file")
+        label_manifest_path = _resolve_path(
+            curve_manifest_path.parent,
+            curve_manifest["label_manifest_file"],
+        )
+        label_attachment = verify_label_attachment(
+            query_manifest_path,
+            label_manifest_path,
+            image_ids=query_ids,
+        )
+        if label_attachment.score_manifest.manifest_sha256 != query_manifest_sha:
+            raise RuntimeError("label attachment reverified a different score manifest")
+        if str(curve_manifest.get("label_manifest_sha256", "")).lower() != (
+            label_attachment.manifest_sha256
+        ):
+            raise ValueError("label manifest SHA-256 does not match curve manifest")
+        if str(
+            curve_manifest.get("label_manifest_content_sha256", "")
+        ).lower() != label_attachment.content_sha256:
+            raise ValueError(
+                "label manifest content SHA-256 does not match curve manifest"
+            )
+        if int(curve_manifest.get("label_manifest_num_images", -1)) != len(
+            label_attachment.items
+        ):
+            raise ValueError("curve label_manifest_num_images is inconsistent")
+        if str(curve_manifest.get("label_manifest_target_dataset", "")) != (
+            pseudo_target
+        ):
+            raise ValueError(
+                "curve label_manifest_target_dataset must equal pseudo_target"
+            )
+        if str(label_attachment.payload.get("target_dataset", "")) != pseudo_target:
+            raise ValueError("label manifest target_dataset must equal pseudo_target")
+        query_label_items = label_attachment.selected_items
+        label_manifest_sha = label_attachment.manifest_sha256
+        label_manifest_content_sha = label_attachment.content_sha256
         causal_window_verified, causal_window_issue = _causal_window_status(
             context_manifest_sha=context_manifest_sha,
             query_manifest_sha=query_manifest_sha,
+            context_manifest_path=context_manifest_path,
+            query_manifest_path=query_manifest_path,
             manifest=query_manifest,
             context_ids=context_ids_requested,
             query_ids=query_ids,
@@ -569,7 +836,7 @@ def _episode_from_spec(
         curve_sha = _sha256(curve_path)
         curve_image_ids = tuple(str(value) for value in payload["curve_image_ids"])
         query_manifest_path = _resolve_path(root, payload["query_score_manifest"])
-        query_manifest, query_manifest_sha = _verify_score_manifest(
+        query_manifest, query_manifest_sha, _ = _verify_score_manifest(
             query_manifest_path,
             expected_target=pseudo_target,
             expected_checkpoint_sha=fold.detector_checkpoint_sha,
@@ -592,7 +859,14 @@ def _episode_from_spec(
             f"curve={curve_image_ids}, query={query_ids}"
         )
     curve = _load_curve_csv(curve_path)
+    oracle_curve: Any = curve
     if provenance_status == "verified":
+        oracle_curve = _verify_rederived_threshold_plan(
+            curve_manifest,
+            curve,
+            query_items=query_verified_items,
+            query_label_items=query_label_items,
+        )
         for field in ("num_images", "gt_objects", "total_pixels"):
             if field not in curve_manifest:
                 raise ValueError(f"curve manifest is missing audited count {field!r}")
@@ -613,6 +887,8 @@ def _episode_from_spec(
         context_score_manifest_sha256=context_manifest_sha,
         query_score_manifest_sha256=query_manifest_sha,
         query_score_target_dataset=str(query_manifest["target_dataset"]),
+        label_manifest_sha256=label_manifest_sha,
+        label_manifest_content_sha256=label_manifest_content_sha,
     )
     episode = build_meta_episode(
         episode_id=str(payload.get("episode_id", f"{pseudo_target}:{index:06d}")),
@@ -624,7 +900,7 @@ def _episode_from_spec(
         source_reference=source_reference,
         fold=fold,
         provenance=provenance,
-        curve=curve,
+        curve=oracle_curve,
         budgets=_budget_from_spec(payload),
         p_min=float(payload["p_min"]),
         threshold_transform=str(payload.get("threshold_transform", default_transform)),
@@ -641,6 +917,16 @@ def _episode_from_spec(
             "causal_window_verified": causal_window_verified,
             "causal_window_issue": causal_window_issue,
             "query_score_manifest_file": _portable_path(query_manifest_path, root),
+            "query_label_manifest_file": (
+                None
+                if label_manifest_path is None
+                else _portable_path(label_manifest_path, root)
+            ),
+            "query_label_manifest_sha256": (
+                None
+                if label_manifest_path is None
+                else _sha256(label_manifest_path)
+            ),
             "context_score_manifest_file": _portable_path(context_manifest_path, root),
             "source_reference_file": _portable_path(source_reference_path, root),
             "context_score_paths": context_paths,

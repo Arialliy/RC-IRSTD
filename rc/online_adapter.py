@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +11,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
+from data_ext.dataset_identity import sha256_file
+from data_ext.score_manifest_artifacts import verify_score_manifest_artifacts
 from model.threshold_calibrator import ThresholdCalibrator
 
 from .domain_statistics import (
@@ -53,19 +54,17 @@ def causal_partition(
     return context, query
 
 
-def _find_grayscale(image_root: Path | None, image_id: str) -> Path | None:
-    if image_root is None:
-        return None
-    matches = sorted(path for path in image_root.glob(f"{image_id}.*") if path.is_file())
-    return matches[0] if matches else None
-
-
 def load_ordered_score_records(
     manifest_or_directory: str | Path,
     *,
     image_dir: str | Path | None = None,
 ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
     source = Path(manifest_or_directory).expanduser().resolve()
+    if image_dir is not None:
+        raise ValueError(
+            "audited score manifests bind explicit image_path values; "
+            "--image-dir overrides are not supported"
+        )
     if source.is_dir():
         manifest_path = source / "manifest.json"
         if manifest_path.exists():
@@ -78,55 +77,27 @@ def load_ordered_score_records(
             if not records:
                 raise FileNotFoundError(f"no score maps found under {source}")
             raise ValueError("audited online adaptation requires a score manifest, not a bare directory")
-    with source.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    raw_items = manifest.get("items", manifest.get("records"))
-    if not isinstance(raw_items, list) or not raw_items:
-        raise ValueError("score manifest requires a non-empty items/records list")
-    if image_dir is not None:
-        image_root = Path(image_dir).expanduser().resolve()
-    elif manifest.get("dataset_dir"):
-        dataset_root = Path(manifest["dataset_dir"]).expanduser()
-        if not dataset_root.is_absolute():
-            dataset_root = source.parent / dataset_root
-        image_root = dataset_root.resolve() / "images"
-    else:
-        image_root = None
+    verified = verify_score_manifest_artifacts(
+        source,
+        require_mask=False,
+        require_native_contract=True,
+        verify_artifact_bytes=False,
+    )
     records = []
-    for item in raw_items:
-        image_id = str(item["image_id"])
-        probability_value = item.get(
-            "prob_path", item.get("score_path", item.get("file"))
-        )
-        if probability_value is None:
-            raise KeyError(f"manifest item {image_id!r} lacks file/prob_path/score_path")
-        probability_path = Path(probability_value)
-        if not probability_path.is_absolute():
-            probability_path = source.parent / probability_path
-        gray_value = item.get("gray_path", item.get("image_path"))
-        gray_path = (
-            _find_grayscale(image_root, image_id)
-            if gray_value is None
-            else Path(gray_value).expanduser()
-        )
-        if gray_path is not None and not gray_path.is_absolute():
-            gray_path = source.parent / gray_path
+    for item in verified.items:
+        score_value = item.get("file", item.get("prob_path", item.get("score_path")))
+        if score_value is None:
+            raise KeyError(f"score manifest item {item.get('image_id')!r} lacks a file")
+        score_path = (verified.path.parent / str(score_value)).resolve()
+        gray_path = (verified.path.parent / str(item["image_path"])).resolve()
         records.append(
             {
-                "image_id": image_id,
-                "prob_path": str(probability_path.resolve()),
-                "gray_path": None if gray_path is None else str(gray_path.resolve()),
+                "image_id": str(item["image_id"]),
+                "prob_path": str(score_path),
+                "gray_path": str(gray_path),
             }
         )
-    return records, manifest
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return records, verified.payload
 
 
 def _torch_load(path: str | Path, device: torch.device) -> Mapping[str, Any]:
@@ -148,6 +119,27 @@ def _manifest_contract_value(payload: Mapping[str, Any], key: str) -> Any:
     if top_present:
         return payload[key]
     return nested[key] if nested_present else None
+
+
+def _score_manifest_checkpoint_sha(payload: Mapping[str, Any]) -> str:
+    values = []
+    for key in (
+        "weight_sha256",
+        "detector_checkpoint_sha",
+        "detector_weight_sha256",
+        "checkpoint_sha256",
+    ):
+        value = _manifest_contract_value(payload, key)
+        if value is not None:
+            values.append(str(value).lower())
+    if not values:
+        raise KeyError("score manifest is missing detector checkpoint SHA-256")
+    if len(set(values)) != 1:
+        raise ValueError("score manifest contains conflicting detector checkpoint SHA fields")
+    value = values[0]
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError("score manifest detector checkpoint SHA must be 64 hexadecimal characters")
+    return value
 
 
 def _deployment_contract(
@@ -179,6 +171,7 @@ def load_calibrator_bundle(
 ) -> tuple[ThresholdCalibrator, FeatureStandardizer, Mapping[str, Any]]:
     checkpoint = _torch_load(checkpoint_path, device)
     required = {
+        "format_version",
         "model_state_dict",
         "input_dim",
         "hidden_dim",
@@ -190,6 +183,9 @@ def load_calibrator_bundle(
         "p_min",
         "outer_fold_id",
         "outer_target",
+        "episode_collection_provenance",
+        "episode_collection_sha256",
+        "training_config",
         "calibration_pseudo_targets",
         "deployment_detector_source_domains",
         "deployment_detector_checkpoint_sha",
@@ -200,6 +196,17 @@ def load_calibrator_bundle(
     missing = required.difference(checkpoint)
     if missing:
         raise KeyError(f"calibrator checkpoint is missing: {sorted(missing)}")
+    if checkpoint["format_version"] != "rc-irstd.calibrator.v3":
+        raise ValueError("unsupported calibrator checkpoint format_version")
+    collection_sha = str(checkpoint["episode_collection_sha256"])
+    if len(collection_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in collection_sha
+    ):
+        raise ValueError("checkpoint episode_collection_sha256 is invalid")
+    if not isinstance(checkpoint["episode_collection_provenance"], Mapping):
+        raise TypeError("checkpoint episode_collection_provenance must be a mapping")
+    if not isinstance(checkpoint["training_config"], Mapping):
+        raise TypeError("checkpoint training_config must be a mapping")
     model = ThresholdCalibrator(
         int(checkpoint["input_dim"]),
         hidden_dim=int(checkpoint["hidden_dim"]),
@@ -229,7 +236,7 @@ def adapt_context_to_query(
     device: torch.device,
     target_domain: str,
     reject_probability: float | None = None,
-    temporal_order_verified: bool = False,
+    temporal_order_asserted: bool = False,
 ) -> dict[str, Any]:
     """Estimate one threshold using context only, then bind it to later query IDs."""
 
@@ -263,7 +270,7 @@ def adapt_context_to_query(
         raise ValueError("online main protocol requires a multi-source detector checkpoint")
     if _manifest_contract_value(score_manifest, "target_exclusion_verified") is not True:
         raise ValueError("score manifest does not verify target-domain exclusion")
-    manifest_checkpoint_sha = str(score_manifest.get("weight_sha256", "")).lower()
+    manifest_checkpoint_sha = _score_manifest_checkpoint_sha(score_manifest)
     expected_checkpoint_sha = str(
         checkpoint_metadata["deployment_detector_checkpoint_sha"]
     ).lower()
@@ -340,11 +347,15 @@ def adapt_context_to_query(
         raise ValueError("reject_probability must lie in [0, 1]")
     return {
         "schema_version": SCHEMA_VERSION,
-        "mode": "causal_online" if temporal_order_verified else "prefix_holdout",
+        "mode": "asserted_temporal_prefix" if temporal_order_asserted else "prefix_holdout",
         "protocol": (
-            "verified_temporal_prefix" if temporal_order_verified else "manifest_order_prefix_holdout"
+            "user_asserted_temporal_order"
+            if temporal_order_asserted
+            else "manifest_order_prefix_holdout"
         ),
-        "temporal_order_verified": bool(temporal_order_verified),
+        # A CLI assertion is useful provenance, but it is not independent
+        # verification against acquisition timestamps or a signed source log.
+        "temporal_order_asserted": bool(temporal_order_asserted),
         "target_domain": target_domain,
         "outer_fold_id": str(checkpoint_metadata["outer_fold_id"]),
         "outer_target": outer_target,
@@ -356,6 +367,10 @@ def adapt_context_to_query(
         "score_manifest_target_dataset": manifest_target,
         "score_manifest_detector_checkpoint_sha": manifest_checkpoint_sha,
         "calibration_pseudo_targets": list(calibration_targets),
+        "calibrator_format_version": str(checkpoint_metadata["format_version"]),
+        "episode_collection_sha256": str(
+            checkpoint_metadata["episode_collection_sha256"]
+        ),
         "context_image_ids": list(context_ids),
         "query_image_ids": list(query_ids),
         "causal_boundary": {
@@ -399,12 +414,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pixel-budget", type=float)
     parser.add_argument("--component-budget", type=float)
     parser.add_argument("--source-reference")
-    parser.add_argument("--image-dir")
     parser.add_argument("--reject-probability", type=float)
     parser.add_argument(
+        "--assert-temporal-order",
         "--temporal-order-verified",
+        dest="temporal_order_asserted",
         action="store_true",
-        help="Assert manifest order is a verified temporal stream; otherwise report prefix_holdout",
+        help=(
+            "Record the user's assertion that manifest order follows acquisition time. "
+            "This is not independent verification; otherwise report prefix_holdout."
+        ),
     )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--output", required=True)
@@ -424,13 +443,39 @@ def _select_device(value: str) -> torch.device:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     budgets = BudgetSpec.from_optional(args.pixel_budget, args.component_budget)
-    records, manifest = load_ordered_score_records(args.manifest, image_dir=args.image_dir)
+    records, manifest = load_ordered_score_records(args.manifest)
     context, query = causal_partition(
         records, context_size=args.context_size, query_size=args.query_size
     )
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    if manifest_path.is_dir():
+        manifest_path = manifest_path / "manifest.json"
+    manifest_sha256 = sha256_file(manifest_path)
+    context_ids = tuple(str(record["image_id"]) for record in context)
+    verified_context = verify_score_manifest_artifacts(
+        manifest_path,
+        image_ids=context_ids,
+        require_mask=False,
+        require_native_contract=True,
+    )
+    if (
+        verified_context.manifest_sha256 != manifest_sha256
+        or verified_context.payload != manifest
+    ):
+        raise RuntimeError("score manifest changed while verifying the context prefix")
+    verified_context_paths = tuple(
+        (str(item.score_path), str(item.gray_path))
+        for item in verified_context.selected_items
+    )
+    record_context_paths = tuple(
+        (str(record["prob_path"]), str(record["gray_path"])) for record in context
+    )
+    if verified_context_paths != record_context_paths:
+        raise RuntimeError("verified context paths differ from manifest record binding")
     device = _select_device(args.device)
+    calibrator_checkpoint_path = Path(args.calibrator_checkpoint).expanduser().resolve()
     model, standardizer, checkpoint = load_calibrator_bundle(
-        args.calibrator_checkpoint, device=device
+        calibrator_checkpoint_path, device=device
     )
     statistics_config = StatisticsConfig.from_dict(checkpoint["statistics_config"])
     _, embedded_reference = _deployment_contract(checkpoint)
@@ -443,10 +488,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if source_reference != embedded_reference:
             raise ValueError("provided source reference differs from checkpoint")
-    manifest_path = Path(args.manifest).expanduser().resolve()
-    if manifest_path.is_dir():
-        manifest_path = manifest_path / "manifest.json"
-    manifest_sha256 = _sha256_file(manifest_path)
     result = adapt_context_to_query(
         model=model,
         standardizer=standardizer,
@@ -460,10 +501,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=device,
         target_domain=args.target_domain,
         reject_probability=args.reject_probability,
-        temporal_order_verified=args.temporal_order_verified,
+        temporal_order_asserted=args.temporal_order_asserted,
     )
     result["score_manifest"] = Path(args.manifest).name
-    result["calibrator_checkpoint"] = Path(args.calibrator_checkpoint).name
+    result["calibrator_checkpoint"] = calibrator_checkpoint_path.name
+    result["calibrator_checkpoint_sha256"] = sha256_file(
+        calibrator_checkpoint_path
+    )
     result["score_manifest_target"] = manifest.get("target_dataset")
     _write_json_atomic(Path(args.output), result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))

@@ -44,8 +44,8 @@
 ### 0.3 当前本地证据与阻塞
 
 - 本地实际有 IRSTD-1K、NUDT-SIRST 和 NUAA-SIRST 三个域；NUAA 掩码同时存在 `<id>.png` 与 `<id>_pixels0.png` 变体，不能用 `name.*` 否则会误选 XML。本地镜像中 `Misc_111` 的掩码画布与图像尺寸不同，评估 loader 使用 nearest-neighbor 对齐到图像画布，并在 artifact/manifest 中保留原掩码尺寸与对齐标志。
-- 三个域可用于代码 smoke test，但固定一个 outer target 后再做 inner LODO 时，detector 只剩一个训练域。这类运行必须标记为 `single_source_inner_smoke_not_main_result`；主实验至少需第四个去重独立域。
-- 主机 Python 当前未安装 PyTorch；仓库已补齐依赖声明，并已在现有 PyTorch GPU 容器中完成三域/多 GPU 一步训练、201 张 score-map 导出和 query 高尾 sweep smoke test。这些数字只记录在 `baseline_results.md`；所有 claim-bearing 结果单元格仍保持 `TBD`，禁止从旧日志推导新结论。
+- 三个域可用于代码 smoke test，但固定一个 outer target 后再做 inner LODO 时，detector 只剩一个训练域。这类运行必须标记为 `single_source_inner_smoke_not_main_result`。第四个去重独立域只是让“两源 inner detector + 一 pseudo-target + 一 outer target”能运行的最低配置；主证据仍建议使用至少 4 个 meta-source 与 3 个额外 external unseen targets。
+- 主机 Python 当前未安装 PyTorch；仓库已补齐依赖声明，并已在现有 PyTorch GPU 容器中分别完成“三域、单 GPU、一步”与“两域、双 GPU、一步”训练，以及 201 张 score-map 导出和 query 高尾 sweep smoke test。这些数字只记录在 `baseline_results.md`；所有 claim-bearing 结果单元格仍保持 `TBD`，禁止从旧日志推导新结论。
 
 ---
 
@@ -605,26 +605,30 @@ P_d(\tau_B^*)<P_{\min}
 https://github.com/ying-fu/MSHNet
 ```
 
-建议新增：
+本轮已落地的目录如下（早期草案中的 `data/`、`calibration/` 和 shell wrapper 已被统一为这些实际路径）：
 
 ```text
 <repo-root>/
-├── data/
+├── data_ext/
 │   ├── multi_source_dataset.py
-│   ├── domain_balanced_sampler.py
-│   └── target_window_dataset.py
+│   ├── balanced_domain_loader.py
+│   ├── eval_dataset.py
+│   ├── dataset_meta.py
+│   └── split_utils.py
 │
 ├── losses/
-│   ├── tail_cvar_loss.py
+│   ├── local_peak_cvar.py
 │   ├── hard_target_loss.py
 │   └── smooth_worst_domain.py
 │
-├── calibration/
-│   ├── extract_domain_statistics.py
+├── rc/
+│   ├── domain_statistics.py
+│   ├── build_source_reference.py
 │   ├── build_meta_episodes.py
 │   ├── oracle_threshold.py
-│   ├── train_threshold_calibrator.py
-│   └── online_threshold_adapter.py
+│   ├── meta_dataset.py
+│   ├── train_calibrator.py
+│   └── online_adapter.py
 │
 ├── model/
 │   ├── MSHNet.py
@@ -635,13 +639,11 @@ https://github.com/ying-fu/MSHNet
 │   ├── threshold_sweep.py
 │   ├── component_matching.py
 │   ├── budget_metrics.py
-│   └── error_analysis.py
+│   ├── operating_point.py
+│   └── evaluate_adapter_output.py
 │
 └── scripts/
-    ├── train_multisource_detector.py
-    ├── export_meta_data.py
-    ├── train_rc_calibrator.py
-    └── evaluate_rc.py
+    └── train_multisource_tail.py
 ```
 
 ---
@@ -1190,9 +1192,11 @@ datasets/<name>/
 │   └── split_utils.py
 │
 ├── scripts/
-│   ├── smoke_test.sh
-│   ├── export_cross_domain_scores.sh
-│   └── evaluate_cross_domain.sh
+│   └── train_multisource_tail.py
+├── tests/
+│   ├── test_evaluation.py
+│   ├── test_rc.py
+│   └── test_risk_losses.py
 │
 └── outputs/
     ├── score_maps/
@@ -1257,7 +1261,7 @@ repro_runs/smoke/<run-name>/
 - loss 为有限数值；
 - checkpoint 可重新加载；
 - 测试不报 shape 错误；
-- 当前基线 IoU/Pd/Fa 被记录到 `baseline_results.md`；
+- 运行状态、checkpoint provenance 和评估协议被记录到 `baseline_results.md`；legacy test-selected IoU/Pd/Fa 不得作为 RC 证据；
 - 此后所有新代码都不能破坏以上命令。
 
 ---
@@ -1281,6 +1285,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+
+from data_ext.split_utils import resolve_image_and_mask, resolve_split_file
 
 
 @dataclass(frozen=True)
@@ -1309,17 +1315,12 @@ class IRSTDEvalDataset(Dataset):
         self.dataset_name = self.root.name
         self.base_size = base_size
 
-        split_files = sorted(
-            (self.root / "img_idx").glob("test*.txt")
+        # 真实实现使用 data_ext.split_utils；
+        # 多个候选 split 必须硬报错，不得默认取第一个。
+        split_file = resolve_split_file(
+            self.root,
+            split="test",
         )
-        if split_files:
-            split_file = split_files[0]
-        else:
-            split_file = self.root / "test.txt"
-            if not split_file.exists():
-                raise FileNotFoundError(
-                    f"No test split found under {self.root}"
-                )
 
         self.names = [
             line.strip()
@@ -1337,20 +1338,6 @@ class IRSTDEvalDataset(Dataset):
             ),
         ])
 
-    def _resolve(
-        self,
-        folder: str,
-        image_id: str,
-    ) -> Path:
-        matches = sorted(
-            (self.root / folder).glob(f"{image_id}.*")
-        )
-        if not matches:
-            raise FileNotFoundError(
-                f"Missing {folder} file for {image_id}"
-            )
-        return matches[0]
-
     def __len__(self) -> int:
         return len(self.names)
 
@@ -1359,12 +1346,12 @@ class IRSTDEvalDataset(Dataset):
         index: int,
     ) -> Dict[str, object]:
         image_id = Path(self.names[index]).stem
-        image = Image.open(
-            self._resolve("images", image_id)
-        ).convert("RGB")
-        mask = Image.open(
-            self._resolve("masks", image_id)
-        ).convert("L")
+        image_path, mask_path = resolve_image_and_mask(
+            self.root,
+            self.names[index],
+        )
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
 
         original_hw = (image.height, image.width)
 
@@ -1589,7 +1576,7 @@ fp_pixels,total_pixels
 ### 验收条件
 
 - 随阈值升高，`fa_pixel` 单调不增；
-- 阈值 1.0 附近的预测接近空集；
+- 在 `prediction = probability > threshold` 且概率位于 `[0,1]` 的契约下，阈值 1.0 的预测必为空集；
 - 阈值 0.0 附近的虚警很高；
 - 同一 score map 重复运行得到完全相同结果。
 
@@ -1725,14 +1712,16 @@ outputs/experiments/<experiment_id>/
 
 ## 2. RC 文件级改动清单
 
-在 `feat/tail-risk-detector` 和 `exp/rc-irstd` 分支新增：
+当前工作树已实现：
 
 ```text
 <repo-root>/
 ├── data_ext/
 │   ├── multi_source_dataset.py
 │   ├── balanced_domain_loader.py
-│   └── target_window_dataset.py
+│   ├── eval_dataset.py
+│   ├── dataset_meta.py
+│   └── split_utils.py
 │
 ├── losses/
 │   ├── __init__.py
@@ -1746,6 +1735,7 @@ outputs/experiments/<experiment_id>/
 ├── rc/
 │   ├── __init__.py
 │   ├── domain_statistics.py
+│   ├── build_source_reference.py
 │   ├── oracle_threshold.py
 │   ├── build_meta_episodes.py
 │   ├── meta_dataset.py
@@ -1753,10 +1743,7 @@ outputs/experiments/<experiment_id>/
 │   └── online_adapter.py
 │
 └── scripts/
-    ├── train_multisource_tail.py
-    ├── build_rc_episodes.sh
-    ├── train_rc_calibrator.sh
-    └── test_rc.sh
+    └── train_multisource_tail.py
 ```
 
 ---
@@ -2047,29 +2034,41 @@ Detector AB → pseudo-target C
 rc/build_meta_episodes.py
 ```
 
-每个 episode：
+不得手写 `statistics`、`oracle_threshold` 或 `reject_label`。它们必须由同一个有序 pseudo-target score manifest 的无标签 context 和带标签 query curve 生成。schema-v3 builder 的单个 episode **输入 spec** 如下：
 
 ```json
 {
-  "pseudo_target": "IRSTD-1K",
-  "context_image_ids": ["...", "..."],
-  "query_image_ids": ["...", "..."],
-  "window_size": 32,
-  "statistics": [],
-  "pixel_budget": 1e-6,
-  "pixel_budget_active": true,
-  "component_budget": null,
-  "component_budget_active": false,
-  "oracle_threshold": 0.973,
-  "oracle_pd": 0.86,
-  "oracle_fa_pixel": 0.00000094,
-  "oracle_fa_component_mp": 0.0,
+  "episode_id": "outer-D__pseudo-A__w000",
+  "pseudo_target": "A",
+  "outer_fold_id": "outer-D",
+  "outer_target": "D",
+  "detector_source_domains": ["B", "C"],
+  "detector_checkpoint_sha": "<64-char-lowercase-sha256>",
+  "held_out_domains": ["A", "D"],
+  "protocol_scope": "multi_source_protocol_candidate",
+  "statistics_config": {
+    "peak_kernel_size": 3,
+    "peak_min_score": 0.05
+  },
+  "source_reference": "../../artifacts/outer-D/pseudo-A/source-reference.npz",
+  "context_manifest": "../../scores/outer-D/pseudo-A/A/manifest.json",
+  "context_score_manifest_sha256": "<manifest-sha256>",
+  "context_image_ids": ["a000", "a001", "a002"],
+  "query_image_ids": ["a003", "a004", "a005"],
+  "curve_manifest": "../../curves/outer-D/pseudo-A/query.csv.manifest.json",
+  "curve_manifest_sha256": "<curve-manifest-sha256>",
+  "query_score_manifest_sha256": "<same-manifest-sha256>",
+  "budgets": {
+    "names": ["pixel", "component"],
+    "values": [1e-6, 1.0],
+    "active": [true, true]
+  },
   "p_min": 0.2,
-  "reject_label": 0
+  "threshold_transform": "identity"
 }
 ```
 
-Episode builder 必须断言 `context_image_ids` 与 `query_image_ids` 不相交。Budget 的 `log10` 变换只在数值特征层执行，JSON 保留原始单位以便审计。
+Builder 以 spec 文件所在目录为相对路径锚点；上例假定 spec 位于 `outputs/specs/outer-D/episode-spec.json`。Builder 必须断言：`context_image_ids` 与 `query_image_ids` 不相交；两者来自同一 manifest，且组成连续的 context-first/query-second 窗口；manifest、curve 和 source reference 的 checkpoint/fold/domain/SHA 合同逐项相等。Budget 的 `log10` 变换只在数值特征层执行，JSON 保留原始单位以便审计。builder 输出的 JSONL 才会嵌入计算后的 statistics、oracle、reject 和 provenance。
 
 窗口：
 
@@ -2272,10 +2271,11 @@ python -m rc.online_adapter \
 python -m evaluation.evaluate_adapter_output \
   --adapter-output outputs/rc/realscene_zero_label.json \
   --score-manifest outputs/scores/realscene/manifest.json \
+  --calibrator-checkpoint outputs/rc/threshold_calibrator.pt \
   --output outputs/rc/realscene_query_metrics.json
 ```
 
-第一条命令只读取无标签 context score maps，输出阈值/reject 及与 query IDs 的 SHA-256 绑定；第二条命令是独立的 label-using offline replay，仅在核验 target domain、detector hash、manifest hash 和 query 顺序后计算 Pd/FA。若 score manifest 的顺序不是经证实的时间流，结果必须报告为 `prefix_holdout`；只有显式提供 `--temporal-order-verified` 时才能报告 `causal_online`。
+第一条命令只读取无标签 context score maps，输出阈值/reject，并绑定 calibrator checkpoint SHA、detector/manifest SHA 与 query IDs；第二条命令是独立的 label-using offline replay，必须传入实际 calibrator checkpoint。它先核验 checkpoint SHA，并在 CPU 上确定性重跑 context→threshold/reject、逐项比对原输出，然后才读取 query 标签计算 Pd/FA。默认必须报告为 `prefix_holdout`。`--assert-temporal-order`（旧参数名 `--temporal-order-verified` 仅作兼容别名）只记录用户对采集时序的声明，输出为 `asserted_temporal_prefix`，不得称为独立验证的 `causal_online`；若要使用后者，还需额外的带签名采集时间戳/日志证据及其核验器。
 
 禁止使用目标标签选择：
 
@@ -2283,6 +2283,128 @@ python -m evaluation.evaluate_adapter_output \
 - 窗口长度；
 - 特征组合；
 - checkpoint。
+
+---
+
+## 11.1 schema-v3 可执行工件链
+
+下列 A/B/C/D 是逻辑域：D 是本 outer fold 最终不可见目标，A 是当前 inner fold 的 pseudo-target，B/C 是训练 inner detector 的源域。本地现有三域在固定 outer target 后无法同时保证“两个 detector source + 一个 pseudo-target”；因此下列主协议需要至少第四个合法独立域。
+
+### A. 训练 inner detector
+
+```bash
+python -m scripts.train_multisource_tail \
+  --source-dirs datasets/B datasets/C \
+  --source-names B C \
+  --outer-fold-id outer-D \
+  --outer-target D \
+  --held-out-domains A D \
+  --batch-per-domain 2 \
+  --epochs 400 \
+  --device cuda \
+  --save-dir outputs/detectors \
+  --run-name outer-D__pseudo-A
+```
+
+checkpoint 必须标记 `checkpoint_selection=fixed_last_no_test_or_target_validation`。若三域环境只能留下一个 detector source，仅可显式加 `--allow-single-source-inner-smoke`；该工件会被标记为 `single_source_inner_smoke_not_main_result`，schema-v3 主协议 episode 会拒绝它。
+
+### B. 用同一 inner checkpoint 导出 B/C/A score manifests
+
+```bash
+CKPT=outputs/detectors/outer-D__pseudo-A/checkpoint_last.pt
+
+python -m evaluation.export_score_maps \
+  --dataset-dir datasets/B --split train \
+  --weight-path "$CKPT" \
+  --output-dir outputs/scores/outer-D/pseudo-A/B \
+  --device cuda
+
+python -m evaluation.export_score_maps \
+  --dataset-dir datasets/C --split train \
+  --weight-path "$CKPT" \
+  --output-dir outputs/scores/outer-D/pseudo-A/C \
+  --device cuda
+
+python -m evaluation.export_score_maps \
+  --dataset-dir datasets/A --split test \
+  --weight-path "$CKPT" \
+  --output-dir outputs/scores/outer-D/pseudo-A/A \
+  --device cuda
+```
+
+主实验建议对每个域使用显式 `--split-file`，不依赖数据集的默认文件名。B/C manifests 只用于无标签 source statistics；A manifest 同时承载有序 context 和后续 query。
+
+### C. 构建与 detector/fold 绑定的 source reference
+
+```bash
+python -m rc.build_source_reference \
+  --score-manifest outputs/scores/outer-D/pseudo-A/B/manifest.json \
+  --score-manifest outputs/scores/outer-D/pseudo-A/C/manifest.json \
+  --domain B \
+  --domain C \
+  --peak-kernel-size 3 \
+  --peak-min-score 0.05 \
+  --output outputs/artifacts/outer-D/pseudo-A/source-reference.npz
+```
+
+NPZ 中的 `source_contract_json` 必须同时嵌入 checkpoint SHA、有序 detector sources、outer fold/target、held-out domains 和 `protocol_scope`。Builder 不读 mask，只读概率图与可选灰度图。
+
+### D. 从 A manifest 取连续 context/query，扫描 query curve
+
+`context_image_ids + query_image_ids` 必须等于 A manifest 中的一段连续子序列，且 context 在前。将 query IDs 按原顺序写入 `query.txt` 后执行：
+
+```bash
+python -m evaluation.threshold_sweep \
+  --score-dir outputs/scores/outer-D/pseudo-A/A \
+  --image-id-file outputs/splits/outer-D/pseudo-A/query.txt \
+  --threshold-mode adaptive \
+  --event-threshold-cap 4096 \
+  --output outputs/curves/outer-D/pseudo-A/query.csv
+```
+
+schema-v3 只接受 `adaptive` 或 `exact` curve。`exact` 必须全局覆盖所有 query score events；被 cap 的 adaptive/exact curve 只在 oracle threshold 位于 manifest 记录的完整 event-exact 高分后缀时才可用。`threshold=1.0` 是独立的严格空预测哨兵点。
+
+### E. 构建可训练 episode
+
+按 Step R5 的 schema-v3 示例生成 `episode-spec.json`。所有 SHA 必须来自实际文件，例如：
+
+```bash
+sha256sum \
+  outputs/detectors/outer-D__pseudo-A/checkpoint_last.pt \
+  outputs/scores/outer-D/pseudo-A/A/manifest.json \
+  outputs/curves/outer-D/pseudo-A/query.csv.manifest.json
+
+python -m rc.build_meta_episodes \
+  --spec-file outputs/specs/outer-D/episode-spec.json \
+  --output outputs/episodes/outer-D.jsonl \
+  --threshold-transform identity
+```
+
+手写 `curve_path/curve_image_ids` 的旧入口只会产生 `asserted_unverified` episode；`rc.train_calibrator` 必须拒绝它。对 A/B/C 轮换 pseudo-target，使用各自严格留出的 inner detector 重复 A–E。
+
+### F. 训练 calibrator 并绑定 outer deployment detector
+
+先用 A/B/C 训练只留出 D 的 outer detector，并用该 outer checkpoint 在 A/B/C 上导出 source manifests、构建 deployment source reference。然后：
+
+```bash
+python -m rc.train_calibrator \
+  --episodes outputs/episodes/outer-D.jsonl \
+  --val-pseudo-target C \
+  --output-dir outputs/rc/outer-D \
+  --deployment-detector-checkpoint-sha "<outer-detector-sha256>" \
+  --deployment-detector-source-domain A \
+  --deployment-detector-source-domain B \
+  --deployment-detector-source-domain C \
+  --deployment-source-reference outputs/artifacts/outer-D/deployment-source-reference.npz \
+  --epochs 100 \
+  --device cuda
+```
+
+validation pseudo-target 不得出现在 calibrator train episodes 中；feature standardizer 只在 train episodes 上拟合。deployment reference 的 contract 必须与上述 outer detector SHA/sources/fold 逐项一致。
+
+### G. 最终 D 的无标签在线适配与独立回放
+
+先用 outer detector 导出 D 的完整有序 manifest，再执行 Step R9 的 `rc.online_adapter` 和 `evaluation.evaluate_adapter_output`。第一步只读 manifest prefix 中的无标签分数；第二步才用 query mask 计算 Pd/FA/BSR/Excess。
 
 ---
 
@@ -2298,7 +2420,7 @@ python -m evaluation.evaluate_adapter_output \
 - [ ] Step R5：严格 LODO detectors 的全量 checkpoint（契约已实现，实验产物未生成）；
 - [x] Step R6：无标签窗口统计与 fold-specific source reference；
 - [x] Step R7：自适应高尾 curve 与 oracle threshold 元标签；
-- [x] Step R8：直接阈值校准器基线及 schema-v2 溯源；
+- [x] Step R8：直接阈值校准器基线及 schema-v3 溯源；
 - [x] Step R9：prefix-holdout/causal online 适配与独立 query replay；
 - [ ] rolling quantile 和 EVT；
 - [ ] 不同窗口长度；

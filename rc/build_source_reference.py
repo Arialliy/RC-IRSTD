@@ -16,6 +16,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from data_ext.score_manifest_artifacts import (
+    VerifiedScoreItem,
+    verify_score_manifest_artifacts,
+)
+
 from .domain_statistics import (
     BASE_FEATURE_DIM,
     extract_unlabeled_statistics,
@@ -31,7 +36,6 @@ _CHECKPOINT_SHA_FIELDS = (
     "detector_weight_sha256",
     "checkpoint_sha256",
 )
-_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
 _SCALE_FLOOR = 1e-8
 
 
@@ -90,92 +94,16 @@ def _manifest_contract_value(payload: Mapping[str, Any], key: str) -> Any:
     return payload[key] if top_present else nested_value
 
 
-def _manifest_items(payload: Mapping[str, Any], path: Path) -> tuple[Mapping[str, Any], ...]:
-    raw_items = payload.get("items", payload.get("records"))
-    if not isinstance(raw_items, list) or not raw_items:
-        raise ValueError(f"score manifest requires a non-empty items/records list: {path}")
-    items: list[Mapping[str, Any]] = []
-    image_ids: list[str] = []
-    score_files: list[str] = []
-    for index, item in enumerate(raw_items):
-        if not isinstance(item, Mapping):
-            raise TypeError(f"score manifest item {index} must be a mapping: {path}")
-        image_id = _nonempty_string(item.get("image_id", ""), f"items[{index}].image_id")
-        score_file = item.get("file", item.get("prob_path", item.get("score_path")))
-        if score_file is None:
-            raise KeyError(f"score manifest item {image_id!r} has no score-map path")
-        image_ids.append(image_id)
-        score_files.append(str(score_file))
-        items.append(item)
-    if len(set(image_ids)) != len(image_ids):
-        raise ValueError(f"score manifest image IDs must be unique: {path}")
-    if len(set(score_files)) != len(score_files):
-        raise ValueError(f"score manifest score-map paths must be unique: {path}")
-    if int(payload.get("num_images", len(items))) != len(items):
-        raise ValueError(f"score manifest num_images disagrees with items: {path}")
-    return tuple(items)
-
-
-def _resolve_path(root: Path, value: str | Path) -> Path:
-    path = Path(value).expanduser()
-    return path.resolve() if path.is_absolute() else (root / path).resolve()
-
-
-def _dataset_image_index(payload: Mapping[str, Any], manifest_path: Path) -> Mapping[str, Path]:
-    dataset_value = payload.get("dataset_dir")
-    if dataset_value in (None, ""):
-        return {}
-    dataset_root = _resolve_path(manifest_path.parent, str(dataset_value))
-    image_root = dataset_root / "images"
-    if not image_root.is_dir():
-        return {}
-    result: dict[str, Path] = {}
-    for candidate in image_root.iterdir():
-        if not candidate.is_file() or candidate.suffix.lower() not in _IMAGE_SUFFIXES:
-            continue
-        if candidate.stem in result:
-            raise ValueError(
-                f"multiple grayscale images share ID {candidate.stem!r} under {image_root}"
-            )
-        result[candidate.stem] = candidate
-    return result
-
-
-def _score_path(item: Mapping[str, Any], manifest_path: Path) -> Path:
-    value = item.get("file", item.get("prob_path", item.get("score_path")))
-    if value is None:
-        raise KeyError(f"manifest item {item.get('image_id')!r} has no score-map path")
-    path = _resolve_path(manifest_path.parent, str(value))
-    if not path.is_file():
-        raise FileNotFoundError(f"score map does not exist: {path}")
-    return path
-
-
-def _explicit_gray_path(item: Mapping[str, Any], manifest_path: Path) -> Path | None:
-    # Deliberately do not inspect mask_path or any other label-bearing field.
-    value = item.get("gray_path", item.get("image_path"))
-    if value in (None, ""):
-        return None
-    path = _resolve_path(manifest_path.parent, str(value))
-    if not path.is_file():
-        raise FileNotFoundError(f"grayscale image does not exist: {path}")
-    return path
-
-
 def _load_domain_inputs(
     payload: Mapping[str, Any],
-    manifest_path: Path,
-    items: Sequence[Mapping[str, Any]],
+    items: Sequence[VerifiedScoreItem],
 ) -> tuple[list[np.ndarray], list[np.ndarray] | None]:
-    image_index = _dataset_image_index(payload, manifest_path)
     probabilities: list[np.ndarray] = []
     grayscale_images: list[np.ndarray | None] = []
     for item in items:
-        image_id = str(item["image_id"])
-        probability_path = _score_path(item, manifest_path)
-        grayscale_path = _explicit_gray_path(item, manifest_path)
-        if grayscale_path is None:
-            grayscale_path = image_index.get(image_id)
+        image_id = item.image_id
+        probability_path = item.score_path
+        grayscale_path = item.gray_path
         probability, grayscale = load_probability_and_grayscale(
             probability_path,
             grayscale_path,
@@ -308,20 +236,18 @@ def build_source_reference(
 
     manifests: list[Mapping[str, Any]] = []
     targets: list[str] = []
-    item_sets: list[tuple[Mapping[str, Any], ...]] = []
+    item_sets: list[tuple[VerifiedScoreItem, ...]] = []
     checkpoint_sha: str | None = None
     source_contract: tuple[str, ...] | None = None
     fold_contract: dict[str, Any] | None = None
     for path in manifest_paths:
-        if not path.is_file():
-            raise FileNotFoundError(f"score manifest does not exist: {path}")
-        if (path.parent / ".export_incomplete").exists():
-            raise RuntimeError(f"score export is incomplete and unsafe to consume: {path.parent}")
-        payload = _read_json_mapping(path)
+        verified_manifest = verify_score_manifest_artifacts(
+            path,
+            require_mask=False,
+            require_native_contract=True,
+        )
+        payload = verified_manifest.payload
         target = _nonempty_string(payload.get("target_dataset", ""), "target_dataset")
-        score_type = payload.get("score_type")
-        if score_type is not None and str(score_type) != "sigmoid_probability":
-            raise ValueError(f"unsupported score_type {score_type!r}; expected sigmoid_probability")
         current_sha = _checkpoint_sha(payload)
         raw_sources = _manifest_contract_value(payload, "detector_source_domains")
         if raw_sources is None:
@@ -365,7 +291,7 @@ def build_source_reference(
 
         manifests.append(payload)
         targets.append(target)
-        item_sets.append(_manifest_items(payload, path))
+        item_sets.append(verified_manifest.selected_items)
 
     if len(set(targets)) != len(targets):
         raise ValueError("score-manifest target_dataset values must be unique")
@@ -408,10 +334,10 @@ def build_source_reference(
 
     centers_by_domain: dict[str, np.ndarray] = {}
     grayscale_availability: list[bool] = []
-    for domain, payload, path, items in zip(
-        selected_domains, manifests, manifest_paths, item_sets
+    for domain, payload, items in zip(
+        selected_domains, manifests, item_sets
     ):
-        probabilities, grayscale_images = _load_domain_inputs(payload, path, items)
+        probabilities, grayscale_images = _load_domain_inputs(payload, items)
         grayscale_availability.append(grayscale_images is not None)
         statistics = extract_unlabeled_statistics(
             probabilities,

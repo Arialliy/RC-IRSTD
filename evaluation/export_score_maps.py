@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,26 +10,26 @@ from typing import Mapping, Sequence
 
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data_ext.dataset_meta import (
+    image_meta_from_batch,
     restore_tensor_to_original,
     safe_output_stem,
-    sample_meta_from_batch,
 )
-from data_ext.eval_dataset import IRSTDEvalDataset
+from data_ext.dataset_identity import (
+    SCORE_MANIFEST_CONTENT_ALGORITHM,
+    build_dataset_record,
+    score_manifest_content_sha256,
+    sha256_file,
+    validate_dataset_record,
+)
+from data_ext.inference_dataset import IRSTDInferenceDataset
 from model.MSHNet import MSHNet
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-try:
-    _NEAREST = Image.Resampling.NEAREST
-except AttributeError:  # Pillow < 9.1
-    _NEAREST = Image.NEAREST
-
-
 def select_device(device: str) -> torch.device:
     if device == "cpu":
         return torch.device("cpu")
@@ -92,13 +91,19 @@ def checkpoint_provenance(checkpoint: object) -> dict[str, object]:
     """
 
     if not isinstance(checkpoint, Mapping):
-        return {"provenance_level": "legacy_unverified"}
+        return {
+            "provenance_level": "legacy_unverified",
+            "legacy_reason": "checkpoint_is_not_a_metadata_mapping",
+        }
     raw_sources = checkpoint.get(
         "detector_source_domains",
         checkpoint.get("source_names"),
     )
     if raw_sources is None:
-        return {"provenance_level": "legacy_unverified"}
+        return {
+            "provenance_level": "legacy_unverified",
+            "legacy_reason": "missing_detector_source_domains",
+        }
     if isinstance(raw_sources, (str, bytes)):
         sources = [str(raw_sources)]
     else:
@@ -119,8 +124,7 @@ def checkpoint_provenance(checkpoint: object) -> dict[str, object]:
     outer_target = checkpoint.get("outer_target")
     if outer_target is not None and str(outer_target) in sources:
         raise ValueError("checkpoint outer_target occurs in detector source domains")
-    return {
-        "provenance_level": "checkpoint_verified",
+    common: dict[str, object] = {
         "detector_source_domains": sources,
         "held_out_domains": held_out,
         "outer_fold_id": checkpoint.get("outer_fold_id"),
@@ -128,6 +132,92 @@ def checkpoint_provenance(checkpoint: object) -> dict[str, object]:
         "checkpoint_selection": checkpoint.get("checkpoint_selection"),
         "protocol_scope": checkpoint.get("protocol_scope"),
         "training_seed": checkpoint.get("seed"),
+    }
+    raw_records = checkpoint.get("detector_source_records")
+    if raw_records is None:
+        # Keep historical metadata visible for diagnostics, but old
+        # source-name-only checkpoints are not eligible for the main protocol.
+        return {
+            "provenance_level": "legacy_unverified",
+            "legacy_reason": "missing_detector_source_records",
+            **common,
+        }
+    if not isinstance(raw_records, (list, tuple)):
+        raise TypeError("checkpoint detector_source_records must be an ordered list")
+    if len(raw_records) != len(sources):
+        raise ValueError(
+            "checkpoint detector_source_records must align one-to-one with "
+            "detector_source_domains"
+        )
+    # Schema-v1 records lack per-image content leaves and the ordered
+    # image+mask training artifact.  They may be exported diagnostically but
+    # can never establish main-protocol target exclusion.
+    if any(
+        not isinstance(record, Mapping)
+        or int(record.get("record_schema_version", -1)) != 2
+        for record in raw_records
+    ):
+        return {
+            "provenance_level": "legacy_unverified",
+            "legacy_reason": "detector_source_records_precede_content_leaf_schema_v2",
+            **common,
+        }
+    records = [
+        validate_dataset_record(
+            record,
+            require_source_name=True,
+            require_training_artifact=True,
+        )
+        for record in raw_records
+    ]
+    record_names = [str(record["source_name"]) for record in records]
+    if record_names != sources:
+        raise ValueError(
+            "checkpoint detector source record order/names do not match "
+            "detector_source_domains"
+        )
+    identities = [str(record["dataset_identity_sha256"]) for record in records]
+    if len(set(identities)) != len(identities):
+        raise ValueError(
+            "checkpoint detector source records contain duplicate dataset identities"
+        )
+    dataset_sizes = checkpoint.get("dataset_sizes")
+    if dataset_sizes is not None:
+        if not isinstance(dataset_sizes, Mapping):
+            raise TypeError("checkpoint dataset_sizes must be a mapping")
+        for record in records:
+            name = str(record["source_name"])
+            if name in dataset_sizes and int(dataset_sizes[name]) != int(
+                record["num_samples"]
+            ):
+                raise ValueError(
+                    f"checkpoint dataset size disagrees with source record {name!r}"
+                )
+    if common["checkpoint_selection"] != "fixed_last_no_test_or_target_validation":
+        raise ValueError(
+            "checkpoint_verified requires checkpoint_selection="
+            "'fixed_last_no_test_or_target_validation'"
+        )
+    if common["protocol_scope"] not in {
+        "multi_source_protocol_candidate",
+        "single_source_inner_smoke_not_main_result",
+    }:
+        raise ValueError(
+            "checkpoint_verified requires a known detector protocol_scope"
+        )
+    expected_scope = (
+        "single_source_inner_smoke_not_main_result"
+        if len(sources) == 1
+        else "multi_source_protocol_candidate"
+    )
+    if common["protocol_scope"] != expected_scope:
+        raise ValueError(
+            "checkpoint detector source count is inconsistent with protocol_scope"
+        )
+    return {
+        "provenance_level": "checkpoint_verified",
+        **common,
+        "detector_source_records": records,
     }
 
 
@@ -188,12 +278,17 @@ def export_score_maps(
         encoding="utf-8",
     )
 
-    dataset = IRSTDEvalDataset(
+    dataset = IRSTDInferenceDataset(
         dataset_dir,
         base_size=base_size,
         resize_mode=resize_mode,
         split=split,
         split_file=split_file,
+    )
+    target_dataset_record = build_dataset_record(
+        dataset.root,
+        dataset.split_file,
+        [sample[0] for sample in dataset.samples],
     )
     loader = DataLoader(
         dataset,
@@ -207,12 +302,47 @@ def export_score_maps(
     weight = Path(weight_path).expanduser().resolve()
     checkpoint = torch.load(weight, map_location=selected_device)
     detector_provenance = checkpoint_provenance(checkpoint)
+    detector_provenance["target_exclusion_verified"] = False
     if detector_provenance["provenance_level"] == "checkpoint_verified":
         source_domains = set(detector_provenance["detector_source_domains"])
         held_out_domains = set(detector_provenance["held_out_domains"])
-        detector_provenance["target_exclusion_verified"] = (
+        logical_exclusion_verified = (
             dataset.dataset_name in held_out_domains
             and dataset.dataset_name not in source_domains
+        )
+        target_leaves = set(target_dataset_record["image_content_sha256_leaves"])
+        source_union: set[str] = set()
+        per_source_collisions: list[dict[str, object]] = []
+        for source_record in detector_provenance["detector_source_records"]:
+            source_leaves = set(source_record["image_content_sha256_leaves"])
+            source_union.update(source_leaves)
+            collisions = sorted(target_leaves & source_leaves)
+            per_source_collisions.append(
+                {
+                    "source_name": source_record["source_name"],
+                    "source_leaf_count": len(source_leaves),
+                    "collision_count": len(collisions),
+                    "collision_sha256_leaves": collisions,
+                }
+            )
+        all_collisions = sorted(target_leaves & source_union)
+        identity_exclusion_verified = not all_collisions
+        detector_provenance["target_identity_collision_audit"] = {
+            "comparison": "raw_image_file_sha256_leaf_intersection",
+            "target_leaf_count": len(target_leaves),
+            "detector_source_union_leaf_count": len(source_union),
+            "collision_count": len(all_collisions),
+            "collision_sha256_leaves": all_collisions,
+            "per_source": per_source_collisions,
+        }
+        detector_provenance["logical_target_exclusion_verified"] = (
+            logical_exclusion_verified
+        )
+        detector_provenance["target_identity_exclusion_verified"] = (
+            identity_exclusion_verified
+        )
+        detector_provenance["target_exclusion_verified"] = (
+            logical_exclusion_verified and identity_exclusion_verified
         )
     model = load_model(weight_path, selected_device, checkpoint=checkpoint)
 
@@ -220,7 +350,9 @@ def export_score_maps(
     used_output_names: set[str] = set()
     with torch.inference_mode():
         for batch in tqdm(loader, desc="Exporting native score maps"):
-            metadata = sample_meta_from_batch(batch["meta"], 0)
+            if "mask" in batch:
+                raise RuntimeError("label-free inference batch unexpectedly contains a mask")
+            metadata = image_meta_from_batch(batch["meta"], 0)
             image = batch["image"].to(selected_device, non_blocking=True)
             logits = extract_logits(model(image, True))
             if logits.ndim != 4 or logits.shape[0] != 1 or logits.shape[1] != 1:
@@ -234,14 +366,10 @@ def export_score_maps(
             probability_array = (
                 probability.clamp_(0.0, 1.0).detach().cpu().numpy().astype(np.float32)
             )
-            mask_array = _load_native_mask(
-                metadata.mask_path,
-                metadata.transform.original_hw,
-            )
-            if probability_array.shape != mask_array.shape:
+            if probability_array.shape != metadata.transform.original_hw:
                 raise RuntimeError(
-                    f"Restored score/mask mismatch for {metadata.image_id!r}: "
-                    f"{probability_array.shape} vs {mask_array.shape}"
+                    f"Restored score/image mismatch for {metadata.image_id!r}: "
+                    f"{probability_array.shape} vs {metadata.transform.original_hw}"
                 )
 
             output_name = f"{safe_output_stem(metadata.image_id)}.npz"
@@ -254,11 +382,9 @@ def export_score_maps(
             _write_npz_atomic(
                 output_path,
                 prob=probability_array,
-                mask=mask_array,
                 image_id=np.asarray(metadata.image_id),
                 dataset_name=np.asarray(metadata.dataset_name),
                 original_hw=np.asarray(metadata.transform.original_hw, dtype=np.int32),
-                mask_original_hw=np.asarray(metadata.mask_original_hw, dtype=np.int32),
                 input_hw=np.asarray(metadata.transform.input_hw, dtype=np.int32),
                 resized_hw=np.asarray(metadata.transform.resized_hw, dtype=np.int32),
                 padding_ltrb=np.asarray(
@@ -267,35 +393,42 @@ def export_score_maps(
                 ),
                 resize_mode=np.asarray(metadata.transform.mode),
             )
+            score_file_sha256 = sha256_file(output_path)
+            gray_file_sha256 = sha256_file(metadata.image_path)
             items.append(
                 {
                     "image_id": metadata.image_id,
                     "file": output_name,
+                    "score_file_sha256": score_file_sha256,
+                    "image_path": _portable_path(metadata.image_path, output_root),
+                    "gray_file_sha256": gray_file_sha256,
                     "original_hw": list(metadata.transform.original_hw),
-                    "mask_original_hw": list(metadata.mask_original_hw),
-                    "mask_resized_to_image": (
-                        metadata.mask_original_hw != metadata.transform.original_hw
-                    ),
                 }
             )
 
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "artifact_type": "label_free_score_export",
         "source_dataset": source_dataset,
         "source_dataset_assertion": source_dataset,
         "target_dataset": dataset.dataset_name,
+        "target_dataset_record": target_dataset_record,
         "path_anchor": "manifest_directory",
         "dataset_dir": _portable_path(dataset.root, output_root),
         "split_file": _portable_path(dataset.split_file, output_root),
         "weight_path": _portable_path(weight, output_root),
-        "weight_sha256": _sha256(weight),
+        "weight_sha256": sha256_file(weight),
         "detector_provenance": detector_provenance,
         "input_hw": list(dataset.input_hw),
         "resize_mode": resize_mode,
         "restored_to_original_hw": True,
         "score_type": "sigmoid_probability",
         "threshold_semantics": "prediction = probability > threshold",
+        "labels_embedded": False,
+        "label_contract": "external_label_attachment_manifest_required_offline",
         "num_images": len(items),
+        "content_sha256_algorithm": SCORE_MANIFEST_CONTENT_ALGORITHM,
+        "content_sha256": score_manifest_content_sha256(items),
         "items": items,
     }
     # Duplicate the protocol-critical fields at the top level so every
@@ -309,6 +442,10 @@ def export_score_maps(
         "outer_target",
         "checkpoint_selection",
         "protocol_scope",
+        "detector_source_records",
+        "logical_target_exclusion_verified",
+        "target_identity_exclusion_verified",
+        "target_identity_collision_audit",
         "target_exclusion_verified",
     ):
         if field in detector_provenance:
@@ -316,19 +453,6 @@ def export_score_maps(
     _write_json_atomic(output_root / "manifest.json", manifest)
     incomplete_marker.unlink()
     return manifest
-
-
-def _load_native_mask(
-    path: str | Path,
-    target_hw: Sequence[int],
-) -> np.ndarray:
-    with Image.open(path) as mask_file:
-        mask_image = mask_file.convert("L")
-    target_h, target_w = int(target_hw[0]), int(target_hw[1])
-    if mask_image.size != (target_w, target_h):
-        mask_image = mask_image.resize((target_w, target_h), resample=_NEAREST)
-    mask = np.asarray(mask_image, dtype=np.uint8)
-    return (mask > 0).astype(np.uint8)
 
 
 def _write_npz_atomic(path: Path, **arrays: np.ndarray) -> None:
@@ -353,14 +477,6 @@ def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _portable_path(path: str | Path, base: str | Path | None = None) -> str:

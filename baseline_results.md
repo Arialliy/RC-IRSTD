@@ -74,7 +74,7 @@
 ## 6. 尚缺的 claim-bearing evidence
 
 - 完整 outer-fold 和 inner-LODO detector checkpoints；
-- 至少第四个独立合法数据域；
+- 至少第四个独立合法数据域才能运行两源 inner-LODO；推荐主证据仍需至少 4 个 meta-source 与 3 个额外 external unseen targets；
 - 至少 3 个随机种子；
 - rolling quantile、EVT/GPD、nearest-source 和 oracle 对比；
 - 直接 RC 与单调逆风险曲线的消融；
