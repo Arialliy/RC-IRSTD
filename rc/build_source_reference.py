@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -37,6 +37,68 @@ _CHECKPOINT_SHA_FIELDS = (
     "checkpoint_sha256",
 )
 _SCALE_FLOOR = 1e-8
+_NO_PENDING_GRAYSCALE = object()
+
+
+class _LockstepPairSplitter:
+    """Split a pair iterator without ``tee``'s multi-item block cache."""
+
+    def __init__(
+        self,
+        pairs: Iterator[tuple[np.ndarray, np.ndarray | None]],
+        *,
+        domain: str,
+    ) -> None:
+        self._pairs = pairs
+        self._domain = domain
+        self._pending_grayscale: object | np.ndarray | None = _NO_PENDING_GRAYSCALE
+        self._finished = False
+
+    def probabilities(self) -> Iterator[np.ndarray]:
+        while True:
+            if self._pending_grayscale is not _NO_PENDING_GRAYSCALE:
+                raise RuntimeError(
+                    "probability/grayscale streams must be consumed in lockstep"
+                )
+            try:
+                probability, grayscale = next(self._pairs)
+            except StopIteration:
+                self._finished = True
+                return
+            self._pending_grayscale = grayscale
+            yield probability
+            if self._pending_grayscale is not _NO_PENDING_GRAYSCALE:
+                raise RuntimeError(
+                    "probability/grayscale streams must be consumed in lockstep"
+                )
+            del probability, grayscale
+
+    def _take_grayscale(self) -> np.ndarray:
+        value = self._pending_grayscale
+        if value is _NO_PENDING_GRAYSCALE:
+            raise RuntimeError(
+                "grayscale stream was advanced before its probability partner"
+            )
+        if value is None:
+            raise ValueError(
+                f"verified grayscale artifact could not be loaded for domain "
+                f"{self._domain!r}"
+            )
+        self._pending_grayscale = _NO_PENDING_GRAYSCALE
+        return np.asarray(value)
+
+    def grayscale_images(self) -> Iterator[np.ndarray]:
+        while True:
+            if self._pending_grayscale is _NO_PENDING_GRAYSCALE:
+                if self._finished:
+                    return
+                raise RuntimeError(
+                    "grayscale stream was advanced before its probability partner"
+                )
+            # Keep no frame-local reference to a yielded image.  This matters
+            # for large native-resolution arrays: the next probability read
+            # must not overlap with a hidden grayscale cache.
+            yield self._take_grayscale()
 
 
 def _read_json_mapping(path: Path) -> Mapping[str, Any]:
@@ -97,46 +159,65 @@ def _manifest_contract_value(payload: Mapping[str, Any], key: str) -> Any:
 def _load_domain_inputs(
     payload: Mapping[str, Any],
     items: Sequence[VerifiedScoreItem],
-) -> tuple[list[np.ndarray], list[np.ndarray] | None]:
-    probabilities: list[np.ndarray] = []
-    grayscale_images: list[np.ndarray | None] = []
-    for item in items:
-        image_id = item.image_id
-        probability_path = item.score_path
-        grayscale_path = item.gray_path
-        probability, grayscale = load_probability_and_grayscale(
-            probability_path,
-            grayscale_path,
-        )
-        if probability.size == 0 or not np.isfinite(probability).all():
-            raise ValueError(f"score map contains non-finite probabilities: {probability_path}")
-        if float(probability.min()) < 0.0 or float(probability.max()) > 1.0:
-            raise ValueError(f"score map is outside probability range [0, 1]: {probability_path}")
-        if grayscale is not None and grayscale.shape != probability.shape:
-            raise ValueError(
-                f"grayscale/score-map shape mismatch for {image_id!r}: "
-                f"{grayscale.shape} != {probability.shape}"
-            )
-        with np.load(probability_path, allow_pickle=False) as score_payload:
-            if "image_id" in score_payload:
-                stored_id = str(np.asarray(score_payload["image_id"]).item())
-                if stored_id != image_id:
-                    raise ValueError(
-                        f"score-map image_id mismatch: {stored_id!r} != {image_id!r}"
-                    )
-        probabilities.append(probability)
-        grayscale_images.append(grayscale)
-    availability = [value is not None for value in grayscale_images]
-    if any(availability) and not all(availability):
+) -> tuple[Iterator[np.ndarray], Iterator[np.ndarray] | None]:
+    """Open verified inputs lazily and split each loaded pair in lockstep.
+
+    ``verify_score_manifest_artifacts`` has already audited every referenced
+    artifact and its SHA before this function is called.  This second pass is
+    deliberately lazy.  A lockstep splitter opens the next pair only after
+    ``extract_unlabeled_statistics`` has consumed the current probability and
+    gray, avoiding both domain-sized lists and ``itertools.tee``'s opaque
+    multi-item block cache.
+    """
+
+    if not items:
+        raise ValueError("a source domain must contain at least one verified score item")
+    has_grayscale = items[0].gray_path is not None
+    if any((item.gray_path is not None) != has_grayscale for item in items[1:]):
         raise ValueError(
             f"grayscale availability must be all-or-none within domain "
             f"{payload.get('target_dataset')!r}"
         )
-    return probabilities, (
-        [np.asarray(value) for value in grayscale_images if value is not None]
-        if all(availability)
-        else None
+
+    def pairs() -> Iterator[tuple[np.ndarray, np.ndarray | None]]:
+        for item in items:
+            image_id = item.image_id
+            probability_path = item.score_path
+            probability, grayscale = load_probability_and_grayscale(
+                probability_path,
+                item.gray_path,
+            )
+            if probability.size == 0 or not np.isfinite(probability).all():
+                raise ValueError(
+                    f"score map contains non-finite probabilities: {probability_path}"
+                )
+            if float(probability.min()) < 0.0 or float(probability.max()) > 1.0:
+                raise ValueError(
+                    f"score map is outside probability range [0, 1]: {probability_path}"
+                )
+            if grayscale is not None and grayscale.shape != probability.shape:
+                raise ValueError(
+                    f"grayscale/score-map shape mismatch for {image_id!r}: "
+                    f"{grayscale.shape} != {probability.shape}"
+                )
+            with np.load(probability_path, allow_pickle=False) as score_payload:
+                if "image_id" in score_payload:
+                    stored_id = str(np.asarray(score_payload["image_id"]).item())
+                    if stored_id != image_id:
+                        raise ValueError(
+                            f"score-map image_id mismatch: {stored_id!r} != {image_id!r}"
+                        )
+            yield probability, grayscale
+
+    paired_inputs = pairs()
+    if not has_grayscale:
+        return ((probability for probability, _ in paired_inputs), None)
+
+    splitter = _LockstepPairSplitter(
+        paired_inputs,
+        domain=str(payload.get("target_dataset", "")),
     )
+    return splitter.probabilities(), splitter.grayscale_images()
 
 
 def _optional_contract_tuple(

@@ -24,6 +24,7 @@ from data_ext.label_manifest_artifacts import (
     verify_label_attachment,
 )
 from data_ext.score_manifest_artifacts import verify_score_manifest_artifacts
+from rc.schema import EVALUATION_MATCHING_CONTRACT_VERSION
 from .budget_metrics import relative_budget_excess
 from .component_matching import aggregate_match_results, match_components
 from .threshold_sweep import THRESHOLD_SEMANTICS
@@ -51,8 +52,8 @@ def evaluate_adapter_output(
     *,
     calibrator_checkpoint: str | Path,
     label_manifest: str | Path,
-    matching_rule: str = "overlap",
-    centroid_distance: float = 3.0,
+    matching_rule: str | None = None,
+    centroid_distance: float | None = None,
 ) -> dict[str, Any]:
     """Verify and replay one online adapter result on its declared query IDs.
 
@@ -60,18 +61,38 @@ def evaluate_adapter_output(
     counts.  They remain useful records for coverage-aware aggregation.
     """
 
-    if matching_rule not in {"overlap", "centroid"}:
-        raise ValueError("matching_rule must be 'overlap' or 'centroid'")
-    if not math.isfinite(float(centroid_distance)) or centroid_distance <= 0.0:
-        raise ValueError("centroid_distance must be finite and positive")
-
     adapter, adapter_name = _load_adapter_output(adapter_output)
+    claim_bearing = _require_bool(adapter, "claim_bearing")
+    required_split_role = "official_test" if claim_bearing else None
+    evaluation_contract = _normalise_evaluation_contract(
+        adapter.get("evaluation_contract")
+    )
+    if matching_rule is not None and matching_rule != evaluation_contract["matching_rule"]:
+        raise ValueError(
+            "requested matching_rule differs from the adapter evaluation contract"
+        )
+    if centroid_distance is not None:
+        requested_distance = float(centroid_distance)
+        if not math.isfinite(requested_distance) or requested_distance <= 0.0:
+            raise ValueError("centroid_distance must be finite and positive")
+        if not math.isclose(
+            requested_distance,
+            float(evaluation_contract["centroid_distance"]),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "requested centroid_distance differs from the adapter evaluation contract"
+            )
+    effective_matching_rule = str(evaluation_contract["matching_rule"])
+    effective_centroid_distance = float(evaluation_contract["centroid_distance"])
     manifest_path = Path(score_manifest).expanduser().resolve()
     verified_manifest = verify_score_manifest_artifacts(
         manifest_path,
         require_mask=False,
         require_native_contract=True,
         verify_artifact_bytes=False,
+        required_split_role=required_split_role,
     )
     manifest = verified_manifest.payload
     manifest_sha256 = verified_manifest.manifest_sha256
@@ -102,6 +123,7 @@ def evaluate_adapter_output(
         context_ids=context_ids,
         query_ids=query_ids,
         budgets=budgets,
+        required_split_role=required_split_role,
     )
     result: dict[str, Any] = {
         "schema_version": ADAPTER_EVALUATION_SCHEMA_VERSION,
@@ -113,13 +135,21 @@ def evaluate_adapter_output(
         "calibrator_checkpoint_file": calibrator_path.name,
         "calibrator_checkpoint_sha256": calibrator_sha256,
         "calibrator_replay_verified": True,
+        "calibrator_model": str(adapter["calibrator_model"]),
+        "calibrator_capability_contract": dict(
+            adapter["calibrator_capability_contract"]
+        ),
+        "calibrator_budget_contract": adapter["calibrator_budget_contract"],
+        "claim_bearing": claim_bearing,
+        "decision_contract": dict(adapter["decision_contract"]),
+        "evaluation_contract": evaluation_contract,
         "query_image_ids": list(query_ids),
         "num_query_images": len(query_ids),
         "budgets": budgets,
         "threshold": threshold,
         "threshold_semantics": THRESHOLD_SEMANTICS,
-        "matching_rule": matching_rule,
-        "centroid_distance": float(centroid_distance),
+        "matching_rule": effective_matching_rule,
+        "centroid_distance": effective_centroid_distance,
         "rejected": rejected,
     }
     if rejected:
@@ -151,7 +181,7 @@ def evaluate_adapter_output(
         if score_item.image_id != expected_id or label_item.image_id != expected_id:
             raise RuntimeError("score/label/query image-ID binding changed after verification")
         with np.load(score_item.score_path, allow_pickle=False) as score_payload:
-            probability = np.asarray(score_payload["prob"], dtype=np.float32)
+            probability = np.asarray(score_payload["prob"], dtype=np.float64)
         mask = load_label_mask(label_item)
         if probability.shape != mask.shape:
             raise ValueError(
@@ -162,8 +192,8 @@ def evaluate_adapter_output(
             match_components(
                 probability > threshold,
                 mask,
-                rule=matching_rule,
-                centroid_distance=centroid_distance,
+                rule=effective_matching_rule,
+                centroid_distance=effective_centroid_distance,
             )
         )
     result.update(
@@ -290,6 +320,15 @@ def _verify_binding(
         "score_manifest_detector_checkpoint_sha",
         "context_image_ids",
         "query_image_ids",
+        "context_size",
+        "query_size",
+        "claim_bearing",
+        "deployment_protocol_contract",
+        "decision_contract",
+        "evaluation_contract",
+        "calibrator_model",
+        "calibrator_capability_contract",
+        "calibrator_budget_contract",
     )
     missing = [field for field in required if field not in adapter]
     if missing:
@@ -385,6 +424,69 @@ def _verify_binding(
     overlap = set(context_ids).intersection(query_ids)
     if overlap:
         raise ValueError(f"Context/query image IDs overlap: {sorted(overlap)}")
+    context_size = adapter["context_size"]
+    query_size = adapter["query_size"]
+    for name, value in (("context_size", context_size), ("query_size", query_size)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise TypeError(f"Adapter {name} must be a positive integer")
+    if context_size != len(context_ids) or query_size != len(query_ids):
+        raise ValueError("Adapter context/query sizes do not match bound image IDs")
+    claim_bearing = _require_bool(adapter, "claim_bearing")
+    deployment_contract = adapter["deployment_protocol_contract"]
+    if claim_bearing and not isinstance(deployment_contract, Mapping):
+        raise TypeError(
+            "Claim-bearing adapter output requires a deployment protocol contract"
+        )
+    decision_contract = adapter["decision_contract"]
+    if not isinstance(decision_contract, Mapping):
+        raise TypeError("Adapter decision_contract must be a mapping")
+    calibrator_model = _nonempty_string(
+        adapter["calibrator_model"], "calibrator_model"
+    )
+    budget_contract = adapter["calibrator_budget_contract"]
+    if calibrator_model == "monotone_pixel":
+        if not isinstance(budget_contract, Mapping):
+            raise TypeError(
+                "monotone_pixel adapter requires calibrator_budget_contract"
+            )
+    elif calibrator_model == "direct":
+        if budget_contract is not None:
+            raise ValueError("direct adapter must not declare a monotone budget contract")
+    else:
+        raise ValueError("unsupported adapter calibrator_model")
+    if decision_contract.get("budget_model") != budget_contract:
+        raise ValueError("Adapter decision/budget model contracts disagree")
+    if decision_contract.get("claim_bearing") is not claim_bearing:
+        raise ValueError("Adapter decision contract claim-bearing flag mismatch")
+    if (
+        decision_contract.get("context_size") != context_size
+        or decision_contract.get("query_size") != query_size
+    ):
+        raise ValueError("Adapter decision contract context/query size mismatch")
+    evaluation_contract = _normalise_evaluation_contract(
+        adapter["evaluation_contract"]
+    )
+    if decision_contract.get("evaluation_matching") != evaluation_contract:
+        raise ValueError("Adapter decision/evaluation matching contracts disagree")
+    if claim_bearing:
+        assert isinstance(deployment_contract, Mapping)
+        deployment_matching = deployment_contract.get("evaluation_matching")
+        if not isinstance(deployment_matching, Mapping):
+            raise TypeError(
+                "Claim-bearing deployment contract requires evaluation_matching"
+            )
+        frozen_pair = (
+            deployment_matching.get("matching_rule"),
+            deployment_matching.get("centroid_distance"),
+        )
+        observed_pair = (
+            evaluation_contract["matching_rule"],
+            evaluation_contract["centroid_distance"],
+        )
+        if frozen_pair != observed_pair:
+            raise ValueError(
+                "Adapter evaluation matching contract differs from deployment contract"
+            )
     return target_domain, context_ids, query_ids
 
 
@@ -399,6 +501,7 @@ def _verify_recomputed_calibrator_decision(
     context_ids: Sequence[str],
     query_ids: Sequence[str],
     budgets: Mapping[str, Any],
+    required_split_role: str | None,
 ) -> None:
     """Replay context inference on CPU before any query label is consumed."""
 
@@ -412,7 +515,7 @@ def _verify_recomputed_calibrator_decision(
         load_calibrator_bundle,
         load_ordered_score_records,
     )
-    from rc.schema import BudgetSpec, SourceReference
+    from rc.schema import BudgetSpec, DeploymentProtocolContract, SourceReference
 
     for field in (
         "reject_probability",
@@ -425,7 +528,16 @@ def _verify_recomputed_calibrator_decision(
         "protocol_scope",
         "p_min",
         "calibrator_format_version",
+        "calibrator_model",
+        "calibrator_capability_contract",
+        "calibrator_budget_contract",
         "episode_collection_sha256",
+        "claim_bearing",
+        "deployment_protocol_contract",
+        "decision_contract",
+        "evaluation_contract",
+        "context_size",
+        "query_size",
     ):
         if field not in adapter:
             raise KeyError(f"Adapter output is missing replay field: {field}")
@@ -439,6 +551,7 @@ def _verify_recomputed_calibrator_decision(
     )
     records, replay_manifest = load_ordered_score_records(
         manifest_path,
+        required_split_role=required_split_role,
     )
     if replay_manifest != manifest:
         raise RuntimeError("score manifest changed while preparing calibrator replay")
@@ -457,6 +570,7 @@ def _verify_recomputed_calibrator_decision(
         image_ids=context_ids,
         require_mask=False,
         require_native_contract=True,
+        required_split_role=required_split_role,
     )
     if (
         verified_context.manifest_sha256 != manifest_sha256
@@ -483,6 +597,52 @@ def _verify_recomputed_calibrator_decision(
     reject_cutoff = _finite_probability(
         adapter["reject_cutoff"], "reject_cutoff"
     )
+    claim_bearing = _require_bool(adapter, "claim_bearing")
+    evaluation_contract = _normalise_evaluation_contract(
+        adapter["evaluation_contract"]
+    )
+    raw_decision_contract = adapter["decision_contract"]
+    if not isinstance(raw_decision_contract, Mapping):
+        raise TypeError("decision_contract must be a mapping")
+    raw_reject_rule = raw_decision_contract.get("reject_rule")
+    if not isinstance(raw_reject_rule, Mapping):
+        raise TypeError("decision_contract.reject_rule must be a mapping")
+    reject_override_requested = raw_reject_rule.get("runtime_override_requested")
+    if not isinstance(reject_override_requested, bool):
+        raise TypeError(
+            "decision_contract.reject_rule.runtime_override_requested must be boolean"
+        )
+    matching_override_requested = evaluation_contract[
+        "runtime_override_requested"
+    ]
+    frozen_protocol = None
+    if claim_bearing:
+        raw_frozen_protocol = checkpoint.get("deployment_protocol_contract")
+        if not isinstance(raw_frozen_protocol, Mapping):
+            raise TypeError(
+                "claim-bearing checkpoint requires deployment_protocol_contract"
+            )
+        frozen_protocol = DeploymentProtocolContract.from_dict(raw_frozen_protocol)
+    replay_reject_cutoff = None
+    if reject_override_requested:
+        replay_reject_cutoff = (
+            frozen_protocol.reject_cutoff
+            if frozen_protocol is not None
+            else reject_cutoff
+        )
+    replay_matching_rule = None
+    replay_centroid_distance = None
+    if matching_override_requested:
+        replay_matching_rule = (
+            frozen_protocol.matching_rule
+            if frozen_protocol is not None
+            else str(evaluation_contract["matching_rule"])
+        )
+        replay_centroid_distance = (
+            frozen_protocol.centroid_distance
+            if frozen_protocol is not None
+            else float(evaluation_contract["centroid_distance"])
+        )
     recomputed = adapt_context_to_query(
         model=model,
         standardizer=standardizer,
@@ -495,8 +655,13 @@ def _verify_recomputed_calibrator_decision(
         score_manifest_sha256=manifest_sha256,
         device=device,
         target_domain=target_domain,
-        reject_probability=reject_cutoff,
+        # Claim-bearing replay resolves frozen parameters from the checkpoint,
+        # never from potentially edited adapter values.
+        reject_probability=replay_reject_cutoff,
+        matching_rule=replay_matching_rule,
+        centroid_distance=replay_centroid_distance,
         temporal_order_asserted=bool(adapter["temporal_order_asserted"]),
+        claim_bearing=claim_bearing,
     )
 
     for field in ("threshold", "reject_probability", "reject_cutoff", "p_min"):
@@ -516,7 +681,16 @@ def _verify_recomputed_calibrator_decision(
         "held_out_domains",
         "protocol_scope",
         "calibrator_format_version",
+        "calibrator_model",
+        "calibrator_capability_contract",
+        "calibrator_budget_contract",
         "episode_collection_sha256",
+        "deployment_protocol_contract",
+        "decision_contract",
+        "evaluation_contract",
+        "claim_bearing",
+        "context_size",
+        "query_size",
     ):
         if adapter[field] != recomputed[field]:
             raise ValueError(
@@ -547,6 +721,42 @@ def _normalise_budgets(value: Any) -> dict[str, Any]:
     if any(enabled and budget <= 0.0 for budget, enabled in zip(values, active)):
         raise ValueError("active budgets must be positive")
     return {"names": list(names), "values": list(values), "active": list(active)}
+
+
+def _normalise_evaluation_contract(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("evaluation_contract must be a mapping")
+    required = (
+        "schema_version",
+        "matching_rule",
+        "centroid_distance",
+        "source",
+        "target_override_allowed",
+        "runtime_override_requested",
+    )
+    missing = [field for field in required if field not in value]
+    if missing:
+        raise KeyError(f"evaluation_contract is missing: {missing}")
+    if value["schema_version"] != EVALUATION_MATCHING_CONTRACT_VERSION:
+        raise ValueError("unsupported evaluation_contract schema_version")
+    matching_rule = value["matching_rule"]
+    if matching_rule not in {"overlap", "centroid"}:
+        raise ValueError("evaluation_contract matching_rule is unsupported")
+    centroid_distance = float(value["centroid_distance"])
+    if not math.isfinite(centroid_distance) or centroid_distance <= 0.0:
+        raise ValueError("evaluation_contract centroid_distance must be positive")
+    source = _nonempty_string(value["source"], "evaluation_contract.source")
+    for field in ("target_override_allowed", "runtime_override_requested"):
+        if not isinstance(value[field], bool):
+            raise TypeError(f"evaluation_contract.{field} must be boolean")
+    return {
+        "schema_version": EVALUATION_MATCHING_CONTRACT_VERSION,
+        "matching_rule": matching_rule,
+        "centroid_distance": centroid_distance,
+        "source": source,
+        "target_override_allowed": bool(value["target_override_allowed"]),
+        "runtime_override_requested": bool(value["runtime_override_requested"]),
+    }
 
 
 def _validate_covered_record(record: Mapping[str, Any]) -> None:
@@ -712,8 +922,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Rejected records do not open this artifact."
         ),
     )
-    parser.add_argument("--matching-rule", choices=("overlap", "centroid"), default="overlap")
-    parser.add_argument("--centroid-distance", type=float, default=3.0)
+    parser.add_argument("--matching-rule", choices=("overlap", "centroid"))
+    parser.add_argument("--centroid-distance", type=float)
     parser.add_argument("--output")
     return parser
 

@@ -31,11 +31,17 @@ from torch.optim import Adagrad
 from tqdm import tqdm
 
 from data_ext.balanced_domain_loader import BalancedDomainLoader
-from data_ext.dataset_identity import build_dataset_record
-from data_ext.split_utils import sample_id_from_entry
+from data_ext.dataset_identity import build_dataset_record, sha256_file
+from data_ext.split_utils import (
+    read_split_entries,
+    resolve_split_file,
+    sample_id_from_entry,
+)
 from losses.hard_target_loss import hard_target_miss_loss
 from losses.local_peak_cvar import domain_pixel_tail_risks, domain_tail_risks
+from losses.schedules import linear_risk_weight
 from losses.smooth_worst_domain import smooth_worst_domain
+from losses.target_background_margin import domain_target_background_margin_risks
 from model.MSHNet import MSHNet
 from model.loss import SLSIoULoss
 from utils.data import IRSTD_Dataset
@@ -92,10 +98,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--warm-epoch", type=int, default=5)
+    parser.add_argument(
+        "--risk-warmup-epochs",
+        type=int,
+        default=6,
+        help="Number of initial epochs with zero tail/miss risk gradient.",
+    )
+    parser.add_argument(
+        "--risk-ramp-epochs",
+        type=int,
+        default=10,
+        help="Linear ramp length for tail/miss weights after risk warm-up.",
+    )
     parser.add_argument("--base-size", type=int, default=256)
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
 
+    parser.add_argument(
+        "--risk-objective",
+        choices=("separate", "margin"),
+        default="separate",
+        help=(
+            "Risk formulation: the unchanged separate background-tail + hard-miss "
+            "baseline, or the shift-invariant target--background logit margin candidate."
+        ),
+    )
     parser.add_argument(
         "--tail-mode",
         choices=("local-peak", "pixel"),
@@ -104,6 +131,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lambda-tail", type=float, default=0.1)
     parser.add_argument("--lambda-miss", type=float, default=0.1)
+    parser.add_argument("--lambda-margin", type=float, default=0.1)
+    parser.add_argument(
+        "--target-background-margin",
+        type=float,
+        default=1.0,
+        help="Required hard-target minus background-tail separation in logit units.",
+    )
     parser.add_argument("--tail-q", type=float, default=0.01)
     parser.add_argument("--miss-q", type=float, default=0.2)
     parser.add_argument("--object-pixel-q", type=float, default=0.25)
@@ -144,8 +178,15 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--lr must be positive")
     if args.warm_epoch < -1:
         raise ValueError("--warm-epoch must be at least -1")
-    if args.lambda_tail < 0.0 or args.lambda_miss < 0.0:
+    if args.risk_warmup_epochs < 0 or args.risk_ramp_epochs < 0:
+        raise ValueError("risk warm-up and ramp epochs cannot be negative")
+    if args.lambda_tail < 0.0 or args.lambda_miss < 0.0 or args.lambda_margin < 0.0:
         raise ValueError("loss weights must be non-negative")
+    if (
+        args.target_background_margin < 0.0
+        or not np.isfinite(args.target_background_margin)
+    ):
+        raise ValueError("--target-background-margin must be finite and non-negative")
     if args.grad_clip_norm < 0.0:
         raise ValueError("--grad-clip-norm cannot be negative")
     canonical_sources = [
@@ -202,16 +243,48 @@ def build_source_datasets(
         root = Path(directory).expanduser().resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"source dataset directory does not exist: {root}")
+        selected_train_split = audited_source_train_split(root, split_file)
         dataset_args = SimpleNamespace(
             dataset_dir=str(root),
             base_size=args.base_size,
             crop_size=args.crop_size,
-            split_file=split_file,
+            split_file=str(selected_train_split),
         )
         # Only the training split is instantiated.  No source test split and
         # no target-domain data can influence checkpoint selection.
         datasets[name] = IRSTD_Dataset(dataset_args, mode="train")
     return datasets
+
+
+def audited_source_train_split(
+    dataset_root: str | Path,
+    split_file: str | Path | None = None,
+) -> Path:
+    """Resolve a source-train split and prove it is disjoint from official test.
+
+    The check is intentionally performed before any training dataset is
+    instantiated.  It catches an explicitly supplied test split as well as
+    contaminated ``trainval.txt`` mirrors such as the legacy NUDT copy.
+    """
+
+    root = Path(dataset_root).expanduser().resolve()
+    train_path = resolve_split_file(root, "train", split_file)
+    test_path = resolve_split_file(root, "test")
+    if train_path == test_path:
+        raise ValueError(
+            f"source training split resolves to the official test split: {train_path}"
+        )
+    train_ids = {sample_id_from_entry(item) for item in read_split_entries(train_path)}
+    test_ids = {sample_id_from_entry(item) for item in read_split_entries(test_path)}
+    overlap = sorted(train_ids & test_ids)
+    if overlap:
+        preview = ", ".join(overlap[:10])
+        suffix = "" if len(overlap) <= 10 else f", ... ({len(overlap)} total)"
+        raise ValueError(
+            "source training split overlaps the official test split: "
+            f"{preview}{suffix}; train={train_path}; test={test_path}"
+        )
+    return train_path
 
 
 def build_detector_source_records(
@@ -327,6 +400,58 @@ def compute_domain_tail_risks(
     )
 
 
+def compute_domain_margin_risks(
+    args: argparse.Namespace,
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    domain_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Image-first, domain-balanced target--background logit margins."""
+
+    return domain_target_background_margin_risks(
+        logits,
+        masks,
+        domain_ids,
+        background_q=args.tail_q,
+        target_q=args.miss_q,
+        object_pixel_fraction=args.object_pixel_q,
+        margin=args.target_background_margin,
+        kernel_size=args.peak_kernel_size,
+        plateau_atol=args.plateau_atol,
+        return_domain_ids=True,
+    )
+
+
+def risk_objective_contract(args: argparse.Namespace) -> Dict[str, object]:
+    """Serializable capability record for configs and detector checkpoints."""
+
+    if args.risk_objective == "margin":
+        return {
+            "name": "target_background_tail_margin",
+            "candidate_status": "explicit_nondefault_candidate",
+            "score_space": "logit_difference",
+            "common_logit_shift_invariant": True,
+            "background_summary": "deterministic_local_peak_top_fraction",
+            "target_summary": "hard_object_bottom_fraction_of_top_pixel_logits",
+            "aggregation": "image_first_then_equal_image_domain_mean_then_normalized_smooth_worst_domain",
+            "empty_target_or_background": "graph_connected_zero",
+            "background_q": args.tail_q,
+            "target_q": args.miss_q,
+            "object_pixel_fraction": args.object_pixel_q,
+            "margin_logit": args.target_background_margin,
+            "lambda_margin": args.lambda_margin,
+        }
+    return {
+        "name": "separate_background_tail_plus_hard_miss",
+        "candidate_status": "baseline_default",
+        "score_space": "probability",
+        "common_logit_shift_invariant": False,
+        "tail_mode": args.tail_mode,
+        "lambda_tail": args.lambda_tail,
+        "lambda_miss": args.lambda_miss,
+    }
+
+
 def _git_state() -> Dict[str, object]:
     result: Dict[str, object] = {"revision": None, "dirty": None}
     safe_directory = f"safe.directory={Path.cwd().resolve()}"
@@ -390,6 +515,7 @@ def save_checkpoint(
     names: List[str],
     detector_source_records: List[Dict[str, object]],
     epoch_metrics: Dict[str, object],
+    run_config_sha256: str,
 ) -> None:
     payload = {
         "state_dict": model_state_dict(model),
@@ -403,12 +529,20 @@ def save_checkpoint(
         "outer_target": args.outer_target,
         "held_out_domains": sorted(set(args.held_out_domains or [])),
         "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+        "head_training_schedule": "all_auxiliary_and_fused_heads_from_epoch_zero",
+        "risk_objective": args.risk_objective,
+        "risk_objective_contract": risk_objective_contract(args),
+        "detector_capability_contract": {
+            "risk_objective": risk_objective_contract(args),
+        },
         "protocol_scope": (
             "single_source_inner_smoke_not_main_result"
             if len(names) == 1
             else "multi_source_protocol_candidate"
         ),
         "epoch_metrics": epoch_metrics,
+        "training_args": dict(vars(args)),
+        "run_config_sha256": run_config_sha256,
     }
     temporary = run_dir / "checkpoint_last.pt.tmp"
     torch.save(payload, temporary)
@@ -426,8 +560,23 @@ def train_one_epoch(
 ) -> Dict[str, object]:
     model.train()
     loader.set_epoch(epoch)
-    warm_flag = epoch > args.warm_epoch
-    totals = {"loss": 0.0, "loss_sls": 0.0, "loss_tail": 0.0, "loss_miss": 0.0}
+    # Always instantiate and supervise every auxiliary head plus the fused
+    # final head.  During the SLS warm-up the loss itself reduces to plain
+    # soft IoU, so this avoids switching at epoch warm+1 to a fusion layer that
+    # has never received a gradient.
+    multiscale_forward = True
+    risk_weight = linear_risk_weight(
+        epoch,
+        args.risk_warmup_epochs,
+        args.risk_ramp_epochs,
+    )
+    totals = {
+        "loss": 0.0,
+        "loss_sls": 0.0,
+        "loss_tail": 0.0,
+        "loss_miss": 0.0,
+        "loss_margin": 0.0,
+    }
     domain_risk_sums = {domain_id: 0.0 for domain_id in loader.domain_ids.values()}
     domain_risk_counts = {domain_id: 0 for domain_id in loader.domain_ids.values()}
 
@@ -437,7 +586,7 @@ def train_one_epoch(
         masks = batch["mask"].to(device, non_blocking=True)
         domain_ids = batch["domain_id"].to(device, non_blocking=True)
 
-        auxiliary_logits, final_logits = model(images, warm_flag)
+        auxiliary_logits, final_logits = model(images, multiscale_forward)
         loss_sls = multiscale_sls_loss(
             sls_loss,
             final_logits,
@@ -446,24 +595,44 @@ def train_one_epoch(
             args.warm_epoch,
             epoch,
         )
-        per_domain_risks, represented_ids = compute_domain_tail_risks(
-            args,
-            final_logits,
-            masks,
-            domain_ids,
-        )
-        loss_tail = smooth_worst_domain(per_domain_risks, gamma=args.tail_gamma)
-        loss_miss = hard_target_miss_loss(
-            final_logits,
-            masks,
-            q=args.miss_q,
-            object_pixel_fraction=args.object_pixel_q,
-        )
-        loss = (
-            loss_sls
-            + args.lambda_tail * loss_tail
-            + args.lambda_miss * loss_miss
-        )
+        graph_zero = final_logits.sum() * 0.0
+        if args.risk_objective == "margin":
+            per_domain_risks, represented_ids = compute_domain_margin_risks(
+                args,
+                final_logits,
+                masks,
+                domain_ids,
+            )
+            loss_margin = smooth_worst_domain(
+                per_domain_risks,
+                gamma=args.tail_gamma,
+            )
+            # Do not silently blend the separate probability objectives into
+            # the explicit margin candidate.
+            loss_tail = graph_zero
+            loss_miss = graph_zero
+            loss = loss_sls + risk_weight * args.lambda_margin * loss_margin
+        else:
+            per_domain_risks, represented_ids = compute_domain_tail_risks(
+                args,
+                final_logits,
+                masks,
+                domain_ids,
+            )
+            loss_tail = smooth_worst_domain(per_domain_risks, gamma=args.tail_gamma)
+            loss_miss = hard_target_miss_loss(
+                final_logits,
+                masks,
+                q=args.miss_q,
+                object_pixel_fraction=args.object_pixel_q,
+            )
+            loss_margin = graph_zero
+            loss = (
+                loss_sls
+                + risk_weight * args.lambda_tail * loss_tail
+                + risk_weight * args.lambda_miss * loss_miss
+            )
+        objective_loss = loss_margin if args.risk_objective == "margin" else loss_tail
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(f"non-finite loss at epoch={epoch}, step={step}")
 
@@ -478,6 +647,7 @@ def train_one_epoch(
             "loss_sls": float(loss_sls.detach()),
             "loss_tail": float(loss_tail.detach()),
             "loss_miss": float(loss_miss.detach()),
+            "loss_margin": float(loss_margin.detach()),
         }
         for key, value in values.items():
             totals[key] += value
@@ -490,30 +660,47 @@ def train_one_epoch(
 
         progress.set_postfix(
             loss=f"{values['loss']:.4f}",
-            tail=f"{values['loss_tail']:.4f}",
-            miss=f"{values['loss_miss']:.4f}",
+            risk=f"{float(objective_loss.detach()):.4f}",
         )
 
     steps = len(loader)
     id_to_name = {domain_id: name for name, domain_id in loader.domain_ids.items()}
-    tail_risk_by_domain = {
+    objective_risk_by_domain = {
         id_to_name[domain_id]: domain_risk_sums[domain_id]
         / max(1, domain_risk_counts[domain_id])
         for domain_id in sorted(domain_risk_sums)
     }
-    return {
+    metrics = {
         "epoch": epoch,
         "steps": steps,
         **{key: value / steps for key, value in totals.items()},
-        "tail_risk_by_domain": tail_risk_by_domain,
+        "risk_objective": args.risk_objective,
+        "objective_risk_by_domain": objective_risk_by_domain,
+        "risk_weight": risk_weight,
+        "effective_lambda_tail": (
+            risk_weight * args.lambda_tail if args.risk_objective == "separate" else 0.0
+        ),
+        "effective_lambda_miss": (
+            risk_weight * args.lambda_miss if args.risk_objective == "separate" else 0.0
+        ),
+        "effective_lambda_margin": (
+            risk_weight * args.lambda_margin if args.risk_objective == "margin" else 0.0
+        ),
         "domain_cycle_counts": dict(loader.last_cycle_counts),
         "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+        "head_training_schedule": "all_auxiliary_and_fused_heads_from_epoch_zero",
         "protocol_scope": (
             "single_source_inner_smoke_not_main_result"
             if len(loader.domain_names) == 1
             else "multi_source_protocol_candidate"
         ),
     }
+    if args.risk_objective == "margin":
+        metrics["margin_risk_by_domain"] = objective_risk_by_domain
+    else:
+        # Preserve the baseline's established metric name and meaning.
+        metrics["tail_risk_by_domain"] = objective_risk_by_domain
+    return metrics
 
 
 def main() -> None:
@@ -578,6 +765,12 @@ def main() -> None:
         "total_batch_size": loader.total_batch_size,
         "loader_seed_rule": "seed + epoch*1000003 + domain_position*10007",
         "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+        "head_training_schedule": "all_auxiliary_and_fused_heads_from_epoch_zero",
+        "risk_objective": args.risk_objective,
+        "risk_objective_contract": risk_objective_contract(args),
+        "detector_capability_contract": {
+            "risk_objective": risk_objective_contract(args),
+        },
         "protocol_scope": (
             "single_source_inner_smoke_not_main_result"
             if len(names) == 1
@@ -590,7 +783,27 @@ def main() -> None:
         "git": _git_state(),
     }
     write_json(run_dir / "config.json", config)
-    print(json.dumps({"run_dir": str(run_dir), **config}, indent=2, sort_keys=True))
+    run_config_sha256 = sha256_file(run_dir / "config.json")
+    # The full content-addressed source records can be hundreds of kilobytes;
+    # keep them in config.json without flooding scheduler/stdout logs.
+    startup_summary = {
+        "run_dir": str(run_dir),
+        "config_file": str(run_dir / "config.json"),
+        "run_config_sha256": run_config_sha256,
+        "source_names": names,
+        "dataset_sizes": config["dataset_sizes"],
+        "outer_fold_id": args.outer_fold_id,
+        "outer_target": args.outer_target,
+        "held_out_domains": args.held_out_domains,
+        "checkpoint_selection": config["checkpoint_selection"],
+        "risk_objective": args.risk_objective,
+        "protocol_scope": config["protocol_scope"],
+        "device_resolved": str(device),
+        "cuda_device_count": config["cuda_device_count"],
+        "data_parallel": args.data_parallel,
+        "total_batch_size": loader.total_batch_size,
+    }
+    print(json.dumps(startup_summary, indent=2, sort_keys=True))
 
     metrics_path = run_dir / "metrics.jsonl"
     for epoch in range(args.epochs):
@@ -613,6 +826,7 @@ def main() -> None:
             names,
             detector_source_records,
             epoch_metrics,
+            run_config_sha256,
         )
         print(json.dumps(epoch_metrics, sort_keys=True))
 

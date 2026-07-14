@@ -48,7 +48,7 @@
 
 域样本以 round-robin 顺序交错，两个 replica 均收到两域混合。入口已要求 `batch_per_domain % visible_gpu_count == 0`，否则提前报错，避免 BatchNorm running statistics 与首域绑定。
 
-## 4. score-map 与高尾阈值 smoke test
+## 4. 历史 score-map 与高尾阈值 smoke test
 
 使用现有 IRSTD-1K paper weight，以 64 × 64 网络输入完成 201 张 test image 推理，随后把连续概率图恢复到每张原始分辨率：
 
@@ -67,11 +67,31 @@
 
 该 5-image 曲线只用于验证高尾 event 与 manifest 契约，不是数据集性能结果。
 
-## 5. 不得当作当前基线的旧记录
+这组导出产生于严格 score/label 拆分之前，只是历史工程记录。当前 schema-v2 主协议不允许 score NPZ 嵌入 mask，因此不得把该旧产物直接改名为 verified curve/episode；必须用当前 `export_score_maps` 重新生成无标签 score，再用 `export_label_maps` 生成独立标签附件。
+
+## 5. 协议回归验收
+
+2026-07-14 在 `rrunet-course:latest` 中执行全量测试：
+
+```text
+67 passed, 10 subtests passed
+```
+
+已覆盖的关键 fail-closed 路径包括：
+
+- 目标域无 `masks/` 目录时仍可完成 label-free score export，score NPZ 不含 mask；
+- 训练 source split 的逐图像内容 SHA、mask SHA 与 target/source leaf collision audit；
+- 错数据根、错 label attachment、score/label 同目录、文件篡改均被拒绝；
+- curve threshold plan、event audit、matching contract 和所有风险/计数列均从 query score+label 独立重算；
+- adapter 在 CPU 确定性复算 context 决策，reject 分支不打开 label manifest。
+
+这些是协议与实现验收，仍不是检测/校准方法有效性证据。
+
+## 6. 不得当作当前基线的旧记录
 
 `repro_runs/` 中的历史 `metric.log` 来自 legacy 训练/评估路径：它在每轮使用官方 test split 选最佳 checkpoint，且旧 PD/FA 实现与本轮原分辨率、一对一 8-connected matching 契约不同。因此本文不复制这些数字，也不用它们声称已复现论文结果。
 
-## 6. 尚缺的 claim-bearing evidence
+## 7. 尚缺的 claim-bearing evidence
 
 - 完整 outer-fold 和 inner-LODO detector checkpoints；
 - 至少第四个独立合法数据域才能运行两源 inner-LODO；推荐主证据仍需至少 4 个 meta-source 与 3 个额外 external unseen targets；

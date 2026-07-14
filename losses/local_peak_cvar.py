@@ -142,6 +142,54 @@ def local_background_peak_scores(
     ]
 
 
+def local_background_peak_logits(
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    kernel_size: int = 3,
+    plateau_atol: float = 0.0,
+) -> List[torch.Tensor]:
+    """Extract deterministic background local maxima in logit space.
+
+    This is the shift-invariant counterpart of
+    :func:`local_background_peak_scores` for target--background margin losses.
+    It deliberately has no absolute score threshold: adding a common constant
+    to every logit therefore changes neither the candidate set nor the
+    returned target--background differences.  Empty-background images return
+    a length-zero view that remains attached to ``logits``.
+    """
+
+    logits, masks = _normalise_inputs(logits, masks)
+    if kernel_size <= 0 or kernel_size % 2 == 0:
+        raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}")
+    if plateau_atol < 0.0:
+        raise ValueError(f"plateau_atol must be non-negative, got {plateau_atol}")
+
+    background_mask = masks < 0.5
+    minus_inf = torch.full_like(logits, -torch.inf)
+    background_logits = torch.where(background_mask, logits, minus_inf)
+    pooled = F.max_pool2d(
+        background_logits,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+    )
+    if plateau_atol == 0.0:
+        reaches_local_max = background_logits == pooled
+    else:
+        reaches_local_max = torch.isclose(
+            background_logits,
+            pooled,
+            rtol=0.0,
+            atol=plateau_atol,
+        )
+    candidates = background_mask & reaches_local_max
+    representatives = _plateau_representatives(candidates, kernel_size)
+    return [
+        logits[index, 0][representatives[index, 0]]
+        for index in range(logits.shape[0])
+    ]
+
+
 def image_tail_risks(
     logits: torch.Tensor,
     masks: torch.Tensor,

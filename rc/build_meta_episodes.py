@@ -40,10 +40,12 @@ from .schema import (
     BudgetSpec,
     EpisodeProvenance,
     FoldContract,
+    OFFICIAL_TRAIN_SPLIT_ROLE,
     RCEpisode,
     SourceReference,
     StatisticsConfig,
     VALID_THRESHOLD_TRANSFORMS,
+    canonicalize_episode_score_split_contract,
 )
 
 
@@ -246,6 +248,7 @@ def _verify_score_manifest(
         image_ids=expected_image_ids,
         require_mask=False,
         require_native_contract=True,
+        required_split_role=OFFICIAL_TRAIN_SPLIT_ROLE,
     )
     payload = verified_manifest.payload
     target = str(payload.get("target_dataset", ""))
@@ -486,7 +489,7 @@ def _load_query_score_records(
         with np.load(item.score_path, allow_pickle=False) as score_payload:
             # Match evaluation.threshold_sweep.load_score_map's probability
             # precision so event identities are reproduced byte-for-byte.
-            probability = np.asarray(score_payload["prob"], dtype=np.float32)
+            probability = np.asarray(score_payload["prob"], dtype=np.float64)
         mask = load_label_mask(label_item)
         records.append(
             ScoreMapRecord(
@@ -702,6 +705,9 @@ def _episode_from_spec(
         expected_image_ids=context_ids_requested,
         exact_image_ids=False,
     )
+    context_split_contract = canonicalize_episode_score_split_contract(
+        context_manifest["split_contract"]
+    )
     if str(payload.get("context_score_manifest_sha256", "")).lower() != context_manifest_sha:
         raise ValueError("spec context_score_manifest_sha256 does not match context manifest")
     probabilities = []
@@ -766,6 +772,9 @@ def _episode_from_spec(
             expected_protocol_scope=fold.protocol_scope,
             expected_image_ids=query_ids,
             exact_image_ids=False,
+        )
+        query_split_contract = canonicalize_episode_score_split_contract(
+            query_manifest["split_contract"]
         )
         if str(curve_manifest.get("score_manifest_sha256", "")).lower() != query_manifest_sha:
             raise ValueError("query score manifest SHA-256 does not match curve manifest")
@@ -848,11 +857,18 @@ def _episode_from_spec(
             expected_image_ids=query_ids,
             exact_image_ids=True,
         )
+        query_split_contract = canonicalize_episode_score_split_contract(
+            query_manifest["split_contract"]
+        )
         if str(payload.get("query_score_manifest_sha256", "")).lower() != query_manifest_sha:
             raise ValueError("spec query_score_manifest_sha256 does not match query manifest")
         provenance_status = "asserted_unverified"
         causal_window_verified = False
         causal_window_issue = "curve provenance is hand-asserted without a curve manifest"
+    if query_split_contract != context_split_contract:
+        raise ValueError(
+            "context/query score manifests use different official-train split contracts"
+        )
     if curve_image_ids != query_ids:
         raise ValueError(
             "curve image IDs must exactly equal query_image_ids in the same order; "
@@ -889,6 +905,7 @@ def _episode_from_spec(
         query_score_target_dataset=str(query_manifest["target_dataset"]),
         label_manifest_sha256=label_manifest_sha,
         label_manifest_content_sha256=label_manifest_content_sha,
+        split_contract=query_split_contract,
     )
     episode = build_meta_episode(
         episode_id=str(payload.get("episode_id", f"{pseudo_target}:{index:06d}")),

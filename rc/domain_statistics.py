@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, laplace, maximum_filter
@@ -21,6 +21,10 @@ from .schema import SourceContract, SourceReference, StatisticsConfig
 PROBABILITY_HISTOGRAM_BINS = 32
 PEAK_HISTOGRAM_BINS = 32
 QUANTILES = (0.50, 0.75, 0.90, 0.95, 0.99, 0.995, 0.999)
+# Exact empirical quantiles require memory proportional to the complete domain.
+# The collection-wide StatisticsConfig binds the deterministic sample limit and
+# estimator so an old exact-v2 artifact cannot be silently mixed with v3.
+STREAM_CHUNK_SIZE = 65_536
 SOURCE_DISTANCE_NAMES = (
     "source_distance_available",
     "source_distance_min",
@@ -85,30 +89,35 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
-def _as_image_list(values: Any, name: str) -> list[np.ndarray]:
+def _iter_images(values: Any, name: str) -> Iterator[np.ndarray]:
+    """Yield validated images without materialising an input iterable."""
+
     if isinstance(values, np.ndarray) or hasattr(values, "detach"):
-        array = _to_numpy(values)
-        if array.ndim == 2:
-            raw = [array]
-        elif array.ndim == 3:
-            raw = [array[index] for index in range(array.shape[0])]
-        elif array.ndim == 4 and array.shape[1] == 1:
-            raw = [array[index, 0] for index in range(array.shape[0])]
+        source_array = _to_numpy(values)
+        if source_array.ndim == 2:
+            raw = (source_array,)
+        elif source_array.ndim == 3:
+            raw = (
+                source_array[index] for index in range(source_array.shape[0])
+            )
+        elif source_array.ndim == 4 and source_array.shape[1] == 1:
+            raw = (
+                source_array[index, 0] for index in range(source_array.shape[0])
+            )
         else:
             raise ValueError(f"{name} must be 2D, [N,H,W], or [N,1,H,W]")
     else:
-        raw = list(values)
-    result: list[np.ndarray] = []
+        try:
+            raw = iter(values)
+        except TypeError as exc:
+            raise ValueError(f"{name} must be an image or iterable of images") from exc
     for index, value in enumerate(raw):
-        array = np.squeeze(_to_numpy(value))
-        if array.ndim != 2:
+        image_array = np.squeeze(_to_numpy(value))
+        if image_array.ndim != 2:
             raise ValueError(f"{name}[{index}] must be two-dimensional")
-        if array.size == 0 or not np.isfinite(array).all():
+        if image_array.size == 0 or not np.isfinite(image_array).all():
             raise ValueError(f"{name}[{index}] must be non-empty and finite")
-        result.append(array)
-    if not result:
-        raise ValueError(f"{name} must contain at least one image")
-    return result
+        yield image_array
 
 
 def _normalise_grayscale(image: np.ndarray) -> np.ndarray:
@@ -125,10 +134,96 @@ def _normalise_grayscale(image: np.ndarray) -> np.ndarray:
     return np.clip(result, 0.0, 1.0)
 
 
-def _normalised_histogram(values: np.ndarray, bins: int) -> np.ndarray:
-    counts, _ = np.histogram(values, bins=bins, range=(0.0, 1.0))
+def _normalised_histogram_counts(counts: np.ndarray) -> np.ndarray:
     total = max(int(counts.sum()), 1)
     return counts.astype(np.float64) / total
+
+
+def _splitmix64_priorities(indices: np.ndarray) -> np.ndarray:
+    """Return deterministic, collision-free priorities for uint64 indices."""
+
+    values = np.asarray(indices, dtype=np.uint64)
+    values = values + np.uint64(0x9E3779B97F4A7C15)
+    values = (values ^ (values >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    values = (values ^ (values >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return values ^ (values >> np.uint64(31))
+
+
+class _BoundedQuantileAccumulator:
+    """Deterministic priority sample with exact small-window behaviour."""
+
+    def __init__(self, limit: int, chunk_size: int) -> None:
+        if limit <= 0 or chunk_size <= 0:
+            raise ValueError("quantile sample limit and chunk size must be positive")
+        self.limit = int(limit)
+        self.chunk_size = int(chunk_size)
+        self.count = 0
+        self._values = np.empty(0, dtype=np.float64)
+        self._priorities = np.empty(0, dtype=np.uint64)
+
+    @property
+    def sample_size(self) -> int:
+        return int(self._values.size)
+
+    @property
+    def exact(self) -> bool:
+        return self.count <= self.limit
+
+    def update(self, values: np.ndarray) -> None:
+        flat = np.asarray(values, dtype=np.float64).reshape(-1)
+        for start in range(0, flat.size, self.chunk_size):
+            block = flat[start : start + self.chunk_size]
+            stop_index = self.count + int(block.size)
+            indices = np.arange(self.count, stop_index, dtype=np.uint64)
+            priorities = _splitmix64_priorities(indices)
+            combined_values = np.concatenate((self._values, block))
+            combined_priorities = np.concatenate((self._priorities, priorities))
+            if combined_values.size > self.limit:
+                keep = np.argpartition(combined_priorities, self.limit - 1)[: self.limit]
+                combined_values = combined_values[keep]
+                combined_priorities = combined_priorities[keep]
+            self._values = combined_values
+            self._priorities = combined_priorities
+            self.count = stop_index
+
+    def quantiles(self, quantiles: Sequence[float]) -> np.ndarray:
+        if self._values.size == 0:
+            return np.zeros(len(quantiles), dtype=np.float64)
+        return np.asarray(np.quantile(self._values, quantiles), dtype=np.float64)
+
+
+class _StreamingMoments:
+    """Numerically stable population mean/standard-deviation accumulator."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, values: np.ndarray) -> None:
+        flat = np.asarray(values, dtype=np.float64).reshape(-1)
+        if flat.size == 0:
+            return
+        batch_count = int(flat.size)
+        batch_mean = float(flat.mean())
+        centered = flat - batch_mean
+        batch_m2 = float(np.dot(centered, centered))
+        if self.count == 0:
+            self.count = batch_count
+            self.mean = batch_mean
+            self.m2 = batch_m2
+            return
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.m2 += batch_m2 + delta * delta * self.count * batch_count / total
+        self.mean += delta * batch_count / total
+        self.count = total
+
+    @property
+    def std(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return float(np.sqrt(max(self.m2 / self.count, 0.0)))
 
 
 def _plateau_representative_values(
@@ -253,18 +348,35 @@ def extract_unlabeled_statistics(
             raise ValueError("use source_reference or raw source centers/scale, not both")
         source_centers = np.asarray(source_reference.centers, dtype=np.float64)
         source_scale = np.asarray(source_reference.scale, dtype=np.float64)
-    probability_images = [
-        np.clip(image.astype(np.float64, copy=False), 0.0, 1.0)
-        for image in _as_image_list(probabilities, "probabilities")
-    ]
-    flat_probabilities = np.concatenate([image.reshape(-1) for image in probability_images])
-    probability_histogram = _normalised_histogram(
-        flat_probabilities, PROBABILITY_HISTOGRAM_BINS
-    )
-    probability_quantiles = np.quantile(flat_probabilities, QUANTILES)
+    sample_limit = int(statistics_config.quantile_sample_limit)
+    chunk_size = int(STREAM_CHUNK_SIZE)
+    probability_samples = _BoundedQuantileAccumulator(sample_limit, chunk_size)
+    peak_samples = _BoundedQuantileAccumulator(sample_limit, chunk_size)
+    gray_samples = _BoundedQuantileAccumulator(sample_limit, chunk_size)
+    gradient_samples = _BoundedQuantileAccumulator(sample_limit, chunk_size)
+    laplacian_samples = _BoundedQuantileAccumulator(sample_limit, chunk_size)
+    probability_counts = np.zeros(PROBABILITY_HISTOGRAM_BINS, dtype=np.int64)
+    peak_counts = np.zeros(PEAK_HISTOGRAM_BINS, dtype=np.int64)
+    gray_moments = _StreamingMoments()
+    gradient_sum = 0.0
+    gradient_count = 0
+    high_frequency_ratio_sum = 0.0
+    total_pixels = 0
+    total_peaks = 0
+    num_images = 0
 
-    peak_arrays = []
-    for image in probability_images:
+    probability_iterator = iter(_iter_images(probabilities, "probabilities"))
+    gray_iterator = (
+        iter(_iter_images(grayscale_images, "grayscale_images"))
+        if grayscale_images is not None
+        else None
+    )
+    for image in probability_iterator:
+        image = np.clip(image.astype(np.float64, copy=False), 0.0, 1.0)
+        probability_counts += np.histogram(
+            image, bins=PROBABILITY_HISTOGRAM_BINS, range=(0.0, 1.0)
+        )[0]
+        probability_samples.update(image)
         pooled = maximum_filter(image, size=peak_kernel_size, mode="nearest")
         if statistics_config.plateau_atol == 0.0:
             reaches_local_max = image == pooled
@@ -278,62 +390,78 @@ def extract_unlabeled_statistics(
         candidates = reaches_local_max & (image >= peak_min_score)
         # Mirror the detector loss exactly: use row-major ranks only as a
         # deterministic tie-break inside the same local pooling kernel.
-        peak_arrays.append(
-            _plateau_representative_values(
-                image, candidates, kernel_size=statistics_config.peak_kernel_size
-            )
+        peaks = _plateau_representative_values(
+            image, candidates, kernel_size=statistics_config.peak_kernel_size
         )
-    nonempty_peaks = [values for values in peak_arrays if values.size]
-    peaks = np.concatenate(nonempty_peaks) if nonempty_peaks else np.empty(0, dtype=np.float64)
-    if peaks.size:
-        peak_histogram = _normalised_histogram(peaks, PEAK_HISTOGRAM_BINS)
-        peak_quantiles = np.quantile(peaks, QUANTILES)
+        peak_counts += np.histogram(
+            peaks, bins=PEAK_HISTOGRAM_BINS, range=(0.0, 1.0)
+        )[0]
+        peak_samples.update(peaks)
+        total_pixels += int(image.size)
+        total_peaks += int(peaks.size)
+        num_images += 1
+
+        if gray_iterator is not None:
+            try:
+                gray = next(gray_iterator)
+            except StopIteration as exc:
+                raise ValueError(
+                    "probabilities and grayscale_images must have the same length"
+                ) from exc
+            gray = _normalise_grayscale(gray)
+            gray_moments.update(gray)
+            gray_samples.update(gray)
+            grad_y, grad_x = np.gradient(gray)
+            gradients = np.hypot(grad_x, grad_y)
+            gradient_sum += float(gradients.sum(dtype=np.float64))
+            gradient_count += int(gradients.size)
+            gradient_samples.update(gradients)
+            laplacian = laplace(gray, mode="nearest")
+            laplacian_samples.update(np.abs(laplacian - np.median(laplacian)))
+            high = gray - gaussian_filter(gray, sigma=1.0, mode="nearest")
+            high_frequency_ratio_sum += float(
+                np.mean(np.square(high))
+                / max(float(np.mean(np.square(gray))), 1e-12)
+            )
+
+    if num_images == 0:
+        raise ValueError("probabilities must contain at least one image")
+    if gray_iterator is not None:
+        try:
+            next(gray_iterator)
+        except StopIteration:
+            pass
+        else:
+            raise ValueError("probabilities and grayscale_images must have the same length")
+
+    probability_histogram = _normalised_histogram_counts(probability_counts)
+    probability_quantiles = probability_samples.quantiles(QUANTILES)
+    if total_peaks:
+        peak_histogram = _normalised_histogram_counts(peak_counts)
+        peak_quantiles = peak_samples.quantiles(QUANTILES)
     else:
         peak_histogram = np.zeros(PEAK_HISTOGRAM_BINS, dtype=np.float64)
         peak_quantiles = np.zeros(len(QUANTILES), dtype=np.float64)
-    total_pixels = sum(image.size for image in probability_images)
-    peaks_per_megapixel = peaks.size / max(total_pixels / 1_000_000.0, 1e-12)
+    peaks_per_megapixel = total_peaks / max(total_pixels / 1_000_000.0, 1e-12)
 
     gray_features = np.zeros(8, dtype=np.float64)
-    gray_available = 0.0
-    if grayscale_images is not None:
-        gray_images = [
-            _normalise_grayscale(image)
-            for image in _as_image_list(grayscale_images, "grayscale_images")
-        ]
-        if len(gray_images) != len(probability_images):
-            raise ValueError("probabilities and grayscale_images must have the same length")
-        gray_available = 1.0
-        gray_values = np.concatenate([image.reshape(-1) for image in gray_images])
-        gray_mean = float(gray_values.mean())
-        gray_std = float(gray_values.std())
-        gray_mad = float(np.median(np.abs(gray_values - np.median(gray_values))))
-        gradient_values = []
-        laplacian_values = []
-        high_frequency_energy = []
-        for image in gray_images:
-            grad_y, grad_x = np.gradient(image)
-            gradient_values.append(np.hypot(grad_x, grad_y).reshape(-1))
-            lap = laplace(image, mode="nearest")
-            laplacian_values.append(np.abs(lap - np.median(lap)).reshape(-1))
-            high = image - gaussian_filter(image, sigma=1.0, mode="nearest")
-            high_frequency_energy.append(
-                float(
-                    np.mean(np.square(high))
-                    / max(float(np.mean(np.square(image))), 1e-12)
-                )
-            )
-        gradients = np.concatenate(gradient_values)
-        laplacians = np.concatenate(laplacian_values)
+    gray_available = float(gray_iterator is not None)
+    if gray_iterator is not None:
+        gray_median = float(gray_samples.quantiles((0.5,))[0])
+        # When sampling is active this is the MAD of the same deterministic
+        # sample.  Below the cap it remains exactly the legacy global MAD.
+        gray_mad = float(
+            np.median(np.abs(gray_samples._values - gray_median))
+        )
         gray_features = np.asarray(
             [
-                gray_mean,
-                gray_std,
+                gray_moments.mean,
+                gray_moments.std,
                 gray_mad,
-                gradients.mean(),
-                np.quantile(gradients, 0.95),
-                np.median(laplacians),
-                np.mean(high_frequency_energy),
+                gradient_sum / max(gradient_count, 1),
+                gradient_samples.quantiles((0.95,))[0],
+                laplacian_samples.quantiles((0.5,))[0],
+                high_frequency_ratio_sum / num_images,
                 0.0,
             ],
             dtype=np.float64,
@@ -357,12 +485,33 @@ def extract_unlabeled_statistics(
     return DomainStatistics(
         vector=vector,
         metadata={
-            "num_images": len(probability_images),
+            "num_images": num_images,
             "num_pixels": int(total_pixels),
-            "num_peaks": int(peaks.size),
+            "num_peaks": int(total_peaks),
             "has_grayscale": bool(gray_available),
             "num_source_centers": int(_source_center_matrix(source_centers).shape[0]),
             "statistics_config": statistics_config.to_dict(),
+            "streaming_memory_contract": {
+                "mode": "single_image_plus_bounded_deterministic_priority_samples",
+                "quantile_sample_limit_per_family": sample_limit,
+                "quantile_estimator": statistics_config.quantile_estimator,
+                "stream_chunk_size": chunk_size,
+                "auxiliary_memory_independent_of_domain_pixel_count": True,
+            },
+            "quantile_sample_counts": {
+                "probability": probability_samples.sample_size,
+                "peak": peak_samples.sample_size,
+                "grayscale": gray_samples.sample_size,
+                "gradient": gradient_samples.sample_size,
+                "laplacian_deviation": laplacian_samples.sample_size,
+            },
+            "quantiles_exact": {
+                "probability": probability_samples.exact,
+                "peak": peak_samples.exact,
+                "grayscale": gray_samples.exact,
+                "gradient": gradient_samples.exact,
+                "laplacian_deviation": laplacian_samples.exact,
+            },
         },
         statistics_config=statistics_config,
     )

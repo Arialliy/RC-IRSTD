@@ -613,7 +613,11 @@ https://github.com/ying-fu/MSHNet
 │   ├── multi_source_dataset.py
 │   ├── balanced_domain_loader.py
 │   ├── eval_dataset.py
+│   ├── inference_dataset.py
 │   ├── dataset_meta.py
+│   ├── dataset_identity.py
+│   ├── score_manifest_artifacts.py
+│   ├── label_manifest_artifacts.py
 │   └── split_utils.py
 │
 ├── losses/
@@ -636,6 +640,7 @@ https://github.com/ying-fu/MSHNet
 │
 ├── evaluation/
 │   ├── export_score_maps.py
+│   ├── export_label_maps.py
 │   ├── threshold_sweep.py
 │   ├── component_matching.py
 │   ├── budget_metrics.py
@@ -1421,13 +1426,12 @@ prob = torch.sigmoid(logits)
 binary = logits > 0
 ```
 
-推荐每张图保存一个压缩 `.npz`：
+每张图保存一个只含预测与几何元数据的压缩 `.npz`：
 
 ```python
 np.savez_compressed(
     output_path,
     prob=prob.astype(np.float32),
-    mask=mask.astype(np.uint8),
     image_id=image_id,
     dataset_name=dataset_name,
     original_hw=np.asarray(
@@ -1441,6 +1445,8 @@ np.savez_compressed(
 )
 ```
 
+`evaluation.export_score_maps` 必须使用独立的 `IRSTDInferenceDataset`：不解析、不枚举、不打开 `masks/`，即使目标数据根本没有 `masks/` 目录也应能完成导出。score-manifest schema-v3 verifier 默认拒绝任何嵌入 `mask` 的 score NPZ，并冻结、重放 official train/test 的 split SHA、有序 ID 和逐图原始字节 SHA；旧 combined 或无 split role 的 manifest 只能显式作为 non-claim-bearing diagnostic 读取。
+
 命令接口建议：
 
 ```bash
@@ -1448,9 +1454,22 @@ python -m evaluation.export_score_maps \
   --dataset-dir datasets/IRSTD-1K \
   --weight-path repro_runs/NUDT/weight.pkl \
   --output-dir outputs/score_maps/NUDT_to_IRSTD1K \
+  --split test \
+  --split-role official_test \
   --base-size 256 \
   --device cuda
 ```
+
+只有离线构造 query curve 或最终评估时，才另行建立与 score manifest 绑定的标签附件：
+
+```bash
+python -m evaluation.export_label_maps \
+  --dataset-dir datasets/IRSTD-1K \
+  --score-manifest outputs/score_maps/NUDT_to_IRSTD1K/manifest.json \
+  --output-dir outputs/label_maps/NUDT_to_IRSTD1K
+```
+
+score 与 label 产物必须位于完全分离的目录树。`label-manifest.json` 同时绑定 score-manifest 文件 SHA、内容 SHA、有序 image IDs、原始画布和每张原图 SHA；错数据根、错标签、文件篡改都必须 fail closed。
 
 ### 输出目录
 
@@ -1466,23 +1485,32 @@ outputs/score_maps/NUDT_to_IRSTD1K/
 
 ```json
 {
-  "source_dataset": "NUDT-SIRST",
+  "schema_version": 2,
+  "artifact_type": "label_free_score_export",
   "target_dataset": "IRSTD-1K",
   "weight_path": "...",
-  "base_size": 256,
+  "labels_embedded": false,
+  "restored_to_original_hw": true,
   "score_type": "sigmoid_probability",
+  "threshold_semantics": "prediction = probability > threshold",
+  "content_sha256": "<ordered-score-content-sha256>",
   "num_images": 1000
 }
 ```
 
 ### 验收条件
 
-随机读取 10 张：
+随机读取 10 张 score，并独立核验 label attachment：
 
 ```python
 assert np.isfinite(prob).all()
 assert prob.min() >= 0.0
 assert prob.max() <= 1.0
+assert "mask" not in score_npz.files
+assert prob.shape == tuple(score_item["original_hw"])
+
+attachment = verify_label_attachment(score_manifest, label_manifest)
+mask = load_label_mask(attachment.selected_items[0])
 assert set(np.unique(mask)).issubset({0, 1})
 assert prob.shape == mask.shape
 ```
@@ -2034,7 +2062,7 @@ Detector AB → pseudo-target C
 rc/build_meta_episodes.py
 ```
 
-不得手写 `statistics`、`oracle_threshold` 或 `reject_label`。它们必须由同一个有序 pseudo-target score manifest 的无标签 context 和带标签 query curve 生成。schema-v3 builder 的单个 episode **输入 spec** 如下：
+不得手写 `statistics`、`oracle_threshold` 或 `reject_label`。它们必须由同一个有序 pseudo-target **official-train** score manifest 的无标签 context 和带标签 query curve 生成。meta-episode schema-v4 builder 的单个 episode **输入 spec** 如下：
 
 ```json
 {
@@ -2048,7 +2076,10 @@ rc/build_meta_episodes.py
   "protocol_scope": "multi_source_protocol_candidate",
   "statistics_config": {
     "peak_kernel_size": 3,
-    "peak_min_score": 0.05
+    "peak_min_score": 0.05,
+    "quantile_sample_limit": 262144,
+    "quantile_estimator": "splitmix64_priority_bottom_k_stream_index_v1",
+    "algorithm_version": "rc-domain-statistics-v3-bounded-quantiles"
   },
   "source_reference": "../../artifacts/outer-D/pseudo-A/source-reference.npz",
   "context_manifest": "../../scores/outer-D/pseudo-A/A/manifest.json",
@@ -2069,6 +2100,8 @@ rc/build_meta_episodes.py
 ```
 
 Builder 以 spec 文件所在目录为相对路径锚点；上例假定 spec 位于 `outputs/specs/outer-D/episode-spec.json`。Builder 必须断言：`context_image_ids` 与 `query_image_ids` 不相交；两者来自同一 manifest，且组成连续的 context-first/query-second 窗口；manifest、curve 和 source reference 的 checkpoint/fold/domain/SHA 合同逐项相等。Budget 的 `log10` 变换只在数值特征层执行，JSON 保留原始单位以便审计。builder 输出的 JSONL 才会嵌入计算后的 statistics、oracle、reject 和 provenance。
+
+`rc-domain-statistics-v3-bounded-quantiles` 对直方图、计数、均值和峰值密度使用全量分块累计；分位数在每个特征族不超过 `quantile_sample_limit` 时与旧实现精确等价，超过后使用由全局流索引决定的 SplitMix64 bottom-k 优先级样本。样本上限、采样器名称和算法版本必须随 source reference、episode 和 calibrator 一起冻结；旧 `rc-domain-statistics-v2` 产物不可复用，必须重建。
 
 窗口：
 
@@ -2264,18 +2297,30 @@ python -m rc.online_adapter \
   --calibrator-checkpoint outputs/rc/threshold_calibrator.pt \
   --target-domain RealScene-ISTD \
   --context-size 32 \
+  --query-size 32 \
   --pixel-budget 1e-6 \
-  --component-budget 1.0 \
   --output outputs/rc/realscene_zero_label.json
+
+# 仅用于离线评估；不参与上述 threshold/reject 决策
+python -m evaluation.export_label_maps \
+  --dataset-dir datasets/RealScene-ISTD \
+  --score-manifest outputs/scores/realscene/manifest.json \
+  --output-dir outputs/labels/realscene
 
 python -m evaluation.evaluate_adapter_output \
   --adapter-output outputs/rc/realscene_zero_label.json \
   --score-manifest outputs/scores/realscene/manifest.json \
   --calibrator-checkpoint outputs/rc/threshold_calibrator.pt \
+  --label-manifest outputs/labels/realscene/label-manifest.json \
   --output outputs/rc/realscene_query_metrics.json
 ```
 
-第一条命令只读取无标签 context score maps，输出阈值/reject，并绑定 calibrator checkpoint SHA、detector/manifest SHA 与 query IDs；第二条命令是独立的 label-using offline replay，必须传入实际 calibrator checkpoint。它先核验 checkpoint SHA，并在 CPU 上确定性重跑 context→threshold/reject、逐项比对原输出，然后才读取 query 标签计算 Pd/FA。默认必须报告为 `prefix_holdout`。`--assert-temporal-order`（旧参数名 `--temporal-order-verified` 仅作兼容别名）只记录用户对采集时序的声明，输出为 `asserted_temporal_prefix`，不得称为独立验证的 `causal_online`；若要使用后者，还需额外的带签名采集时间戳/日志证据及其核验器。
+上例对应 `monotone_pixel` 主路径，只允许像素虚警预算。传统
+connected-component 虚警可能因阈值升高导致区域分裂而增加，因此仅在
+direct baseline/兼容评价中支持 `--component-budget`，不得写成具有严格
+单调保证的逆风险约束。
+
+第一条命令只读取无标签 context score maps，输出阈值/reject，并绑定 calibrator checkpoint SHA、detector/manifest SHA 与 query IDs；标签导出是彻底分离的离线产物；最后一条命令是 label-using offline replay，必须传入实际 calibrator checkpoint 和独立 label manifest。它先核验 checkpoint SHA，并在 CPU 上确定性重跑 context→threshold/reject、逐项比对原输出；reject 时直接返回，不解析、不打开 label manifest。只有接受后才核验并读取 query 标签计算 Pd/FA。默认必须报告为 `prefix_holdout`。`--assert-temporal-order`（旧参数名 `--temporal-order-verified` 仅作兼容别名）只记录用户对采集时序的声明，输出为 `asserted_temporal_prefix`，不得称为独立验证的 `causal_online`；若要使用后者，还需额外的带签名采集时间戳/日志证据及其核验器。
 
 禁止使用目标标签选择：
 
@@ -2286,7 +2331,7 @@ python -m evaluation.evaluate_adapter_output \
 
 ---
 
-## 11.1 schema-v3 可执行工件链
+## 11.1 schema-v4 meta-episode 可执行工件链
 
 下列 A/B/C/D 是逻辑域：D 是本 outer fold 最终不可见目标，A 是当前 inner fold 的 pseudo-target，B/C 是训练 inner detector 的源域。本地现有三域在固定 outer target 后无法同时保证“两个 detector source + 一个 pseudo-target”；因此下列主协议需要至少第四个合法独立域。
 
@@ -2306,7 +2351,7 @@ python -m scripts.train_multisource_tail \
   --run-name outer-D__pseudo-A
 ```
 
-checkpoint 必须标记 `checkpoint_selection=fixed_last_no_test_or_target_validation`。若三域环境只能留下一个 detector source，仅可显式加 `--allow-single-source-inner-smoke`；该工件会被标记为 `single_source_inner_smoke_not_main_result`，schema-v3 主协议 episode 会拒绝它。
+checkpoint 必须标记 `checkpoint_selection=fixed_last_no_test_or_target_validation`。若三域环境只能留下一个 detector source，仅可显式加 `--allow-single-source-inner-smoke`；该工件会被标记为 `single_source_inner_smoke_not_main_result`，schema-v4 主协议 episode 会拒绝它。
 
 ### B. 用同一 inner checkpoint 导出 B/C/A score manifests
 
@@ -2315,24 +2360,33 @@ CKPT=outputs/detectors/outer-D__pseudo-A/checkpoint_last.pt
 
 python -m evaluation.export_score_maps \
   --dataset-dir datasets/B --split train \
+  --split-role official_train \
   --weight-path "$CKPT" \
   --output-dir outputs/scores/outer-D/pseudo-A/B \
   --device cuda
 
 python -m evaluation.export_score_maps \
   --dataset-dir datasets/C --split train \
+  --split-role official_train \
   --weight-path "$CKPT" \
   --output-dir outputs/scores/outer-D/pseudo-A/C \
   --device cuda
 
 python -m evaluation.export_score_maps \
-  --dataset-dir datasets/A --split test \
+  --dataset-dir datasets/A --split train \
+  --split-role official_train \
   --weight-path "$CKPT" \
   --output-dir outputs/scores/outer-D/pseudo-A/A \
   --device cuda
+
+# 只为 pseudo-target A 的离线 query oracle 生成标签附件
+python -m evaluation.export_label_maps \
+  --dataset-dir datasets/A \
+  --score-manifest outputs/scores/outer-D/pseudo-A/A/manifest.json \
+  --output-dir outputs/labels/outer-D/pseudo-A/A
 ```
 
-主实验建议对每个域使用显式 `--split-file`，不依赖数据集的默认文件名。B/C manifests 只用于无标签 source statistics；A manifest 同时承载有序 context 和后续 query。
+主实验建议对每个域使用显式 `--split-file`，不依赖数据集的默认文件名。B/C score manifests 只用于无标签 source statistics；A 的 pseudo-target context/query 必须全部来自 official train，context 永远不读标签，query oracle 标签只能来自独立 `label-manifest.json`。任何 official-test、无 role 或旧 schema-v2 score manifest 都会在 episode 构建阶段被拒绝。
 
 ### C. 构建与 detector/fold 绑定的 source reference
 
@@ -2356,22 +2410,24 @@ NPZ 中的 `source_contract_json` 必须同时嵌入 checkpoint SHA、有序 det
 ```bash
 python -m evaluation.threshold_sweep \
   --score-dir outputs/scores/outer-D/pseudo-A/A \
+  --label-manifest outputs/labels/outer-D/pseudo-A/A/label-manifest.json \
   --image-id-file outputs/splits/outer-D/pseudo-A/query.txt \
   --threshold-mode adaptive \
   --event-threshold-cap 4096 \
   --output outputs/curves/outer-D/pseudo-A/query.csv
 ```
 
-schema-v3 只接受 `adaptive` 或 `exact` curve。`exact` 必须全局覆盖所有 query score events；被 cap 的 adaptive/exact curve 只在 oracle threshold 位于 manifest 记录的完整 event-exact 高分后缀时才可用。`threshold=1.0` 是独立的严格空预测哨兵点。
+verified builder 只接受 `adaptive` 或 `exact` curve。curve sidecar 必须同时绑定 score/label manifest SHA、query IDs、`matching_rule` 和 `centroid_distance`。Builder 会从已验证的 query score+label 重建 threshold plan，完整重跑 sweep，并逐列核对全部 `CURVE_FIELDS`；CSV 不是 oracle 的信任根。`exact` 必须全局覆盖所有 query score events；被 cap 的 adaptive/exact curve 只在 oracle threshold 位于 manifest 记录的完整 event-exact 高分后缀时才可用。`threshold=1.0` 是独立的严格空预测哨兵点。
 
 ### E. 构建可训练 episode
 
-按 Step R5 的 schema-v3 示例生成 `episode-spec.json`。所有 SHA 必须来自实际文件，例如：
+按 Step R5 的 schema-v4 示例生成 `episode-spec.json`。所有 SHA 必须来自实际文件，例如：
 
 ```bash
 sha256sum \
   outputs/detectors/outer-D__pseudo-A/checkpoint_last.pt \
   outputs/scores/outer-D/pseudo-A/A/manifest.json \
+  outputs/labels/outer-D/pseudo-A/A/label-manifest.json \
   outputs/curves/outer-D/pseudo-A/query.csv.manifest.json
 
 python -m rc.build_meta_episodes \
@@ -2400,11 +2456,11 @@ python -m rc.train_calibrator \
   --device cuda
 ```
 
-validation pseudo-target 不得出现在 calibrator train episodes 中；feature standardizer 只在 train episodes 上拟合。deployment reference 的 contract 必须与上述 outer detector SHA/sources/fold 逐项一致。
+validation pseudo-target 不得出现在 calibrator train episodes 中；feature standardizer 只在 train episodes 上拟合。两部分 episode 都必须证明来自各 pseudo-target 的 official train，因为 validation loss 会参与 best-checkpoint 选择；训练入口在任何拟合前统一拒绝 official test、无 role 和 legacy v3 episode。deployment reference 的 contract 必须与上述 outer detector SHA/sources/fold 逐项一致。
 
 ### G. 最终 D 的无标签在线适配与独立回放
 
-先用 outer detector 导出 D 的完整有序 manifest，再执行 Step R9 的 `rc.online_adapter` 和 `evaluation.evaluate_adapter_output`。第一步只读 manifest prefix 中的无标签分数；第二步才用 query mask 计算 Pd/FA/BSR/Excess。
+先用 outer detector 以 `--split test --split-role official_test` 导出 D 的完整有序、无标签 score manifest，再执行 Step R9 的 `rc.online_adapter`。如果有离线评估权限，另行为 D 导出独立 label manifest，再调用 `evaluation.evaluate_adapter_output`。claim-bearing 在线适配与 replay 都硬性要求 official test；第一步只读 manifest prefix 中的无标签分数，离线 replay 先重现决策，且仅在非 reject 时打开 query label artifact 计算 Pd/FA/BSR/Excess。
 
 ---
 
@@ -2420,8 +2476,8 @@ validation pseudo-target 不得出现在 calibrator train episodes 中；feature
 - [ ] Step R5：严格 LODO detectors 的全量 checkpoint（契约已实现，实验产物未生成）；
 - [x] Step R6：无标签窗口统计与 fold-specific source reference；
 - [x] Step R7：自适应高尾 curve 与 oracle threshold 元标签；
-- [x] Step R8：直接阈值校准器基线及 schema-v3 溯源；
-- [x] Step R9：prefix-holdout/causal online 适配与独立 query replay；
+- [x] Step R8：直接阈值校准器基线、单调像素预算候选及 schema-v4 official-split 溯源；
+- [x] Step R9：prefix-holdout/用户声明时序的适配，以及标签产物分离的 query replay；
 - [ ] rolling quantile 和 EVT；
 - [ ] 不同窗口长度；
 - [ ] 目标污染实验；
@@ -2429,7 +2485,7 @@ validation pseudo-target 不得出现在 calibrator train episodes 中；feature
 - [ ] 至少 3 个 unseen domains；
 - [ ] 三个随机种子。
 
-另外，AAAI 评审稿建议的“单调逆风险曲线 + 尾部间隔学习”属于 RC-v2/候选主方法，当前仓库中的 direct calibrator 不得被改名为该方法。
+另外，AAAI 评审稿建议的“单调逆风险曲线 + 尾部间隔学习”已形成显式候选路径，但 direct calibrator 仍是独立基线；当前单调分支仍使用 oracle-threshold 回归加 reject BCE，尚未完成 query risk-aligned loss，因此不得把这一证据门槛写成已完成。
 
 ---
 

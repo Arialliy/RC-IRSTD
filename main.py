@@ -46,6 +46,16 @@ def parse_args(default_mode=None):
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--train-split-file', type=str, default=None)
+    parser.add_argument('--test-split-file', type=str, default=None)
+    parser.add_argument(
+        '--allow-test-selection',
+        action='store_true',
+        help=(
+            'Legacy reproduction only: evaluate the official test split every '
+            'epoch and select weight.pkl by test mIoU. Never use for RC/AAAI results.'
+        ),
+    )
 
     parser.add_argument('--mode', type=str, default=default_mode or 'train', choices=['train', 'test'])
     parser.add_argument('--weight-path', type=str, default='')
@@ -88,14 +98,21 @@ class Trainer(object):
                 pin_memory=self.device.type == 'cuda',
             )
 
-        valset = IRSTD_Dataset(args, mode='val')
-        self.val_loader = Data.DataLoader(
-            valset,
-            1,
-            drop_last=False,
-            num_workers=args.num_workers,
-            pin_memory=self.device.type == 'cuda',
-        )
+        self.val_loader = None
+        if args.mode == 'test' or args.allow_test_selection:
+            if args.mode == 'train':
+                print(
+                    'WARNING: --allow-test-selection reads the official test split '
+                    'during training. This run is legacy/non-claim-bearing.'
+                )
+            testset = IRSTD_Dataset(args, mode='test')
+            self.val_loader = Data.DataLoader(
+                testset,
+                1,
+                drop_last=False,
+                num_workers=args.num_workers,
+                pin_memory=self.device.type == 'cuda',
+            )
 
         model = MSHNet(3)
         if args.multi_gpus and self.device.type == 'cuda' and torch.cuda.device_count() > 1:
@@ -172,6 +189,22 @@ class Trainer(object):
             raise ValueError('--resume-path or --weight-path is required when --if-checkpoint true')
 
         checkpoint = torch.load(path, map_location=self.device)
+        if not self.args.allow_test_selection:
+            if not isinstance(checkpoint, dict):
+                raise ValueError(
+                    'Safe fixed-last resume requires a metadata checkpoint; '
+                    'raw/legacy weights have unknown selection provenance.'
+                )
+            if checkpoint.get('checkpoint_selection') != 'fixed_last_no_test_or_target_validation':
+                raise ValueError(
+                    'Safe fixed-last resume refuses a checkpoint with unknown or '
+                    'test-selected provenance. Use a fixed-last checkpoint or run '
+                    'the explicitly legacy --allow-test-selection mode.'
+                )
+            if checkpoint.get('official_test_accessed_during_training') is not False:
+                raise ValueError(
+                    'Safe fixed-last resume requires an explicit no-test-access marker.'
+                )
         self.model.load_state_dict(self._normalise_state_dict(checkpoint))
         if isinstance(checkpoint, dict) and 'optimizer' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -211,6 +244,11 @@ class Trainer(object):
             tbar.set_description('Epoch %d, loss %.4f' % (epoch, losses.avg))
 
     def test(self, epoch):
+        if self.val_loader is None:
+            raise RuntimeError(
+                'No test loader is available. Training defaults to fixed-last '
+                'without official-test access; use --mode test for final evaluation.'
+            )
         self.model.eval()
         self.mIoU.reset()
         self.PD_FA.reset()
@@ -255,12 +293,33 @@ class Trainer(object):
                     'optimizer': self.optimizer.state_dict(),
                     'epoch': epoch,
                     'iou': self.best_iou,
+                    'checkpoint_selection': 'official_test_selected_best_legacy_only',
+                    'official_test_accessed_during_training': True,
                 }
                 torch.save(all_states, osp.join(self.save_folder, 'checkpoint.pkl'))
             elif self.mode == 'test':
                 print('mIoU: ' + str(mean_IoU))
                 print('Pd: ' + str(PD[0]))
                 print('Fa: ' + str(FA[0] * 1000000))
+
+    def save_fixed_last(self, epoch):
+        """Save the current epoch without constructing or reading a test loader."""
+
+        if self.mode != 'train':
+            raise RuntimeError('save_fixed_last is available only in train mode')
+        state_dict = self.model.state_dict()
+        all_states = {
+            'net': state_dict,
+            'optimizer': self.optimizer.state_dict(),
+            'epoch': epoch,
+            'checkpoint_selection': 'fixed_last_no_test_or_target_validation',
+            'official_test_accessed_during_training': False,
+            'protocol_scope': 'legacy_single_domain_fixed_last_not_rc_protocol',
+            'train_split_file': str(self.train_loader.dataset.list_dir),
+            'seed': int(self.args.seed),
+        }
+        torch.save(state_dict, osp.join(self.save_folder, 'weight-last.pkl'))
+        torch.save(all_states, osp.join(self.save_folder, 'checkpoint.pkl'))
 
 
 def main(default_mode=None):
@@ -272,7 +331,10 @@ def main(default_mode=None):
     if trainer.mode == 'train':
         for epoch in range(trainer.start_epoch, args.epochs):
             trainer.train(epoch)
-            trainer.test(epoch)
+            if args.allow_test_selection:
+                trainer.test(epoch)
+            else:
+                trainer.save_fixed_last(epoch)
     else:
         trainer.test(1)
 

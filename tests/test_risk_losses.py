@@ -1,5 +1,8 @@
 import math
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch.utils.data import TensorDataset
@@ -13,9 +16,47 @@ from losses.local_peak_cvar import (
     top_fraction_mean,
 )
 from losses.smooth_worst_domain import smooth_max
+from losses.schedules import linear_risk_weight
+from losses.target_background_margin import (
+    domain_target_background_margin_risks,
+    image_target_background_margin_risks,
+)
 
 
 class RiskLossTests(unittest.TestCase):
+    def test_risk_terms_have_zero_warmup_and_linear_ramp(self):
+        self.assertEqual(linear_risk_weight(0, 5, 10), 0.0)
+        self.assertEqual(linear_risk_weight(4, 5, 10), 0.0)
+        self.assertAlmostEqual(linear_risk_weight(5, 5, 10), 0.1)
+        self.assertAlmostEqual(linear_risk_weight(9, 5, 10), 0.5)
+        self.assertEqual(linear_risk_weight(14, 5, 10), 1.0)
+        self.assertEqual(linear_risk_weight(20, 5, 10), 1.0)
+        self.assertEqual(linear_risk_weight(5, 5, 0), 1.0)
+
+    def test_warmup_supervises_fused_and_all_auxiliary_heads(self):
+        from model.loss import SLSIoULoss
+        from scripts.train_multisource_tail import multiscale_sls_loss
+
+        masks = torch.zeros((2, 1, 8, 8))
+        masks[:, :, 3:5, 3:5] = 1.0
+        final = torch.zeros((2, 1, 8, 8), requires_grad=True)
+        auxiliaries = [
+            torch.zeros((2, 1, 8, 8), requires_grad=True),
+            torch.zeros((2, 1, 4, 4), requires_grad=True),
+        ]
+        loss = multiscale_sls_loss(
+            SLSIoULoss(),
+            final,
+            auxiliaries,
+            masks,
+            warm_epoch=5,
+            epoch=0,
+        )
+        loss.backward()
+        self.assertGreater(torch.count_nonzero(final.grad).item(), 0)
+        for prediction in auxiliaries:
+            self.assertGreater(torch.count_nonzero(prediction.grad).item(), 0)
+
     def test_top_fraction_mean_uses_ceiling_and_largest_values(self):
         values = torch.tensor([1.0, 2.0, 3.0, 4.0])
         self.assertAlmostEqual(top_fraction_mean(values, 0.26).item(), 3.5)
@@ -121,6 +162,130 @@ class RiskLossTests(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(logits.grad)
         self.assertTrue(torch.equal(logits.grad, torch.zeros_like(logits.grad)))
+
+    @staticmethod
+    def _margin_example(
+        background_logits,
+        target_logits,
+    ):
+        count = len(background_logits)
+        logits = torch.full((count, 1, 7, 7), -12.0)
+        masks = torch.zeros_like(logits)
+        for index, (background, target) in enumerate(
+            zip(background_logits, target_logits)
+        ):
+            masks[index, 0, 1, 1] = 1.0
+            logits[index, 0, 1, 1] = target
+            logits[index, 0, 5, 5] = background
+        return logits, masks
+
+    def test_logit_margin_is_invariant_to_common_global_shift(self):
+        logits, masks = self._margin_example([1.0, -1.0], [0.0, 2.0])
+        baseline = image_target_background_margin_risks(
+            logits,
+            masks,
+            background_q=0.01,
+            target_q=1.0,
+            object_pixel_fraction=1.0,
+            margin=1.0,
+        )
+        shifted = image_target_background_margin_risks(
+            logits + 7.0,
+            masks,
+            background_q=0.01,
+            target_q=1.0,
+            object_pixel_fraction=1.0,
+            margin=1.0,
+        )
+        self.assertTrue(torch.equal(baseline, shifted))
+
+    def test_margin_violation_pushes_target_up_and_background_peak_down(self):
+        logits, masks = self._margin_example([2.0], [-2.0])
+        logits.requires_grad_()
+        risk = image_target_background_margin_risks(
+            logits,
+            masks,
+            background_q=0.01,
+            target_q=1.0,
+            object_pixel_fraction=1.0,
+            margin=1.0,
+        ).sum()
+        self.assertAlmostEqual(risk.item(), 5.0)
+        risk.backward()
+        self.assertGreater(logits.grad[0, 0, 5, 5].item(), 0.0)
+        self.assertLess(logits.grad[0, 0, 1, 1].item(), 0.0)
+        self.assertAlmostEqual(logits.grad.sum().item(), 0.0)
+
+    def test_margin_reduces_image_first_then_balances_domains(self):
+        logits, masks = self._margin_example([1.0, 3.0, 7.0], [0.0, 0.0, 0.0])
+        domain_risks, represented_ids = domain_target_background_margin_risks(
+            logits,
+            masks,
+            torch.tensor([5, 5, 9]),
+            background_q=0.01,
+            target_q=1.0,
+            object_pixel_fraction=1.0,
+            margin=0.0,
+            return_domain_ids=True,
+        )
+        self.assertEqual(represented_ids.tolist(), [5, 9])
+        self.assertTrue(torch.equal(domain_risks, torch.tensor([2.0, 7.0])))
+
+    def test_margin_empty_target_or_background_is_graph_connected_zero(self):
+        logits = torch.randn((2, 1, 5, 5), requires_grad=True)
+        masks = torch.zeros_like(logits)
+        # Image 0 has background but no target. Image 1 has one all-image
+        # target component but no background candidate.
+        masks[1] = 1.0
+        risks = image_target_background_margin_risks(logits, masks)
+        self.assertTrue(torch.equal(risks, torch.zeros_like(risks)))
+        risks.sum().backward()
+        self.assertIsNotNone(logits.grad)
+        self.assertTrue(torch.equal(logits.grad, torch.zeros_like(logits.grad)))
+
+    def test_margin_capability_contract_is_persisted_in_detector_checkpoint(self):
+        from scripts.train_multisource_tail import save_checkpoint
+
+        args = SimpleNamespace(
+            seed=42,
+            outer_fold_id="fold-A",
+            outer_target="TARGET",
+            held_out_domains=["TARGET"],
+            risk_objective="margin",
+            tail_q=0.01,
+            miss_q=0.2,
+            object_pixel_q=0.25,
+            target_background_margin=1.5,
+            lambda_margin=0.3,
+            tail_mode="local-peak",
+            lambda_tail=0.1,
+            lambda_miss=0.1,
+        )
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            save_checkpoint(
+                run_dir,
+                model,
+                optimizer,
+                epoch=0,
+                args=args,
+                names=["SOURCE-A", "SOURCE-B"],
+                detector_source_records=[],
+                epoch_metrics={"loss_margin": 1.0},
+                run_config_sha256="a" * 64,
+            )
+            checkpoint = torch.load(
+                run_dir / "checkpoint_last.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+        self.assertEqual(checkpoint["risk_objective"], "margin")
+        capability = checkpoint["detector_capability_contract"]["risk_objective"]
+        self.assertEqual(capability["score_space"], "logit_difference")
+        self.assertTrue(capability["common_logit_shift_invariant"])
+        self.assertEqual(capability["margin_logit"], 1.5)
 
     @staticmethod
     def _toy_dataset(length: int, offset: int) -> TensorDataset:

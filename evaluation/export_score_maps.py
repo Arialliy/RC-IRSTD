@@ -19,17 +19,29 @@ from data_ext.dataset_meta import (
     safe_output_stem,
 )
 from data_ext.dataset_identity import (
+    ORDERED_SAMPLE_IDS_ALGORITHM,
     SCORE_MANIFEST_CONTENT_ALGORITHM,
+    SPLIT_IMAGE_ARTIFACT_ALGORITHM,
     build_dataset_record,
     score_manifest_content_sha256,
     sha256_file,
     validate_dataset_record,
 )
 from data_ext.inference_dataset import IRSTDInferenceDataset
+from data_ext.split_utils import (
+    read_split_entries,
+    resolve_split_file,
+    sample_id_from_entry,
+)
 from model.MSHNet import MSHNet
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+SCORE_MANIFEST_SCHEMA_VERSION = 3
+SPLIT_CONTRACT_SCHEMA_VERSION = 1
+OFFICIAL_SPLIT_ROLES = ("official_train", "official_test")
+
+
 def select_device(device: str) -> torch.device:
     if device == "cpu":
         return torch.device("cpu")
@@ -132,7 +144,15 @@ def checkpoint_provenance(checkpoint: object) -> dict[str, object]:
         "checkpoint_selection": checkpoint.get("checkpoint_selection"),
         "protocol_scope": checkpoint.get("protocol_scope"),
         "training_seed": checkpoint.get("seed"),
+        "run_config_sha256": checkpoint.get("run_config_sha256"),
     }
+    if common["run_config_sha256"] is not None:
+        digest = str(common["run_config_sha256"]).strip().lower()
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ValueError("checkpoint run_config_sha256 is not a valid SHA-256")
+        common["run_config_sha256"] = digest
     raw_records = checkpoint.get("detector_source_records")
     if raw_records is None:
         # Keep historical metadata visible for diagnostics, but old
@@ -233,6 +253,154 @@ def extract_logits(model_output: object) -> torch.Tensor:
     raise TypeError("Model output does not contain a logits tensor")
 
 
+def high_precision_sigmoid(logits: torch.Tensor) -> torch.Tensor:
+    """Compute probabilities in float64 to preserve extreme-tail ordering.
+
+    Detector logits are usually float32.  Casting after sigmoid cannot recover
+    distinct large logits that already saturated to the same float32 value,
+    which is material at per-million-pixel false-alarm budgets.
+    """
+
+    if not isinstance(logits, torch.Tensor) or not logits.is_floating_point():
+        raise TypeError("logits must be a floating-point torch.Tensor")
+    if not bool(torch.isfinite(logits).all().item()):
+        raise ValueError("logits contain NaN or infinity")
+    return torch.sigmoid(logits.to(dtype=torch.float64))
+
+
+def build_official_split_contract(
+    dataset: IRSTDInferenceDataset,
+    *,
+    split_role: str,
+    manifest_root: str | Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Freeze and audit the dataset's official train/test protocol split.
+
+    ``split_role`` is deliberately independent of the historical ``split``
+    argument.  A caller exporting training scores must opt in with
+    ``official_train``; leaving the exporter defaults unchanged always creates
+    an ``official_test`` artifact that a calibration consumer must reject.
+
+    The returned dataset record is the record for the selected role.  Both
+    official records are built from the concrete split files and raw image
+    bytes, then reduced to the fields needed to replay the disjointness audit
+    without embedding labels.
+    """
+
+    role = str(split_role).strip()
+    if role not in OFFICIAL_SPLIT_ROLES:
+        raise ValueError(
+            "split_role must be one of " + ", ".join(OFFICIAL_SPLIT_ROLES)
+        )
+
+    split_records: dict[str, dict[str, object]] = {}
+    split_paths: dict[str, Path] = {}
+    for official_role, split_name in (
+        ("official_train", "train"),
+        ("official_test", "test"),
+    ):
+        split_path = resolve_split_file(dataset.root, split_name).resolve()
+        sample_ids = [
+            sample_id_from_entry(entry) for entry in read_split_entries(split_path)
+        ]
+        split_paths[official_role] = split_path
+        split_records[official_role] = validate_dataset_record(
+            build_dataset_record(dataset.root, split_path, sample_ids),
+            require_source_name=False,
+            require_training_artifact=False,
+        )
+
+    train_record = split_records["official_train"]
+    test_record = split_records["official_test"]
+    if train_record["dataset_identity_sha256"] != test_record["dataset_identity_sha256"]:
+        raise RuntimeError(
+            "dataset image content changed while official train/test records "
+            "were being frozen"
+        )
+    for official_role, split_path in split_paths.items():
+        record = split_records[official_role]
+        if sha256_file(split_path) != record["split_sha256"]:
+            raise RuntimeError(
+                f"official split changed while protocol contract was built: {split_path}"
+            )
+
+    selected_path = Path(dataset.split_file).expanduser().resolve()
+    expected_selected_path = split_paths[role]
+    if selected_path != expected_selected_path:
+        raise ValueError(
+            f"split_role={role!r} requires the concrete official split file "
+            f"{expected_selected_path}, but the selected split resolves to {selected_path}. "
+            "Calibration exports must explicitly use split='train' together with "
+            "split_role='official_train'."
+        )
+    selected_record = split_records[role]
+    selected_ids = [str(sample[0]) for sample in dataset.samples]
+    selected_record_ids = [
+        str(item["sample_id"])
+        for item in selected_record["split_image_artifact_items"]
+    ]
+    if selected_ids != selected_record_ids:
+        raise RuntimeError(
+            "inference dataset order differs from the selected official split record"
+        )
+
+    train_items = list(train_record["split_image_artifact_items"])
+    test_items = list(test_record["split_image_artifact_items"])
+    train_ids = {str(item["sample_id"]) for item in train_items}
+    test_ids = {str(item["sample_id"]) for item in test_items}
+    train_image_hashes = {str(item["image_sha256"]) for item in train_items}
+    test_image_hashes = {str(item["image_sha256"]) for item in test_items}
+    id_overlap = sorted(train_ids & test_ids)
+    image_overlap = sorted(train_image_hashes & test_image_hashes)
+    if id_overlap or image_overlap:
+        details = []
+        if id_overlap:
+            details.append(f"sample-ID overlap={len(id_overlap)}")
+        if image_overlap:
+            details.append(f"raw-image-content overlap={len(image_overlap)}")
+        raise ValueError(
+            "official train/test splits are not disjoint ("
+            + ", ".join(details)
+            + "); score export is ineligible for calibration or final evaluation"
+        )
+
+    contract: dict[str, object] = {
+        "schema_version": SPLIT_CONTRACT_SCHEMA_VERSION,
+        "role": role,
+        "selected_split_file": _portable_path(selected_path, manifest_root),
+        "selected_split_sha256": selected_record["split_sha256"],
+        "selected_num_images": selected_record["num_samples"],
+        "selected_ids_sha256": selected_record["ordered_sample_ids_sha256"],
+        "ordered_sample_ids_algorithm": ORDERED_SAMPLE_IDS_ALGORITHM,
+        "split_image_artifact_algorithm": SPLIT_IMAGE_ARTIFACT_ALGORITHM,
+        "train_test_id_overlap_count": len(id_overlap),
+        "train_test_id_overlap_ids": id_overlap,
+        "train_test_image_content_overlap_count": len(image_overlap),
+        "train_test_image_content_overlap_sha256_leaves": image_overlap,
+        "disjointness_verified": True,
+    }
+    for official_role, record in split_records.items():
+        contract.update(
+            {
+                f"{official_role}_split_file": _portable_path(
+                    split_paths[official_role], manifest_root
+                ),
+                f"{official_role}_split_sha256": record["split_sha256"],
+                f"{official_role}_num_images": record["num_samples"],
+                f"{official_role}_ids_sha256": record[
+                    "ordered_sample_ids_sha256"
+                ],
+                f"{official_role}_split_image_artifact_sha256": record[
+                    "split_image_artifact_sha256"
+                ],
+                f"{official_role}_split_image_artifact_items": record[
+                    "split_image_artifact_items"
+                ],
+            }
+        )
+    return contract, selected_record
+
+
 def export_score_maps(
     *,
     dataset_dir: str | Path,
@@ -242,6 +410,7 @@ def export_score_maps(
     resize_mode: str = "resize",
     split: str = "test",
     split_file: str | Path | None = None,
+    split_role: str = "official_test",
     source_dataset: str | None = None,
     device: str = "auto",
     num_workers: int = 0,
@@ -285,10 +454,10 @@ def export_score_maps(
         split=split,
         split_file=split_file,
     )
-    target_dataset_record = build_dataset_record(
-        dataset.root,
-        dataset.split_file,
-        [sample[0] for sample in dataset.samples],
+    split_contract, target_dataset_record = build_official_split_contract(
+        dataset,
+        split_role=split_role,
+        manifest_root=output_root,
     )
     loader = DataLoader(
         dataset,
@@ -357,14 +526,14 @@ def export_score_maps(
             logits = extract_logits(model(image, True))
             if logits.ndim != 4 or logits.shape[0] != 1 or logits.shape[1] != 1:
                 raise ValueError(f"Expected logits [1, 1, H, W], got {tuple(logits.shape)}")
-            probability = torch.sigmoid(logits[0, 0])
+            probability = high_precision_sigmoid(logits[0, 0])
             probability = restore_tensor_to_original(
                 probability,
                 metadata.transform,
                 mode="bilinear",
             )
             probability_array = (
-                probability.clamp_(0.0, 1.0).detach().cpu().numpy().astype(np.float32)
+                probability.clamp_(0.0, 1.0).detach().cpu().numpy().astype(np.float64)
             )
             if probability_array.shape != metadata.transform.original_hw:
                 raise RuntimeError(
@@ -407,12 +576,13 @@ def export_score_maps(
             )
 
     manifest: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": SCORE_MANIFEST_SCHEMA_VERSION,
         "artifact_type": "label_free_score_export",
         "source_dataset": source_dataset,
         "source_dataset_assertion": source_dataset,
         "target_dataset": dataset.dataset_name,
         "target_dataset_record": target_dataset_record,
+        "split_contract": split_contract,
         "path_anchor": "manifest_directory",
         "dataset_dir": _portable_path(dataset.root, output_root),
         "split_file": _portable_path(dataset.split_file, output_root),
@@ -423,6 +593,12 @@ def export_score_maps(
         "resize_mode": resize_mode,
         "restored_to_original_hw": True,
         "score_type": "sigmoid_probability",
+        "score_dtype": "float64",
+        "sigmoid_compute_dtype": "float64",
+        "extreme_tail_precision_verified": True,
+        "extreme_tail_precision_contract": (
+            "cast logits to float64 before sigmoid; restore probability in float64"
+        ),
         "threshold_semantics": "prediction = probability > threshold",
         "labels_embedded": False,
         "label_contract": "external_label_attachment_manifest_required_offline",
@@ -442,6 +618,7 @@ def export_score_maps(
         "outer_target",
         "checkpoint_selection",
         "protocol_scope",
+        "run_config_sha256",
         "detector_source_records",
         "logical_target_exclusion_verified",
         "target_identity_exclusion_verified",
@@ -503,6 +680,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resize-mode", choices=("resize", "letterbox"), default="resize")
     parser.add_argument("--split", default="test")
     parser.add_argument("--split-file")
+    parser.add_argument(
+        "--split-role",
+        choices=OFFICIAL_SPLIT_ROLES,
+        default="official_test",
+        help=(
+            "Protocol role for the selected split. Calibration requires the "
+            "explicit pair --split train --split-role official_train; the safe "
+            "default is final-evaluation-only official_test."
+        ),
+    )
     parser.add_argument("--source-dataset")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -521,6 +708,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resize_mode=args.resize_mode,
         split=args.split,
         split_file=args.split_file,
+        split_role=args.split_role,
         source_dataset=args.source_dataset,
         device=args.device,
         num_workers=args.num_workers,

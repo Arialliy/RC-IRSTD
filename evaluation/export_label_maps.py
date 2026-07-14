@@ -21,14 +21,13 @@ from data_ext.label_manifest_artifacts import (
     label_manifest_content_sha256,
     verify_label_attachment,
 )
+from data_ext.mask_alignment import (
+    DEFAULT_ASPECT_TOLERANCE,
+    align_mask_to_image,
+    aspect_ratio_relative_error,
+)
 from data_ext.score_manifest_artifacts import verify_score_manifest_artifacts
 from data_ext.split_utils import resolve_sample_file
-
-
-try:
-    _NEAREST = Image.Resampling.NEAREST
-except AttributeError:  # Pillow < 9.1
-    _NEAREST = Image.NEAREST
 
 
 def export_label_maps(
@@ -81,6 +80,14 @@ def export_label_maps(
                 "dataset image bytes do not match the score manifest for "
                 f"{image_id!r}; refusing to attach labels from the wrong data root"
             )
+        with Image.open(image_path) as image_file:
+            source_image_size = image_file.size
+        if source_image_size != (target_w, target_h):
+            raise ValueError(
+                "score manifest original_hw does not match the source image for "
+                f"{image_id!r}: manifest={(target_w, target_h)} "
+                f"image={source_image_size}"
+            )
         mask_path = resolve_sample_file(
             dataset_root,
             mask_folder,
@@ -91,8 +98,15 @@ def export_label_maps(
         with Image.open(mask_path) as mask_file:
             mask_image = mask_file.convert("L")
         source_hw = (mask_image.height, mask_image.width)
-        if mask_image.size != (target_w, target_h):
-            mask_image = mask_image.resize((target_w, target_h), resample=_NEAREST)
+        aspect_error = aspect_ratio_relative_error(
+            (target_w, target_h),
+            mask_image.size,
+        )
+        mask_image = align_mask_to_image(
+            mask_image,
+            (target_w, target_h),
+            image_id,
+        )
         mask = (np.asarray(mask_image, dtype=np.uint8) > 0).astype(np.uint8)
         output_name = f"{safe_output_stem(image_id)}.label.npz"
         if output_name in names:
@@ -116,6 +130,8 @@ def export_label_maps(
                 "source_mask_file_sha256": source_mask_sha,
                 "source_mask_original_hw": list(source_hw),
                 "source_mask_resized_to_score_hw": source_hw != (target_h, target_w),
+                "mask_alignment_aspect_ratio_relative_error": aspect_error,
+                "mask_alignment_aspect_tolerance": DEFAULT_ASPECT_TOLERANCE,
             }
         )
 
@@ -132,7 +148,10 @@ def export_label_maps(
         "score_manifest_content_sha256": score.content_sha256,
         "target_dataset": declared_target,
         "labels_embedded_in_scores": False,
-        "alignment_rule": "binary mask; nearest-neighbor to score original_hw",
+        "alignment_rule": (
+            "binary mask; nearest-neighbor to score original_hw only when "
+            "image/mask aspect-ratio relative error <= 0.01; otherwise fail closed"
+        ),
         "num_images": len(items),
         "content_sha256_algorithm": LABEL_MANIFEST_CONTENT_ALGORITHM,
         "content_sha256": label_manifest_content_sha256(items),

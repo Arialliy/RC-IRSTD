@@ -14,14 +14,17 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from data_ext.dataset_identity import sha256_file
+from model.monotone_pixel_calibrator import MonotonePixelRiskCalibrator
 from model.threshold_calibrator import ThresholdCalibrator, asymmetric_threshold_loss
 
 from .meta_dataset import (
     FeatureStandardizer,
     RCMetaDataset,
+    RCPixelRiskMetaDataset,
     assert_pseudo_target_isolation,
     assert_verified_provenance,
     load_episodes,
@@ -29,7 +32,20 @@ from .meta_dataset import (
     validate_episode_collection,
 )
 from .domain_statistics import load_source_reference
-from .schema import FoldContract, RCEpisode, VALID_THRESHOLD_TRANSFORMS
+from .schema import (
+    DeploymentProtocolContract,
+    FoldContract,
+    OFFICIAL_TRAIN_SPLIT_ROLE,
+    RCEpisode,
+    SCHEMA_VERSION,
+    VALID_THRESHOLD_TRANSFORMS,
+    canonicalize_episode_score_split_contract,
+)
+
+
+DIRECT_CALIBRATOR = "direct"
+MONOTONE_PIXEL_CALIBRATOR = "monotone_pixel"
+CALIBRATOR_MODELS = (DIRECT_CALIBRATOR, MONOTONE_PIXEL_CALIBRATOR)
 
 
 def seed_everything(seed: int) -> None:
@@ -71,8 +87,112 @@ def resolve_episode_splits(args: argparse.Namespace) -> tuple[list[RCEpisode], l
     return train, validation
 
 
+def audit_official_train_score_provenance(
+    train_episodes: Sequence[RCEpisode],
+    validation_episodes: Sequence[RCEpisode],
+) -> dict[str, Any]:
+    """Fail closed before either fitting or pseudo-target model selection.
+
+    Pseudo-target validation is still calibration: its oracle thresholds may
+    select the best checkpoint.  Consequently both the optimiser split and
+    the pseudo-target validation split must have been exported exclusively
+    from each pseudo-target's official training split.  Legacy v3 episodes
+    remain deserialisable for diagnostics, but are ineligible here.
+    """
+
+    partitions = (
+        ("calibrator_train", train_episodes),
+        ("pseudo_target_validation", validation_episodes),
+    )
+    contracts_by_target: dict[str, dict[str, Any]] = {}
+    counts_by_target: dict[str, int] = {}
+    partition_by_target: dict[str, str] = {}
+    total = 0
+    for partition, episodes in partitions:
+        if not episodes:
+            raise ValueError(f"{partition} episode split must be non-empty")
+        for episode in episodes:
+            total += 1
+            if episode.schema_version != SCHEMA_VERSION:
+                raise ValueError(
+                    "claim-bearing calibrator training requires meta-episode v4 "
+                    "official-train provenance; legacy/missing split contract in "
+                    f"episode {episode.episode_id!r}"
+                )
+            raw_contract = episode.provenance.split_contract
+            if raw_contract is None:
+                raise ValueError(
+                    "claim-bearing calibrator training requires an official-train "
+                    f"split contract in episode {episode.episode_id!r}"
+                )
+            contract = canonicalize_episode_score_split_contract(raw_contract)
+            if contract["role"] != OFFICIAL_TRAIN_SPLIT_ROLE:
+                raise ValueError(
+                    "calibrator train/pseudo-target validation episodes must use "
+                    "role='official_train'; "
+                    f"episode {episode.episode_id!r} declares {contract['role']!r}"
+                )
+            if contract["selected_split_sha256"] != contract[
+                "official_train_split_sha256"
+            ]:
+                raise ValueError(
+                    "official-train episode selected_split_sha256 mismatch: "
+                    f"{episode.episode_id!r}"
+                )
+            if (
+                contract["train_test_id_overlap_count"] != 0
+                or contract["train_test_image_content_overlap_count"] != 0
+                or contract["disjointness_verified"] is not True
+            ):
+                raise ValueError(
+                    "official-train episode does not prove train/test disjointness: "
+                    f"{episode.episode_id!r}"
+                )
+
+            target = episode.pseudo_target
+            prior_partition = partition_by_target.setdefault(target, partition)
+            if prior_partition != partition:
+                raise ValueError(
+                    "one pseudo-target occurs in both calibrator train and validation: "
+                    f"{target!r}"
+                )
+            prior_contract = contracts_by_target.setdefault(target, contract)
+            if prior_contract != contract:
+                raise ValueError(
+                    "episodes for one pseudo-target disagree on their official-train "
+                    f"split contract: {target!r}"
+                )
+            counts_by_target[target] = counts_by_target.get(target, 0) + 1
+
+    target_audit: dict[str, Any] = {}
+    for target in sorted(contracts_by_target):
+        contract = contracts_by_target[target]
+        contract_json = json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        target_audit[target] = {
+            "partition": partition_by_target[target],
+            "num_episodes": counts_by_target[target],
+            "split_contract_sha256": hashlib.sha256(contract_json).hexdigest(),
+            "split_contract": contract,
+        }
+    return {
+        "schema_version": "rc-irstd.calibrator-official-train-provenance.v1",
+        "required_episode_schema": SCHEMA_VERSION,
+        "required_score_split_role": OFFICIAL_TRAIN_SPLIT_ROLE,
+        "pseudo_target_validation_may_select_best_checkpoint": True,
+        "official_test_scores_consumed": False,
+        "num_episodes": total,
+        "pseudo_targets": target_audit,
+    }
+
+
 def _batch_loss(
-    model: ThresholdCalibrator,
+    model: nn.Module,
     batch: Mapping[str, Any],
     *,
     device: torch.device,
@@ -84,7 +204,20 @@ def _batch_loss(
     features = batch["features"].to(device)
     target_threshold = batch["threshold"].to(device)
     target_reject = batch["reject"].to(device)
-    prediction, reject_logit = model(features)
+    if isinstance(model, MonotonePixelRiskCalibrator):
+        pixel_budgets = batch["pixel_budget"].to(device).reshape(-1, 1)
+        output = model(features, pixel_budgets=pixel_budgets)
+        if (
+            output.requested_thresholds is None
+            or output.requested_reject_logits is None
+        ):
+            raise RuntimeError("monotone calibrator did not return requested outputs")
+        prediction = output.requested_thresholds[:, 0]
+        reject_logit = output.requested_reject_logits[:, 0]
+    elif isinstance(model, ThresholdCalibrator):
+        prediction, reject_logit = model(features)
+    else:
+        raise TypeError(f"unsupported calibrator model: {type(model).__name__}")
     sample_weight = None if threshold_on_reject else (1.0 - target_reject)
     threshold_loss_sum = asymmetric_threshold_loss(
         prediction,
@@ -123,7 +256,7 @@ def _batch_loss(
 
 
 def train_one_epoch(
-    model: ThresholdCalibrator,
+    model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     *,
@@ -206,7 +339,7 @@ def _prediction_metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 @torch.no_grad()
 def evaluate(
-    model: ThresholdCalibrator,
+    model: nn.Module,
     loader: DataLoader,
     *,
     device: torch.device,
@@ -322,6 +455,210 @@ def _episode_input_provenance(args: argparse.Namespace) -> tuple[dict[str, Any],
     )
 
 
+def _freeze_deployment_protocol(
+    episodes: Sequence[RCEpisode],
+    *,
+    reject_cutoff: float,
+    matching_rule: str,
+    centroid_distance: float,
+) -> DeploymentProtocolContract:
+    """Derive one immutable target-time protocol from pseudo-target episodes."""
+
+    size_pairs = {
+        (len(episode.context_image_ids), len(episode.query_image_ids))
+        for episode in episodes
+    }
+    if len(size_pairs) != 1:
+        raise ValueError(
+            "claim-bearing calibration requires one pre-specified context/query "
+            f"size pair across all episodes, got {sorted(size_pairs)}"
+        )
+    context_size, query_size = next(iter(size_pairs))
+    return DeploymentProtocolContract(
+        context_size=context_size,
+        query_size=query_size,
+        reject_cutoff=reject_cutoff,
+        matching_rule=matching_rule,
+        centroid_distance=centroid_distance,
+    )
+
+
+def _validate_monotone_pixel_grid(
+    values: Sequence[float] | None,
+    episodes: Sequence[RCEpisode],
+) -> tuple[float, ...]:
+    if values is None:
+        raise ValueError(
+            "--calibrator-model monotone_pixel requires --pixel-budget-grid"
+        )
+    grid = tuple(float(value) for value in values)
+    # Constructor validation is the canonical ordering/range check.
+    probe = MonotonePixelRiskCalibrator(
+        context_feature_dim=len(episodes[0].feature_names),
+        pixel_budget_grid=grid,
+        hidden_dims=(),
+        dropout=0.0,
+    )
+    lower = float(probe.pixel_budget_grid[-1])
+    upper = float(probe.pixel_budget_grid[0])
+    unsupported = [
+        episode.episode_id
+        for episode in episodes
+        if episode.budgets.active != (True, False)
+    ]
+    if unsupported:
+        raise ValueError(
+            "monotone_pixel supports only active pixel budgets; "
+            f"unsupported episodes={unsupported}"
+        )
+    outside = [
+        episode.episode_id
+        for episode in episodes
+        if not lower <= float(episode.budgets.values[0]) <= upper
+    ]
+    if outside:
+        raise ValueError(
+            "episode pixel budgets fall outside the frozen monotone grid; "
+            f"episodes={outside}"
+        )
+    return grid
+
+
+def _monotone_budget_contract(
+    grid: Sequence[float],
+    *,
+    train_episodes: Sequence[RCEpisode],
+    validation_episodes: Sequence[RCEpisode],
+) -> dict[str, Any]:
+    """Audit supervision coverage and bind the frozen interpolation policy."""
+
+    frozen_grid = tuple(float(value) for value in grid)
+
+    def grid_index(value: float) -> int | None:
+        for index, candidate in enumerate(frozen_grid):
+            if math.isclose(value, candidate, rel_tol=1e-12, abs_tol=0.0):
+                return index
+        return None
+
+    def audit_split(name: str, episodes: Sequence[RCEpisode]) -> dict[str, Any]:
+        counts = [0] * len(frozen_grid)
+        grouped: dict[
+            tuple[str, tuple[str, ...], tuple[str, ...], str],
+            list[RCEpisode],
+        ] = {}
+        for episode in episodes:
+            value = float(episode.budgets.values[0])
+            index = grid_index(value)
+            if index is not None:
+                counts[index] += 1
+            key = (
+                episode.pseudo_target,
+                episode.context_image_ids,
+                episode.query_image_ids,
+                episode.provenance.curve_file_sha256,
+            )
+            grouped.setdefault(key, []).append(episode)
+        missing = [
+            frozen_grid[index] for index, count in enumerate(counts) if count == 0
+        ]
+        if missing:
+            raise ValueError(
+                f"{name} episodes do not supervise every frozen pixel-budget "
+                f"grid point; missing={missing}"
+            )
+        checked_multi_budget_groups = 0
+        for key, rows in grouped.items():
+            by_budget: dict[float, RCEpisode] = {}
+            for episode in rows:
+                budget = float(episode.budgets.values[0])
+                previous = by_budget.get(budget)
+                if previous is not None:
+                    observed = (
+                        episode.oracle_threshold,
+                        episode.oracle_pd,
+                        episode.reject,
+                    )
+                    expected = (
+                        previous.oracle_threshold,
+                        previous.oracle_pd,
+                        previous.reject,
+                    )
+                    if observed != expected:
+                        raise ValueError(
+                            "conflicting oracle supervision for the same "
+                            f"context/query/budget group: key={key}, budget={budget}"
+                        )
+                by_budget[budget] = episode
+            missing_group_grid = [
+                value
+                for value in frozen_grid
+                if not any(
+                    math.isclose(value, observed, rel_tol=1e-12, abs_tol=0.0)
+                    for observed in by_budget
+                )
+            ]
+            if missing_group_grid:
+                raise ValueError(
+                    "each context/query curve group must supervise the complete "
+                    f"frozen pixel-budget grid; group={key}, "
+                    f"missing={missing_group_grid}"
+                )
+            ordered = [by_budget[value] for value in sorted(by_budget, reverse=True)]
+            checked_multi_budget_groups += 1
+            thresholds = [float(row.oracle_threshold) for row in ordered]
+            rejects = [bool(row.reject) for row in ordered]
+            if any(
+                strict + 1e-12 < loose
+                for loose, strict in zip(thresholds, thresholds[1:])
+            ):
+                raise ValueError(
+                    "pixel-only oracle thresholds decrease as the budget tightens; "
+                    f"group={key}, thresholds={thresholds}"
+                )
+            if any(loose and not strict for loose, strict in zip(rejects, rejects[1:])):
+                raise ValueError(
+                    "pixel-only reject labels decrease as the budget tightens; "
+                    f"group={key}, reject={rejects}"
+                )
+        return {
+            "name": name,
+            "num_episodes": len(episodes),
+            "grid_counts": counts,
+            "all_grid_points_supervised": True,
+            "num_context_query_groups": len(grouped),
+            "num_multi_budget_groups_checked": checked_multi_budget_groups,
+            "duplicate_oracle_conflicts": 0,
+        }
+
+    canonical = json.dumps(
+        {
+            "risk": "fa_pixel",
+            "grid": list(frozen_grid),
+            "grid_order": "loose_to_strict",
+            "interpolation": "piecewise_linear_log10",
+            "extrapolation_allowed": False,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "schema_version": "rc-irstd.monotone-pixel-budget.v1",
+        "risk": "fa_pixel",
+        "component_budget_supported": False,
+        "grid": list(frozen_grid),
+        "grid_order": "loose_to_strict",
+        "grid_policy_sha256": hashlib.sha256(canonical).hexdigest(),
+        "interpolation": "piecewise_linear_log10",
+        "extrapolation_allowed": False,
+        "curve_compute_dtype": "float64",
+        "train_supervision": audit_split("train", train_episodes),
+        "validation_supervision": audit_split(
+            "validation", validation_episodes
+        ),
+    }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episodes", help="Combined JSON/JSONL episodes to split by pseudo-target")
@@ -334,6 +671,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--deployment-detector-source-domain", action="append", required=True
     )
     parser.add_argument("--deployment-source-reference", required=True)
+    parser.add_argument(
+        "--calibrator-model",
+        choices=CALIBRATOR_MODELS,
+        default=DIRECT_CALIBRATOR,
+        help=(
+            "direct is the scalar MLP baseline; monotone_pixel is "
+            "the pixel-risk inverse curve and intentionally rejects component budgets."
+        ),
+    )
+    parser.add_argument(
+        "--pixel-budget-grid",
+        nargs="+",
+        type=float,
+        help=(
+            "Loose-to-strict positive grid required by monotone_pixel, for "
+            "example: 1e-4 1e-5 1e-6. Extrapolation is prohibited."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -345,6 +700,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold-on-reject", action="store_true")
     parser.add_argument("--threshold-transform", choices=VALID_THRESHOLD_TRANSFORMS)
     parser.add_argument("--reject-probability", type=float, default=0.5)
+    parser.add_argument(
+        "--evaluation-matching-rule",
+        choices=("overlap", "centroid"),
+        default="overlap",
+    )
+    parser.add_argument(
+        "--evaluation-centroid-distance",
+        type=float,
+        default=3.0,
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -373,6 +738,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     assert_pseudo_target_isolation(train_episodes, validation_episodes)
     validate_episode_collection(train_episodes + validation_episodes)
     assert_verified_provenance(train_episodes + validation_episodes)
+    official_train_score_provenance = audit_official_train_score_provenance(
+        train_episodes,
+        validation_episodes,
+    )
+    monotone_pixel_grid: tuple[float, ...] | None = None
+    monotone_budget_contract: dict[str, Any] | None = None
+    if args.calibrator_model == MONOTONE_PIXEL_CALIBRATOR:
+        monotone_pixel_grid = _validate_monotone_pixel_grid(
+            args.pixel_budget_grid,
+            train_episodes + validation_episodes,
+        )
+        monotone_budget_contract = _monotone_budget_contract(
+            monotone_pixel_grid,
+            train_episodes=train_episodes,
+            validation_episodes=validation_episodes,
+        )
+    elif args.pixel_budget_grid is not None:
+        raise ValueError(
+            "--pixel-budget-grid is only valid with --calibrator-model monotone_pixel"
+        )
+    deployment_protocol_contract = _freeze_deployment_protocol(
+        train_episodes + validation_episodes,
+        reject_cutoff=args.reject_probability,
+        matching_rule=args.evaluation_matching_rule,
+        centroid_distance=args.evaluation_centroid_distance,
+    )
     schema_transform = train_episodes[0].threshold_transform
     if validation_episodes[0].threshold_transform != schema_transform:
         raise ValueError("train and validation threshold transforms differ")
@@ -407,9 +798,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("deployment source reference is not a main-protocol detector")
 
     # This is deliberately fit before the validation dataset is materialised.
-    standardizer = FeatureStandardizer.fit_train(train_episodes)
-    train_dataset = RCMetaDataset(train_episodes, standardizer=standardizer)
-    validation_dataset = RCMetaDataset(validation_episodes, standardizer=standardizer)
+    # The monotone model keeps budgets outside the context encoder so its
+    # ordering guarantee is architectural rather than learned from a generic
+    # budget feature.
+    if args.calibrator_model == MONOTONE_PIXEL_CALIBRATOR:
+        standardizer = FeatureStandardizer.fit_context_train(train_episodes)
+        train_dataset = RCPixelRiskMetaDataset(
+            train_episodes, standardizer=standardizer
+        )
+        validation_dataset = RCPixelRiskMetaDataset(
+            validation_episodes, standardizer=standardizer
+        )
+    else:
+        standardizer = FeatureStandardizer.fit_train(train_episodes)
+        train_dataset = RCMetaDataset(train_episodes, standardizer=standardizer)
+        validation_dataset = RCMetaDataset(
+            validation_episodes, standardizer=standardizer
+        )
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_dataset,
@@ -425,11 +830,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers=args.num_workers,
     )
     device = select_device(args.device)
-    model = ThresholdCalibrator(
-        train_dataset.input_dim,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-    ).to(device)
+    if args.calibrator_model == MONOTONE_PIXEL_CALIBRATOR:
+        assert monotone_pixel_grid is not None
+        model: nn.Module = MonotonePixelRiskCalibrator(
+            context_feature_dim=train_dataset.input_dim,
+            pixel_budget_grid=monotone_pixel_grid,
+            hidden_dims=(args.hidden_dim, args.hidden_dim),
+            dropout=args.dropout,
+        ).to(device)
+        model_config: dict[str, Any] = model.export_config()
+        capability_contract: dict[str, Any] = model.capability_contract()
+        format_version = "rc-irstd.calibrator.v4"
+        input_feature_names = list(train_episodes[0].feature_names)
+    else:
+        model = ThresholdCalibrator(
+            train_dataset.input_dim,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
+        model_config = {
+            "input_dim": train_dataset.input_dim,
+            "hidden_dim": args.hidden_dim,
+            "dropout": args.dropout,
+        }
+        capability_contract = {
+            "budget_scope": "pixel_or_component_or_dual_empirical_direct",
+            "supports_component_budget": True,
+            "supports_reject": True,
+            "training_pipeline_integrated": True,
+            "budget_monotonicity_guaranteed": False,
+            "risk_aligned_query_loss": False,
+            "training_objective": "asymmetric_oracle_threshold_plus_reject_bce",
+            "risk_guarantee": "empirical_not_certified",
+        }
+        format_version = "rc-irstd.calibrator.v3"
+        input_feature_names = list(train_episodes[0].input_feature_names)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -440,12 +875,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_epoch = -1
     checkpoint_path = output_dir / "calibrator.pt"
     common_checkpoint = {
-        "format_version": "rc-irstd.calibrator.v3",
+        "format_version": format_version,
+        "calibrator_model": args.calibrator_model,
+        "model_config": model_config,
+        "capability_contract": capability_contract,
+        "monotone_budget_contract": monotone_budget_contract,
         "input_dim": train_dataset.input_dim,
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
         "statistics_feature_names": list(train_episodes[0].feature_names),
-        "input_feature_names": list(train_episodes[0].input_feature_names),
+        "input_feature_names": input_feature_names,
         "threshold_transform": threshold_transform,
         "statistics_config": statistics_config.to_dict(),
         "p_min": train_episodes[0].p_min,
@@ -453,6 +892,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "outer_target": outer_target,
         "episode_collection_provenance": episode_collection_provenance,
         "episode_collection_sha256": episode_collection_sha256,
+        "official_train_score_provenance": official_train_score_provenance,
         "training_config": {
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -465,10 +905,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "threshold_on_reject": bool(args.threshold_on_reject),
             "threshold_transform": threshold_transform,
             "reject_probability": args.reject_probability,
+            "evaluation_matching_rule": args.evaluation_matching_rule,
+            "evaluation_centroid_distance": args.evaluation_centroid_distance,
             "num_workers": args.num_workers,
             "seed": args.seed,
             "device_requested": args.device,
             "device_resolved": str(device),
+            "calibrator_model": args.calibrator_model,
+            "pixel_budget_grid": (
+                None
+                if monotone_pixel_grid is None
+                else list(monotone_pixel_grid)
+            ),
         },
         "standardizer": standardizer.to_dict(),
         "train_pseudo_targets": sorted(train_dataset.pseudo_targets),
@@ -483,6 +931,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "deployment_held_out_domains": list(deployment_fold.held_out_domains),
         "deployment_protocol_scope": deployment_fold.protocol_scope,
         "deployment_source_reference": deployment_source_reference.to_dict(),
+        "deployment_protocol_contract": deployment_protocol_contract.to_dict(),
         "episode_detector_contracts": [
             {
                 **episode.fold.to_dict(),
@@ -546,17 +995,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "train_pseudo_targets": sorted(train_dataset.pseudo_targets),
         "validation_pseudo_targets": sorted(validation_dataset.pseudo_targets),
         "standardizer_fit": "train_only",
+        "calibrator_model": args.calibrator_model,
+        "calibrator_format_version": format_version,
+        "capability_contract": capability_contract,
+        "monotone_budget_contract": monotone_budget_contract,
         "threshold_transform": threshold_transform,
         "statistics_config": statistics_config.to_dict(),
         "p_min": train_episodes[0].p_min,
         "outer_fold_id": outer_fold_id,
         "outer_target": outer_target,
         "episode_collection_sha256": episode_collection_sha256,
+        "official_train_score_provenance": official_train_score_provenance,
         "deployment_detector_checkpoint_sha": deployment_fold.detector_checkpoint_sha,
         "deployment_detector_source_domains": list(deployment_fold.detector_source_domains),
         "deployment_held_out_domains": list(deployment_fold.held_out_domains),
         "deployment_protocol_scope": deployment_fold.protocol_scope,
         "deployment_source_reference_sha256": deployment_source_reference.sha256,
+        "deployment_protocol_contract": deployment_protocol_contract.to_dict(),
         "budget_metrics_status": "not_computed_requires_query_curve_replay",
         "checkpoint": checkpoint_path.name,
     }

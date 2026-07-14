@@ -93,7 +93,7 @@ review_basis: "2026-07-14 local code audit + official AAAI-27 timetable"
 
 | 层级 | 当前状态 | 可用范围 |
 |---|---|---|
-| 评估与协议基础 | 已有原分辨率 score-map、双虚警指标、support/query 拆分、固定最后 checkpoint 和无标签统计的代码 | 可做可重复性 smoke test 与基线实验 |
+| 评估与协议基础 | 已有原分辨率、严格无标签 score export，独立 hash-bound label attachment，双虚警指标、support/query 拆分、固定最后 checkpoint 和无标签统计的代码 | 可做可重复性 smoke test 与基线实验；仍不等于已得到科学结果 |
 | RC 直接阈值校准器 | 作为最小基线保留；必须通过跨域溯源、query replay 和独立外层目标审计后才能进入主表 | 不得写成单调逆风险曲线 |
 | AAAI 升级版 | 单调逆风险曲线、风险对齐损失、尾部间隔学习和可识别性分析尚待独立实现与实证 | 只能作为 RC-v2/候选主方法，不得标记为已完成 |
 
@@ -1234,13 +1234,14 @@ B
 |---|---|---|
 | 10.1 collate | 已修正；metadata 为默认 DataLoader 可拼接字典 | 已有 batch smoke test |
 | 10.2 空预测/高尾网格 | 已加 `0/1`、adaptive/exact query events 及 cap 审计 | 主实验需报告覆盖下界，capped 不得写 global exact |
-| 10.3 原图预算 | 已在阈值与 matching 前恢复原始 canvas | 需在方法/补充材料报告 interpolation 和 mask 对齐记录 |
+| 10.3 原图预算 | 已在阈值与 matching 前恢复原始 canvas；score 不再嵌入 mask，离线 label attachment 独立记录 nearest-neighbor 对齐和原 mask 尺寸 | 需在方法/补充材料报告 interpolation 与对齐统计 |
 | 10.4 plateau | detector 与 RC 统计统一为 `kernel_local_row_major_rank_nms` | 需消融证明该候选定义合理 |
-| 10.5 support/query 泄漏 | schema-v3 强制同一 manifest 的连续 context-first/query-second 窗口、curve/manifest SHA 和 outer/pseudo/source 隔离；手写或不连续 IDs 不能训练主结果 | 需生成真实 nested-LODO artifacts |
+| 10.5 support/query 泄漏 | schema-v3 强制同一无标签 score manifest 的连续 context-first/query-second 窗口；query label 来自独立 attachment。Builder 重建 threshold plan、全量重扫 curve 并逐列核对，手写/篡改产物不能训练主结果 | 需生成真实 nested-LODO artifacts |
 | 10.6 sigmoid/direct head | 仍保留为 RC 最小基线 | 单调逆风险曲线尚未实现 |
 | 10.7 source distance | 已用 permutation-invariant aggregate，并将 fold-specific domains/centers/scale/hash 嵌入 checkpoint | 需证明不只是 dataset fingerprint |
 | 10.8 component/candidate | pixel 与 8-connected component metrics 已分开 | 严格单调 candidate-risk 路径尚未实现 |
-| 在线后 query 评估 | 已新增 hash-bound replay，reject 时不读取/输出标签指标 | 需完整外层结果与置信区间 |
+| 数据域污染 | detector source record 已绑定 split 顺序、逐图像内容 SHA 和所选 image+mask 训练产物；target export 对所有 source image leaves 求交，改名/复制/子集碰撞均 fail closed | 需对真实数据集生成并归档 collision audit |
+| 在线后 query 评估 | 已新增 calibrator/score/label hash-bound replay；reject 时不解析、不打开 label manifest，也不输出标签指标 | 需完整外层结果与置信区间 |
 
 ## 10.1 `SampleMeta` dataclass 与 DataLoader collate
 

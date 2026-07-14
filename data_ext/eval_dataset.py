@@ -16,6 +16,7 @@ from .dataset_meta import (
     build_spatial_transform,
     normalise_hw,
 )
+from .mask_alignment import align_mask_to_image
 from .split_utils import (
     read_split_entries,
     resolve_image_and_mask,
@@ -89,11 +90,9 @@ class IRSTDEvalDataset(Dataset):
 
         mask_original_hw = (mask.height, mask.width)
         # One published NUAA-SIRST sample (Misc_111 in common mirrors) has a
-        # mask stored at a different canvas size.  Align GT to the image canvas
-        # explicitly with nearest-neighbour interpolation before any input
-        # transform; metadata preserves the source size for auditability.
-        if image.size != mask.size:
-            mask = mask.resize(image.size, resample=_NEAREST)
+        # mask stored at a different resolution.  Only a same-aspect-ratio
+        # mismatch is aligned; a likely wrong pair fails closed.
+        mask = align_mask_to_image(mask, image, image_id)
         original_hw = (image.height, image.width)
         transform = build_spatial_transform(
             original_hw,
@@ -134,13 +133,12 @@ class IRSTDEvalDataset(Dataset):
     def load_original_mask(self, index: int) -> torch.Tensor:
         """Load an exact, binary native-resolution mask for score export."""
 
-        _, image_path, mask_path = self.samples[index]
+        image_id, image_path, mask_path = self.samples[index]
         with Image.open(image_path) as image_file:
             image_size = image_file.size
         with Image.open(mask_path) as mask_file:
             mask = mask_file.convert("L")
-        if mask.size != image_size:
-            mask = mask.resize(image_size, resample=_NEAREST)
+        mask = align_mask_to_image(mask, image_size, image_id)
         return (TVF.pil_to_tensor(mask) > 0).to(torch.uint8)
 
 

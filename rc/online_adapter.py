@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from data_ext.dataset_identity import sha256_file
 from data_ext.score_manifest_artifacts import verify_score_manifest_artifacts
+from model.monotone_pixel_calibrator import (
+    MonotonePixelRiskCalibrator,
+    pixel_budget_from_spec,
+)
 from model.threshold_calibrator import ThresholdCalibrator
 
 from .domain_statistics import (
@@ -21,8 +28,21 @@ from .domain_statistics import (
     load_source_reference,
 )
 from .meta_dataset import FeatureStandardizer
-from .schema import BudgetSpec, FoldContract, SCHEMA_VERSION
-from .schema import SourceReference, StatisticsConfig
+from .schema import (
+    BudgetSpec,
+    CAUSAL_PARTITION_RULE,
+    DEFAULT_CENTROID_DISTANCE,
+    DEFAULT_MATCHING_RULE,
+    DeploymentProtocolContract,
+    EVALUATION_MATCHING_CONTRACT_VERSION,
+    FoldContract,
+    ONLINE_DECISION_CONTRACT_VERSION,
+    REJECT_COMPARISON_RULE,
+    REJECT_SCORE_RULE,
+    SCHEMA_VERSION,
+    SourceReference,
+    StatisticsConfig,
+)
 
 
 def causal_partition(
@@ -58,6 +78,7 @@ def load_ordered_score_records(
     manifest_or_directory: str | Path,
     *,
     image_dir: str | Path | None = None,
+    required_split_role: str | None = None,
 ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
     source = Path(manifest_or_directory).expanduser().resolve()
     if image_dir is not None:
@@ -82,6 +103,7 @@ def load_ordered_score_records(
         require_mask=False,
         require_native_contract=True,
         verify_artifact_bytes=False,
+        required_split_role=required_split_role,
     )
     records = []
     for item in verified.items:
@@ -164,11 +186,155 @@ def _deployment_contract(
     return fold, reference
 
 
+def _checkpoint_reject_cutoff(checkpoint: Mapping[str, Any]) -> float:
+    """Resolve one cutoff and reject conflicting duplicated metadata."""
+
+    values: list[tuple[str, float]] = []
+    if "reject_probability" in checkpoint:
+        values.append(
+            ("reject_probability", float(checkpoint["reject_probability"]))
+        )
+    training_config = checkpoint.get("training_config")
+    if isinstance(training_config, Mapping) and "reject_probability" in training_config:
+        values.append(
+            (
+                "training_config.reject_probability",
+                float(training_config["reject_probability"]),
+            )
+        )
+    if not values:
+        raise KeyError("calibrator checkpoint is missing the frozen reject cutoff")
+    for name, value in values:
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"checkpoint {name} must lie in [0, 1]")
+    cutoff = values[0][1]
+    if any(
+        not math.isclose(value, cutoff, rel_tol=0.0, abs_tol=1e-12)
+        for _, value in values[1:]
+    ):
+        raise ValueError("calibrator checkpoint contains conflicting reject cutoffs")
+    return cutoff
+
+
+def _deployment_protocol_contract(
+    checkpoint: Mapping[str, Any],
+    *,
+    required: bool,
+) -> DeploymentProtocolContract | None:
+    payload = checkpoint.get("deployment_protocol_contract")
+    if payload is None:
+        if required:
+            raise ValueError(
+                "claim-bearing online adaptation requires a frozen "
+                "deployment_protocol_contract; this legacy checkpoint is diagnostic-only"
+            )
+        return None
+    if not isinstance(payload, Mapping):
+        raise TypeError("checkpoint deployment_protocol_contract must be a mapping")
+    contract = DeploymentProtocolContract.from_dict(payload)
+    checkpoint_cutoff = _checkpoint_reject_cutoff(checkpoint)
+    if not math.isclose(
+        contract.reject_cutoff,
+        checkpoint_cutoff,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "deployment protocol reject cutoff conflicts with calibrator checkpoint"
+        )
+    training_config = checkpoint.get("training_config")
+    if not isinstance(training_config, Mapping):
+        raise TypeError("checkpoint training_config must be a mapping")
+    if "evaluation_matching_rule" in training_config and str(
+        training_config["evaluation_matching_rule"]
+    ) != contract.matching_rule:
+        raise ValueError(
+            "deployment protocol matching rule conflicts with training_config"
+        )
+    if "evaluation_centroid_distance" in training_config and not math.isclose(
+        float(training_config["evaluation_centroid_distance"]),
+        contract.centroid_distance,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "deployment protocol centroid distance conflicts with training_config"
+        )
+    return contract
+
+
+def _validated_monotone_budget_contract(
+    checkpoint: Mapping[str, Any],
+    model: MonotonePixelRiskCalibrator,
+) -> dict[str, Any]:
+    value = checkpoint.get("monotone_budget_contract")
+    if not isinstance(value, Mapping):
+        raise TypeError("schema-v4 checkpoint requires monotone_budget_contract")
+    contract = dict(value)
+    required = {
+        "schema_version",
+        "risk",
+        "component_budget_supported",
+        "grid",
+        "grid_order",
+        "grid_policy_sha256",
+        "interpolation",
+        "extrapolation_allowed",
+        "curve_compute_dtype",
+        "train_supervision",
+        "validation_supervision",
+    }
+    missing = required.difference(contract)
+    if missing:
+        raise KeyError(
+            f"monotone budget contract is missing: {sorted(missing)}"
+        )
+    if contract["schema_version"] != "rc-irstd.monotone-pixel-budget.v1":
+        raise ValueError("unsupported monotone budget contract schema")
+    if contract["risk"] != "fa_pixel" or contract["component_budget_supported"] is not False:
+        raise ValueError("schema-v4 monotone contract must be pixel-only")
+    grid = tuple(float(value) for value in contract["grid"])
+    model_grid = tuple(float(value) for value in model.pixel_budget_grid.cpu())
+    if grid != model_grid:
+        raise ValueError("monotone budget contract grid differs from model_config")
+    if (
+        contract["grid_order"] != "loose_to_strict"
+        or contract["interpolation"] != "piecewise_linear_log10"
+        or contract["extrapolation_allowed"] is not False
+        or contract["curve_compute_dtype"] != "float64"
+    ):
+        raise ValueError("unsupported monotone budget interpolation contract")
+    canonical = json.dumps(
+        {
+            "risk": "fa_pixel",
+            "grid": list(grid),
+            "grid_order": "loose_to_strict",
+            "interpolation": "piecewise_linear_log10",
+            "extrapolation_allowed": False,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    expected_sha = hashlib.sha256(canonical).hexdigest()
+    if contract["grid_policy_sha256"] != expected_sha:
+        raise ValueError("monotone budget grid policy SHA-256 is invalid")
+    for split in ("train_supervision", "validation_supervision"):
+        supervision = contract[split]
+        if not isinstance(supervision, Mapping) or supervision.get(
+            "all_grid_points_supervised"
+        ) is not True:
+            raise ValueError(
+                f"monotone budget contract lacks complete {split} grid coverage"
+            )
+    return contract
+
+
 def load_calibrator_bundle(
     checkpoint_path: str | Path,
     *,
     device: torch.device,
-) -> tuple[ThresholdCalibrator, FeatureStandardizer, Mapping[str, Any]]:
+) -> tuple[nn.Module, FeatureStandardizer, Mapping[str, Any]]:
     checkpoint = _torch_load(checkpoint_path, device)
     required = {
         "format_version",
@@ -196,7 +362,11 @@ def load_calibrator_bundle(
     missing = required.difference(checkpoint)
     if missing:
         raise KeyError(f"calibrator checkpoint is missing: {sorted(missing)}")
-    if checkpoint["format_version"] != "rc-irstd.calibrator.v3":
+    format_version = str(checkpoint["format_version"])
+    if format_version not in {
+        "rc-irstd.calibrator.v3",
+        "rc-irstd.calibrator.v4",
+    }:
         raise ValueError("unsupported calibrator checkpoint format_version")
     collection_sha = str(checkpoint["episode_collection_sha256"])
     if len(collection_sha) != 64 or any(
@@ -207,24 +377,56 @@ def load_calibrator_bundle(
         raise TypeError("checkpoint episode_collection_provenance must be a mapping")
     if not isinstance(checkpoint["training_config"], Mapping):
         raise TypeError("checkpoint training_config must be a mapping")
-    model = ThresholdCalibrator(
-        int(checkpoint["input_dim"]),
-        hidden_dim=int(checkpoint["hidden_dim"]),
-        dropout=float(checkpoint["dropout"]),
+    calibrator_model = str(
+        checkpoint.get(
+            "calibrator_model",
+            "direct" if format_version == "rc-irstd.calibrator.v3" else "",
+        )
     )
+    if format_version == "rc-irstd.calibrator.v3":
+        if calibrator_model != "direct":
+            raise ValueError("schema-v3 calibrator checkpoint must use direct model")
+        model: nn.Module = ThresholdCalibrator(
+            int(checkpoint["input_dim"]),
+            hidden_dim=int(checkpoint["hidden_dim"]),
+            dropout=float(checkpoint["dropout"]),
+        )
+    else:
+        if calibrator_model != "monotone_pixel":
+            raise ValueError(
+                "schema-v4 calibrator checkpoint must use monotone_pixel model"
+            )
+        raw_model_config = checkpoint.get("model_config")
+        if not isinstance(raw_model_config, Mapping):
+            raise TypeError("schema-v4 checkpoint model_config must be a mapping")
+        model_config = dict(raw_model_config)
+        model = MonotonePixelRiskCalibrator(**model_config)
+        if model.context_feature_dim != int(checkpoint["input_dim"]):
+            raise ValueError("schema-v4 model_config input dimension disagrees")
+        capability = checkpoint.get("capability_contract")
+        if not isinstance(capability, Mapping):
+            raise TypeError(
+                "schema-v4 checkpoint capability_contract must be a mapping"
+            )
+        expected_capability = model.capability_contract()
+        if dict(capability) != expected_capability:
+            raise ValueError("schema-v4 calibrator capability contract disagrees")
+        _validated_monotone_budget_contract(checkpoint, model)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()
     standardizer = FeatureStandardizer.from_dict(checkpoint["standardizer"])
     if tuple(checkpoint["input_feature_names"]) != standardizer.feature_names:
         raise ValueError("checkpoint input feature names disagree with standardizer")
     _deployment_contract(checkpoint)
+    _checkpoint_reject_cutoff(checkpoint)
+    _deployment_protocol_contract(checkpoint, required=False)
     return model, standardizer, checkpoint
 
 
 @torch.no_grad()
 def adapt_context_to_query(
     *,
-    model: ThresholdCalibrator,
+    model: nn.Module,
     standardizer: FeatureStandardizer,
     checkpoint_metadata: Mapping[str, Any],
     context_records: Sequence[Mapping[str, Any]],
@@ -236,12 +438,17 @@ def adapt_context_to_query(
     device: torch.device,
     target_domain: str,
     reject_probability: float | None = None,
+    matching_rule: str | None = None,
+    centroid_distance: float | None = None,
     temporal_order_asserted: bool = False,
+    claim_bearing: bool = True,
 ) -> dict[str, Any]:
     """Estimate one threshold using context only, then bind it to later query IDs."""
 
     context_ids = tuple(str(record["image_id"]) for record in context_records)
     query_ids = tuple(str(record["image_id"]) for record in query_records)
+    if not context_ids or not query_ids:
+        raise ValueError("online context and query must both be non-empty")
     overlap = set(context_ids).intersection(query_ids)
     if overlap:
         raise ValueError(f"context/query image IDs overlap: {sorted(overlap)}")
@@ -249,6 +456,105 @@ def adapt_context_to_query(
     if target_domain != outer_target:
         raise ValueError("online target_domain must equal checkpoint outer_target")
     deployment_fold, embedded_reference = _deployment_contract(checkpoint_metadata)
+    if not isinstance(claim_bearing, bool):
+        raise TypeError("claim_bearing must be boolean")
+    checkpoint_cutoff = _checkpoint_reject_cutoff(checkpoint_metadata)
+    frozen_protocol = _deployment_protocol_contract(
+        checkpoint_metadata,
+        required=claim_bearing,
+    )
+    override_requested = reject_probability is not None
+    requested_cutoff = (
+        checkpoint_cutoff
+        if reject_probability is None
+        else float(reject_probability)
+    )
+    if not math.isfinite(requested_cutoff) or not 0.0 <= requested_cutoff <= 1.0:
+        raise ValueError("reject_probability must lie in [0, 1]")
+    if claim_bearing:
+        assert frozen_protocol is not None
+        frozen_protocol.assert_runtime_sizes(
+            context_size=len(context_ids),
+            query_size=len(query_ids),
+        )
+        if not math.isclose(
+            requested_cutoff,
+            frozen_protocol.reject_cutoff,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "claim-bearing final-target adaptation cannot override the "
+                "checkpoint reject cutoff"
+            )
+        cutoff = frozen_protocol.reject_cutoff
+        cutoff_source = "checkpoint.deployment_protocol_contract.reject_cutoff"
+    else:
+        cutoff = requested_cutoff
+        cutoff_source = (
+            "diagnostic_runtime_override"
+            if override_requested
+            else (
+                "checkpoint.reject_probability"
+                if "reject_probability" in checkpoint_metadata
+                else "checkpoint.training_config.reject_probability"
+            )
+        )
+    matching_override_requested = (
+        matching_rule is not None or centroid_distance is not None
+    )
+    default_matching_rule = (
+        frozen_protocol.matching_rule
+        if frozen_protocol is not None
+        else DEFAULT_MATCHING_RULE
+    )
+    default_centroid_distance = (
+        frozen_protocol.centroid_distance
+        if frozen_protocol is not None
+        else DEFAULT_CENTROID_DISTANCE
+    )
+    requested_matching_rule = (
+        default_matching_rule if matching_rule is None else str(matching_rule)
+    )
+    requested_centroid_distance = (
+        default_centroid_distance
+        if centroid_distance is None
+        else float(centroid_distance)
+    )
+    if requested_matching_rule not in {"overlap", "centroid"}:
+        raise ValueError("matching_rule must be 'overlap' or 'centroid'")
+    if (
+        not math.isfinite(requested_centroid_distance)
+        or requested_centroid_distance <= 0.0
+    ):
+        raise ValueError("centroid_distance must be finite and positive")
+    if claim_bearing:
+        assert frozen_protocol is not None
+        if requested_matching_rule != frozen_protocol.matching_rule or not math.isclose(
+            requested_centroid_distance,
+            frozen_protocol.centroid_distance,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "claim-bearing final-target adaptation cannot override the "
+                "checkpoint evaluation matching contract"
+            )
+        effective_matching_rule = frozen_protocol.matching_rule
+        effective_centroid_distance = frozen_protocol.centroid_distance
+        matching_source = "checkpoint.deployment_protocol_contract.evaluation_matching"
+    else:
+        effective_matching_rule = requested_matching_rule
+        effective_centroid_distance = requested_centroid_distance
+        matching_source = (
+            "diagnostic_runtime_override"
+            if matching_override_requested
+            else (
+                "checkpoint.deployment_protocol_contract.evaluation_matching"
+                if frozen_protocol is not None
+                else "diagnostic_legacy_default"
+            )
+        )
     calibration_targets = tuple(
         str(value) for value in checkpoint_metadata["calibration_pseudo_targets"]
     )
@@ -330,21 +636,89 @@ def adapt_context_to_query(
     expected_statistics_names = tuple(checkpoint_metadata["statistics_feature_names"])
     if statistics.feature_names != expected_statistics_names:
         raise ValueError("online statistics schema differs from calibrator checkpoint")
-    raw_features = np.asarray(
-        tuple(float(value) for value in statistics.vector) + budgets.encoded(),
-        dtype=np.float64,
-    )[None, :]
+    if isinstance(model, MonotonePixelRiskCalibrator):
+        pixel_budget = pixel_budget_from_spec(budgets)
+        raw_feature_values = tuple(float(value) for value in statistics.vector)
+    elif isinstance(model, ThresholdCalibrator):
+        pixel_budget = None
+        raw_feature_values = (
+            tuple(float(value) for value in statistics.vector) + budgets.encoded()
+        )
+    else:
+        raise TypeError(f"unsupported calibrator model: {type(model).__name__}")
+    raw_features = np.asarray(raw_feature_values, dtype=np.float64)[None, :]
     normalised = standardizer.transform(raw_features).astype(np.float32)
     features = torch.from_numpy(normalised).to(device)
-    threshold, reject_logit = model(features)
-    probability = float(torch.sigmoid(reject_logit)[0].cpu())
-    cutoff = (
-        float(checkpoint_metadata.get("reject_probability", 0.5))
-        if reject_probability is None
-        else float(reject_probability)
-    )
-    if not 0.0 <= cutoff <= 1.0:
-        raise ValueError("reject_probability must lie in [0, 1]")
+    if isinstance(model, MonotonePixelRiskCalibrator):
+        assert pixel_budget is not None
+        budget_model_contract: dict[str, Any] | None = (
+            _validated_monotone_budget_contract(checkpoint_metadata, model)
+        )
+        output = model(
+            features,
+            pixel_budgets=torch.tensor(
+                [[pixel_budget]], dtype=torch.float64, device=device
+            ),
+        )
+        if (
+            output.requested_thresholds is None
+            or output.requested_reject_probabilities is None
+        ):
+            raise RuntimeError("monotone calibrator did not return requested outputs")
+        threshold_value = float(output.requested_thresholds[0, 0].cpu())
+        probability = float(output.requested_reject_probabilities[0, 0].cpu())
+    else:
+        budget_model_contract = None
+        threshold, reject_logit = model(features)
+        threshold_value = float(threshold[0].cpu())
+        probability = float(torch.sigmoid(reject_logit)[0].cpu())
+    evaluation_contract = {
+        "schema_version": EVALUATION_MATCHING_CONTRACT_VERSION,
+        "matching_rule": effective_matching_rule,
+        "centroid_distance": effective_centroid_distance,
+        "source": matching_source,
+        "target_override_allowed": False if claim_bearing else True,
+        "runtime_override_requested": matching_override_requested,
+    }
+    decision_contract = {
+        "schema_version": ONLINE_DECISION_CONTRACT_VERSION,
+        "claim_bearing": claim_bearing,
+        "claim_eligibility": (
+            "claim_eligible_frozen_checkpoint_protocol"
+            if claim_bearing
+            else "diagnostic_only"
+        ),
+        "context_size": len(context_ids),
+        "query_size": len(query_ids),
+        "partition_rule": (
+            frozen_protocol.partition_rule
+            if frozen_protocol is not None
+            else CAUSAL_PARTITION_RULE
+        ),
+        "size_contract_source": (
+            "checkpoint.deployment_protocol_contract"
+            if claim_bearing
+            else "diagnostic_runtime"
+        ),
+        "reject_rule": {
+            "score": (
+                frozen_protocol.reject_score
+                if frozen_protocol is not None
+                else REJECT_SCORE_RULE
+            ),
+            "comparison": (
+                frozen_protocol.reject_comparison
+                if frozen_protocol is not None
+                else REJECT_COMPARISON_RULE
+            ),
+            "cutoff": cutoff,
+            "cutoff_source": cutoff_source,
+            "target_override_allowed": False if claim_bearing else True,
+            "runtime_override_requested": override_requested,
+        },
+        "evaluation_matching": evaluation_contract,
+        "budget_model": budget_model_contract,
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "asserted_temporal_prefix" if temporal_order_asserted else "prefix_holdout",
@@ -368,9 +742,24 @@ def adapt_context_to_query(
         "score_manifest_detector_checkpoint_sha": manifest_checkpoint_sha,
         "calibration_pseudo_targets": list(calibration_targets),
         "calibrator_format_version": str(checkpoint_metadata["format_version"]),
+        "calibrator_model": str(
+            checkpoint_metadata.get("calibrator_model", "direct")
+        ),
+        "calibrator_capability_contract": dict(
+            checkpoint_metadata.get("capability_contract", {})
+        ),
+        "calibrator_budget_contract": budget_model_contract,
         "episode_collection_sha256": str(
             checkpoint_metadata["episode_collection_sha256"]
         ),
+        "claim_bearing": claim_bearing,
+        "deployment_protocol_contract": (
+            None if frozen_protocol is None else frozen_protocol.to_dict()
+        ),
+        "decision_contract": decision_contract,
+        "evaluation_contract": evaluation_contract,
+        "context_size": len(context_ids),
+        "query_size": len(query_ids),
         "context_image_ids": list(context_ids),
         "query_image_ids": list(query_ids),
         "causal_boundary": {
@@ -385,7 +774,7 @@ def adapt_context_to_query(
         "p_min": float(checkpoint_metadata["p_min"]),
         "statistics_config": statistics_config.to_dict(),
         "source_reference": source_reference.to_dict(),
-        "threshold": float(threshold[0].cpu()),
+        "threshold": threshold_value,
         "reject_probability": probability,
         "reject_cutoff": cutoff,
         "reject": probability >= cutoff,
@@ -414,7 +803,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pixel-budget", type=float)
     parser.add_argument("--component-budget", type=float)
     parser.add_argument("--source-reference")
-    parser.add_argument("--reject-probability", type=float)
+    parser.add_argument(
+        "--reject-probability",
+        type=float,
+        help=(
+            "Diagnostic cutoff override. In claim-bearing mode, an explicitly "
+            "supplied value must equal the checkpoint-frozen cutoff."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-unfrozen-protocol",
+        action="store_true",
+        help=(
+            "Permit legacy checkpoints, alternate context/query sizes, or a cutoff "
+            "override; output is explicitly marked diagnostic-only."
+        ),
+    )
+    parser.add_argument(
+        "--matching-rule",
+        choices=("overlap", "centroid"),
+        help=(
+            "Evaluation matching rule to bind without reading labels. Formal mode "
+            "requires equality with the calibrator checkpoint contract."
+        ),
+    )
+    parser.add_argument(
+        "--centroid-distance",
+        type=float,
+        help=(
+            "Centroid matching radius to bind without reading labels. Formal mode "
+            "requires equality with the calibrator checkpoint contract."
+        ),
+    )
     parser.add_argument(
         "--assert-temporal-order",
         "--temporal-order-verified",
@@ -443,7 +863,12 @@ def _select_device(value: str) -> torch.device:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     budgets = BudgetSpec.from_optional(args.pixel_budget, args.component_budget)
-    records, manifest = load_ordered_score_records(args.manifest)
+    claim_bearing = not args.diagnostic_unfrozen_protocol
+    required_split_role = "official_test" if claim_bearing else None
+    records, manifest = load_ordered_score_records(
+        args.manifest,
+        required_split_role=required_split_role,
+    )
     context, query = causal_partition(
         records, context_size=args.context_size, query_size=args.query_size
     )
@@ -457,6 +882,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         image_ids=context_ids,
         require_mask=False,
         require_native_contract=True,
+        required_split_role=required_split_role,
     )
     if (
         verified_context.manifest_sha256 != manifest_sha256
@@ -501,7 +927,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=device,
         target_domain=args.target_domain,
         reject_probability=args.reject_probability,
+        matching_rule=args.matching_rule,
+        centroid_distance=args.centroid_distance,
         temporal_order_asserted=args.temporal_order_asserted,
+        claim_bearing=claim_bearing,
     )
     result["score_manifest"] = Path(args.manifest).name
     result["calibrator_checkpoint"] = calibrator_checkpoint_path.name

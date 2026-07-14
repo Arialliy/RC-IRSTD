@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -15,7 +16,10 @@ import torch
 from PIL import Image
 
 from data_ext.dataset_identity import (
+    ORDERED_SAMPLE_IDS_ALGORITHM,
     SCORE_MANIFEST_CONTENT_ALGORITHM,
+    SPLIT_IMAGE_ARTIFACT_ALGORITHM,
+    build_dataset_record,
     score_manifest_content_sha256,
     sha256_file,
 )
@@ -36,7 +40,11 @@ from evaluation.threshold_sweep import (
 )
 from model.threshold_calibrator import ThresholdCalibrator, asymmetric_threshold_loss
 from rc.build_meta_episodes import main as build_episodes_main
-from rc.build_meta_episodes import _causal_window_status, _verify_oracle_event_coverage
+from rc.build_meta_episodes import (
+    _causal_window_status,
+    _verify_oracle_event_coverage,
+    _verify_score_manifest,
+)
 from rc.build_source_reference import main as build_source_reference_main
 from rc.domain_statistics import (
     BASE_FEATURE_DIM,
@@ -55,13 +63,18 @@ from rc.online_adapter import main as online_main
 from rc.oracle_threshold import select_oracle_operating_point
 from rc.schema import (
     BudgetSpec,
+    DeploymentProtocolContract,
     EpisodeProvenance,
     FoldContract,
+    LEGACY_EPISODE_SCHEMA_VERSION,
     RCEpisode,
     SourceReference,
     StatisticsConfig,
 )
-from rc.train_calibrator import main as train_calibrator_main
+from rc.train_calibrator import (
+    audit_official_train_score_provenance,
+    main as train_calibrator_main,
+)
 
 
 SHA_A = "a" * 64
@@ -116,7 +129,46 @@ def _write_source_reference(
     return load_source_reference(path, statistics_config=config)
 
 
-def _provenance(target: str, status: str = "verified") -> EpisodeProvenance:
+def _episode_split_contract(role: str = "official_train") -> dict[str, object]:
+    selected_prefix = "official_train" if role == "official_train" else "official_test"
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "role": role,
+        "selected_split_file": "",
+        "selected_split_sha256": "",
+        "selected_num_images": 0,
+        "selected_ids_sha256": "",
+        "official_train_split_file": "train.txt",
+        "official_train_split_sha256": SHA_A,
+        "official_train_num_images": 2,
+        "official_train_ids_sha256": SHA_B,
+        "official_train_split_image_artifact_sha256": SHA_C,
+        "official_test_split_file": "test.txt",
+        "official_test_split_sha256": SHA_D,
+        "official_test_num_images": 1,
+        "official_test_ids_sha256": SHA_C,
+        "official_test_split_image_artifact_sha256": SHA_B,
+        "ordered_sample_ids_algorithm": "test-ordered-ids-v1",
+        "split_image_artifact_algorithm": "test-image-artifacts-v1",
+        "train_test_id_overlap_count": 0,
+        "train_test_id_overlap_ids": [],
+        "train_test_image_content_overlap_count": 0,
+        "train_test_image_content_overlap_sha256_leaves": [],
+        "disjointness_verified": True,
+    }
+    values["selected_split_file"] = values[f"{selected_prefix}_split_file"]
+    values["selected_split_sha256"] = values[f"{selected_prefix}_split_sha256"]
+    values["selected_num_images"] = values[f"{selected_prefix}_num_images"]
+    values["selected_ids_sha256"] = values[f"{selected_prefix}_ids_sha256"]
+    return values
+
+
+def _provenance(
+    target: str,
+    status: str = "verified",
+    *,
+    split_role: str = "official_train",
+) -> EpisodeProvenance:
     return EpisodeProvenance(
         status=status,
         curve_file_sha256=SHA_A,
@@ -126,6 +178,7 @@ def _provenance(target: str, status: str = "verified") -> EpisodeProvenance:
         query_score_target_dataset=target,
         label_manifest_sha256=SHA_D if status == "verified" else "",
         label_manifest_content_sha256=SHA_A if status == "verified" else "",
+        split_contract=_episode_split_contract(split_role),
     )
 
 
@@ -180,7 +233,10 @@ def _write_score_manifest(
     image_ids: tuple[str, ...],
     *,
     held_out_domains: tuple[str, ...] = ("A", "B", "OUT"),
+    split_role: str = "official_train",
 ) -> Path:
+    if split_role not in {"official_train", "official_test"}:
+        raise ValueError("test helper split_role must be official_train or official_test")
     directory.mkdir(parents=True, exist_ok=True)
     image_directory = directory / "images"
     image_directory.mkdir(exist_ok=True)
@@ -206,11 +262,94 @@ def _write_score_manifest(
                 "original_hw": [8, 8],
             }
         )
+    other_id = f"{target}-other-split-only"
+    other_image_path = image_directory / f"{other_id}.png"
+    Image.fromarray(np.full((8, 8), 255, dtype=np.uint8), mode="L").save(
+        other_image_path
+    )
+    split_directory = directory / "img_idx"
+    split_directory.mkdir(exist_ok=True)
+    selected_split = "train" if split_role == "official_train" else "test"
+    selected_ids = list(image_ids)
+    role_ids = {
+        "official_train": (
+            selected_ids if selected_split == "train" else [other_id]
+        ),
+        "official_test": (
+            selected_ids if selected_split == "test" else [other_id]
+        ),
+    }
+    split_paths: dict[str, Path] = {}
+    split_records: dict[str, dict[str, object]] = {}
+    for role, split_name in (
+        ("official_train", "train"),
+        ("official_test", "test"),
+    ):
+        split_path = split_directory / f"{split_name}_{target}.txt"
+        split_path.write_text(
+            "".join(f"{image_id}.png\n" for image_id in role_ids[role]),
+            encoding="utf-8",
+        )
+        split_paths[role] = split_path
+        split_records[role] = build_dataset_record(
+            directory,
+            split_path,
+            role_ids[role],
+        )
+    train_items = split_records["official_train"]["split_image_artifact_items"]
+    test_items = split_records["official_test"]["split_image_artifact_items"]
+    assert isinstance(train_items, list) and isinstance(test_items, list)
+    train_ids = {str(item["sample_id"]) for item in train_items}
+    test_ids = {str(item["sample_id"]) for item in test_items}
+    train_hashes = {str(item["image_sha256"]) for item in train_items}
+    test_hashes = {str(item["image_sha256"]) for item in test_items}
+    selected_record = split_records[split_role]
+    split_contract: dict[str, object] = {
+        "schema_version": 1,
+        "role": split_role,
+        "selected_split_file": os.path.relpath(
+            split_paths[split_role], start=directory
+        ),
+        "selected_split_sha256": selected_record["split_sha256"],
+        "selected_num_images": selected_record["num_samples"],
+        "selected_ids_sha256": selected_record["ordered_sample_ids_sha256"],
+        "ordered_sample_ids_algorithm": ORDERED_SAMPLE_IDS_ALGORITHM,
+        "split_image_artifact_algorithm": SPLIT_IMAGE_ARTIFACT_ALGORITHM,
+        "train_test_id_overlap_count": len(train_ids & test_ids),
+        "train_test_id_overlap_ids": sorted(train_ids & test_ids),
+        "train_test_image_content_overlap_count": len(train_hashes & test_hashes),
+        "train_test_image_content_overlap_sha256_leaves": sorted(
+            train_hashes & test_hashes
+        ),
+        "disjointness_verified": True,
+    }
+    for role in ("official_train", "official_test"):
+        record = split_records[role]
+        split_contract.update(
+            {
+                f"{role}_split_file": os.path.relpath(
+                    split_paths[role], start=directory
+                ),
+                f"{role}_split_sha256": record["split_sha256"],
+                f"{role}_num_images": record["num_samples"],
+                f"{role}_ids_sha256": record["ordered_sample_ids_sha256"],
+                f"{role}_split_image_artifact_sha256": record[
+                    "split_image_artifact_sha256"
+                ],
+                f"{role}_split_image_artifact_items": record[
+                    "split_image_artifact_items"
+                ],
+            }
+        )
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "artifact_type": "label_free_score_export",
         "path_anchor": "manifest_directory",
         "target_dataset": target,
+        "target_dataset_record": selected_record,
+        "split_contract": split_contract,
+        "dataset_dir": ".",
+        "split_file": os.path.relpath(split_paths[split_role], start=directory),
         "weight_sha256": checkpoint_sha,
         "detector_source_domains": ["S1", "S2"],
         "held_out_domains": list(held_out_domains),
@@ -675,6 +814,58 @@ class RCContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "asserted_unverified"):
             assert_verified_provenance([first, unverified])
+
+    def test_calibrator_split_audit_rejects_legacy_and_official_test(self) -> None:
+        train = _episode("train", "A", 0.1, self.reference)
+        validation = _episode("validation", "B", 0.2, self.reference)
+        audit = audit_official_train_score_provenance([train], [validation])
+        self.assertFalse(audit["official_test_scores_consumed"])
+        self.assertEqual(audit["required_score_split_role"], "official_train")
+
+        legacy_payload = train.to_dict()
+        legacy_payload["schema_version"] = LEGACY_EPISODE_SCHEMA_VERSION
+        legacy_payload["provenance"].pop("split_contract")
+        legacy = RCEpisode.from_dict(legacy_payload)
+        with self.assertRaisesRegex(ValueError, "legacy/missing split contract"):
+            audit_official_train_score_provenance([legacy], [validation])
+
+        test_payload = validation.to_dict()
+        test_payload["provenance"]["split_contract"] = _episode_split_contract(
+            "official_test"
+        )
+        official_test = RCEpisode.from_dict(test_payload)
+        with self.assertRaisesRegex(ValueError, "role='official_train'"):
+            audit_official_train_score_provenance([train], [official_test])
+
+    def test_episode_builder_requires_official_train_score_manifest(self) -> None:
+        manifest = _write_score_manifest(
+            self.root / "official-test-scores",
+            "A",
+            SHA_A,
+            ("c", "q"),
+            split_role="official_test",
+        )
+        arguments = {
+            "expected_target": "A",
+            "expected_checkpoint_sha": SHA_A,
+            "expected_outer_fold_id": "fold-out",
+            "expected_outer_target": "OUT",
+            "expected_detector_sources": ("S1", "S2"),
+            "expected_held_out_domains": ("A", "B", "OUT"),
+            "expected_protocol_scope": "multi_source_protocol_candidate",
+            "expected_image_ids": ("c",),
+            "exact_image_ids": False,
+        }
+        with self.assertRaisesRegex(ValueError, "required role 'official_train'"):
+            _verify_score_manifest(manifest, **arguments)
+
+        legacy = json.loads(manifest.read_text(encoding="utf-8"))
+        legacy["schema_version"] = 2
+        legacy.pop("split_contract")
+        legacy.pop("target_dataset_record")
+        manifest.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "final-test-evaluation-only"):
+            _verify_score_manifest(manifest, **arguments)
 
     def _verified_builder_fixture(self) -> dict[str, object]:
         shared_manifest = _write_score_manifest(
@@ -1230,6 +1421,208 @@ class RCContractTests(unittest.TestCase):
         self.assertEqual(tuple(threshold.shape), (3,))
         self.assertEqual(tuple(reject.shape), (3,))
 
+    def test_monotone_pixel_calibrator_train_and_online_contract(self) -> None:
+        budgets = (1e-4, 1e-5, 1e-6)
+        episodes = []
+        for target, offset in (("A", 0.1), ("B", 0.4)):
+            for index, budget in enumerate(budgets):
+                base = _episode(
+                    f"m{target.lower()}{index}",
+                    target,
+                    offset + index * 0.05,
+                    self.reference,
+                    pd=0.8 - index * 0.2,
+                )
+                episodes.append(
+                    replace(
+                        base,
+                        budgets=BudgetSpec(
+                            values=(budget, 0.0), active=(True, False)
+                        ),
+                        context_image_ids=(f"m{target.lower()}-context",),
+                        query_image_ids=(f"m{target.lower()}-query",),
+                        oracle_threshold=0.6 + index * 0.1,
+                    )
+                )
+        episode_path = self.root / "monotone-episodes.jsonl"
+        episode_path.write_text(
+            "".join(json.dumps(episode.to_dict()) + "\n" for episode in episodes),
+            encoding="utf-8",
+        )
+        deployment_reference_path = self.root / "monotone-source-reference.npz"
+        _write_source_reference(
+            deployment_reference_path,
+            self.config,
+            checkpoint_sha=SHA_D,
+            held_out_domains=("OUT",),
+        )
+        output_dir = self.root / "monotone-trained"
+        result = train_calibrator_main(
+            [
+                "--episodes",
+                str(episode_path),
+                "--val-pseudo-target",
+                "B",
+                "--output-dir",
+                str(output_dir),
+                "--deployment-detector-checkpoint-sha",
+                SHA_D,
+                "--deployment-detector-source-domain",
+                "S1",
+                "--deployment-detector-source-domain",
+                "S2",
+                "--deployment-source-reference",
+                str(deployment_reference_path),
+                "--calibrator-model",
+                "monotone_pixel",
+                "--pixel-budget-grid",
+                "1e-4",
+                "1e-5",
+                "1e-6",
+                "--epochs",
+                "1",
+                "--batch-size",
+                "2",
+                "--hidden-dim",
+                "8",
+                "--dropout",
+                "0",
+                "--device",
+                "cpu",
+            ]
+        )
+        self.assertEqual(result, 0)
+        checkpoint_path = output_dir / "calibrator.pt"
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        self.assertEqual(checkpoint["format_version"], "rc-irstd.calibrator.v4")
+        self.assertEqual(checkpoint["calibrator_model"], "monotone_pixel")
+        self.assertFalse(
+            checkpoint["capability_contract"]["supports_component_budget"]
+        )
+        self.assertEqual(
+            checkpoint["monotone_budget_contract"]["grid"],
+            [1e-4, 1e-5, 1e-6],
+        )
+        self.assertTrue(
+            checkpoint["monotone_budget_contract"]["train_supervision"]
+            ["all_grid_points_supervised"]
+        )
+        self.assertEqual(
+            checkpoint["monotone_budget_contract"]["train_supervision"]
+            ["num_multi_budget_groups_checked"],
+            1,
+        )
+        self.assertEqual(
+            checkpoint["input_feature_names"], list(episodes[0].feature_names)
+        )
+
+        online_manifest = _write_score_manifest(
+            self.root / "monotone-online",
+            "OUT",
+            SHA_D,
+            ("0", "1", "2"),
+            held_out_domains=("OUT",),
+            split_role="official_test",
+        )
+        online_output = self.root / "monotone-online.json"
+        self.assertEqual(
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(checkpoint_path),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "1",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            ),
+            0,
+        )
+        online = json.loads(online_output.read_text(encoding="utf-8"))
+        self.assertEqual(online["calibrator_model"], "monotone_pixel")
+        self.assertEqual(
+            online["calibrator_format_version"], "rc-irstd.calibrator.v4"
+        )
+        self.assertEqual(
+            online["calibrator_capability_contract"],
+            checkpoint["capability_contract"],
+        )
+        self.assertEqual(
+            online["calibrator_budget_contract"],
+            checkpoint["monotone_budget_contract"],
+        )
+        self.assertEqual(
+            online["decision_contract"]["budget_model"],
+            checkpoint["monotone_budget_contract"],
+        )
+        self.assertTrue(0.0 <= online["threshold"] <= 1.0)
+        self.assertTrue(0.0 <= online["reject_probability"] <= 1.0)
+
+        with self.assertRaisesRegex(ValueError, "component budgets are not supported"):
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(checkpoint_path),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "1",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--component-budget",
+                    "1.0",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            )
+
+        tampered = dict(checkpoint)
+        tampered["monotone_budget_contract"] = {
+            **checkpoint["monotone_budget_contract"],
+            "grid_policy_sha256": SHA_A,
+        }
+        tampered_path = output_dir / "tampered-grid-contract.pt"
+        torch.save(tampered, tampered_path)
+        with self.assertRaisesRegex(ValueError, "grid policy SHA-256"):
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(tampered_path),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "1",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            )
+
     def test_train_checkpoint_and_online_audit_contract(self) -> None:
         episodes = [
             _episode("a0", "A", 0.1, self.reference),
@@ -1296,6 +1689,14 @@ class RCContractTests(unittest.TestCase):
             checkpoint["deployment_source_reference"]["sha256"],
             deployment_reference.sha256,
         )
+        self.assertEqual(
+            checkpoint["deployment_protocol_contract"],
+            DeploymentProtocolContract(
+                context_size=1,
+                query_size=1,
+                reject_cutoff=0.5,
+            ).to_dict(),
+        )
 
         online_manifest = _write_score_manifest(
             self.root / "online",
@@ -1303,6 +1704,7 @@ class RCContractTests(unittest.TestCase):
             SHA_D,
             ("0", "1", "2"),
             held_out_domains=("OUT",),
+            split_role="official_test",
         )
         online_output = self.root / "online-result.json"
         online_main(
@@ -1314,7 +1716,9 @@ class RCContractTests(unittest.TestCase):
                 "--target-domain",
                 "OUT",
                 "--context-size",
-                "2",
+                "1",
+                "--query-size",
+                "1",
                 "--pixel-budget",
                 "1e-5",
                 "--device",
@@ -1335,8 +1739,228 @@ class RCContractTests(unittest.TestCase):
             _sha256(output_dir / "calibrator.pt"),
         )
         self.assertEqual(online["score_manifest_sha256"], _sha256(online_manifest))
-        self.assertEqual(online["context_image_ids"], ["0", "1"])
-        self.assertEqual(online["query_image_ids"], ["2"])
+        self.assertEqual(online["context_image_ids"], ["0"])
+        self.assertEqual(online["query_image_ids"], ["1"])
+        self.assertTrue(online["claim_bearing"])
+        self.assertEqual(online["context_size"], 1)
+        self.assertEqual(online["query_size"], 1)
+        self.assertEqual(
+            online["decision_contract"]["reject_rule"]["cutoff_source"],
+            "checkpoint.deployment_protocol_contract.reject_cutoff",
+        )
+        self.assertFalse(
+            online["decision_contract"]["reject_rule"]["target_override_allowed"]
+        )
+        self.assertEqual(
+            online["evaluation_contract"]["matching_rule"],
+            "overlap",
+        )
+        self.assertEqual(
+            online["evaluation_contract"]["centroid_distance"],
+            3.0,
+        )
+        self.assertFalse(
+            online["evaluation_contract"]["target_override_allowed"]
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot override"):
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(output_dir / "calibrator.pt"),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "1",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--reject-probability",
+                    "0.25",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            )
+
+        with self.assertRaisesRegex(ValueError, "context/query sizes"):
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(output_dir / "calibrator.pt"),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "2",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            )
+
+        with self.assertRaisesRegex(ValueError, "evaluation matching contract"):
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(output_dir / "calibrator.pt"),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "1",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--matching-rule",
+                    "centroid",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            )
+
+        implicit_default_checkpoint = dict(checkpoint)
+        implicit_default_protocol = dict(
+            checkpoint["deployment_protocol_contract"]
+        )
+        implicit_default_protocol.pop("evaluation_matching")
+        implicit_default_checkpoint["deployment_protocol_contract"] = (
+            implicit_default_protocol
+        )
+        implicit_default_path = output_dir / "implicit-default-matching.pt"
+        torch.save(implicit_default_checkpoint, implicit_default_path)
+        implicit_default_output = self.root / "implicit-default-matching.json"
+        online_main(
+            [
+                "--manifest",
+                str(online_manifest),
+                "--calibrator-checkpoint",
+                str(implicit_default_path),
+                "--target-domain",
+                "OUT",
+                "--context-size",
+                "1",
+                "--query-size",
+                "1",
+                "--pixel-budget",
+                "1e-5",
+                "--device",
+                "cpu",
+                "--output",
+                str(implicit_default_output),
+            ]
+        )
+        implicit_default = json.loads(
+            implicit_default_output.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            implicit_default["evaluation_contract"]["matching_rule"],
+            "overlap",
+        )
+        self.assertEqual(
+            implicit_default["evaluation_contract"]["centroid_distance"],
+            3.0,
+        )
+
+        legacy_checkpoint = dict(checkpoint)
+        legacy_checkpoint.pop("deployment_protocol_contract")
+        legacy_checkpoint_path = output_dir / "legacy-calibrator.pt"
+        torch.save(legacy_checkpoint, legacy_checkpoint_path)
+        with self.assertRaisesRegex(ValueError, "legacy checkpoint is diagnostic-only"):
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(legacy_checkpoint_path),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "1",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            )
+        diagnostic_output = self.root / "online-diagnostic.json"
+        online_main(
+            [
+                "--manifest",
+                str(online_manifest),
+                "--calibrator-checkpoint",
+                str(legacy_checkpoint_path),
+                "--target-domain",
+                "OUT",
+                "--context-size",
+                "2",
+                "--query-size",
+                "1",
+                "--pixel-budget",
+                "1e-5",
+                "--reject-probability",
+                "0.25",
+                "--diagnostic-unfrozen-protocol",
+                "--device",
+                "cpu",
+                "--output",
+                str(diagnostic_output),
+            ]
+        )
+        diagnostic = json.loads(diagnostic_output.read_text(encoding="utf-8"))
+        self.assertFalse(diagnostic["claim_bearing"])
+        self.assertEqual(
+            diagnostic["decision_contract"]["claim_eligibility"],
+            "diagnostic_only",
+        )
+        self.assertEqual(diagnostic["reject_cutoff"], 0.25)
+
+        conflicting_checkpoint = dict(checkpoint)
+        conflicting_checkpoint["training_config"] = {
+            **checkpoint["training_config"],
+            "reject_probability": 0.25,
+        }
+        conflicting_checkpoint_path = output_dir / "conflicting-calibrator.pt"
+        torch.save(conflicting_checkpoint, conflicting_checkpoint_path)
+        with self.assertRaisesRegex(ValueError, "conflicting reject cutoffs"):
+            online_main(
+                [
+                    "--manifest",
+                    str(online_manifest),
+                    "--calibrator-checkpoint",
+                    str(conflicting_checkpoint_path),
+                    "--target-domain",
+                    "OUT",
+                    "--context-size",
+                    "1",
+                    "--query-size",
+                    "1",
+                    "--pixel-budget",
+                    "1e-5",
+                    "--device",
+                    "cpu",
+                    "--output",
+                    str(online_output),
+                ]
+            )
 
         broken = json.loads(online_manifest.read_text(encoding="utf-8"))
         broken["weight_sha256"] = SHA_A
@@ -1351,7 +1975,9 @@ class RCContractTests(unittest.TestCase):
                     "--target-domain",
                     "OUT",
                     "--context-size",
-                    "2",
+                    "1",
+                    "--query-size",
+                    "1",
                     "--pixel-budget",
                     "1e-5",
                     "--device",

@@ -120,6 +120,16 @@ def encoded_matrix(episodes: Sequence[RCEpisode]) -> np.ndarray:
     return matrix
 
 
+def context_matrix(episodes: Sequence[RCEpisode]) -> np.ndarray:
+    """Return budget-invariant, unlabeled context statistics only."""
+
+    validate_episode_collection(episodes)
+    matrix = np.asarray([episode.statistics for episode in episodes], dtype=np.float64)
+    if matrix.ndim != 2 or not np.isfinite(matrix).all():
+        raise ValueError("context statistics matrix must be finite and two-dimensional")
+    return matrix
+
+
 @dataclass(frozen=True)
 class FeatureStandardizer:
     feature_names: tuple[str, ...]
@@ -160,6 +170,15 @@ class FeatureStandardizer:
 
         matrix = encoded_matrix(train_episodes)
         return cls.fit(matrix, train_episodes[0].input_feature_names)
+
+    @classmethod
+    def fit_context_train(
+        cls, train_episodes: Sequence[RCEpisode]
+    ) -> "FeatureStandardizer":
+        """Fit only budget-invariant context features from training episodes."""
+
+        matrix = context_matrix(train_episodes)
+        return cls.fit(matrix, train_episodes[0].feature_names)
 
     def transform(self, matrix: np.ndarray) -> np.ndarray:
         values = np.asarray(matrix, dtype=np.float64)
@@ -210,6 +229,67 @@ class RCMetaDataset(Dataset):
         return {
             "features": torch.from_numpy(self.features[index]),
             "threshold": torch.tensor(episode.oracle_threshold, dtype=torch.float32),
+            "reject": torch.tensor(float(episode.reject), dtype=torch.float32),
+            "oracle_pd": torch.tensor(episode.oracle_pd, dtype=torch.float32),
+            "episode_id": episode.episode_id,
+            "pseudo_target": episode.pseudo_target,
+        }
+
+    @property
+    def input_dim(self) -> int:
+        return self.features.shape[1]
+
+    @property
+    def pseudo_targets(self) -> set[str]:
+        return {episode.pseudo_target for episode in self.episodes}
+
+
+class RCPixelRiskMetaDataset(Dataset):
+    """Pixel-budget episodes with budgets kept outside the context encoder."""
+
+    def __init__(
+        self,
+        episodes: Sequence[RCEpisode] | str | Path,
+        *,
+        standardizer: FeatureStandardizer | None = None,
+    ) -> None:
+        if isinstance(episodes, (str, Path)):
+            episodes = load_episodes(episodes)
+        self.episodes = list(episodes)
+        validate_episode_collection(self.episodes)
+        unsupported = [
+            episode.episode_id
+            for episode in self.episodes
+            if episode.budgets.active != (True, False)
+        ]
+        if unsupported:
+            raise ValueError(
+                "monotone pixel-risk training requires pixel-only budgets; "
+                f"unsupported episodes={unsupported}"
+            )
+        self.standardizer = standardizer
+        raw = context_matrix(self.episodes)
+        if standardizer is not None:
+            if standardizer.feature_names != self.episodes[0].feature_names:
+                raise ValueError(
+                    "context standardizer feature schema differs from episodes"
+                )
+            raw = standardizer.transform(raw)
+        self.features = raw.astype(np.float32)
+
+    def __len__(self) -> int:
+        return len(self.episodes)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        episode = self.episodes[index]
+        return {
+            "features": torch.from_numpy(self.features[index]),
+            "pixel_budget": torch.tensor(
+                episode.budgets.values[0], dtype=torch.float64
+            ),
+            "threshold": torch.tensor(
+                episode.oracle_threshold, dtype=torch.float32
+            ),
             "reject": torch.tensor(float(episode.reject), dtype=torch.float32),
             "oracle_pd": torch.tensor(episode.oracle_pd, dtype=torch.float32),
             "episode_id": episode.episode_id,

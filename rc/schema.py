@@ -13,7 +13,12 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = "rc-irstd.meta-episode.v3"
+LEGACY_EPISODE_SCHEMA_VERSION = "rc-irstd.meta-episode.v3"
+SCHEMA_VERSION = "rc-irstd.meta-episode.v4"
+SUPPORTED_EPISODE_SCHEMA_VERSIONS = (
+    LEGACY_EPISODE_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+)
 BUDGET_NAMES = ("pixel", "component")
 VALID_THRESHOLD_TRANSFORMS = ("identity", "logit", "tail")
 PROVENANCE_STATUSES = ("verified", "asserted_unverified")
@@ -22,6 +27,51 @@ SINGLE_SOURCE_SMOKE_SCOPE = "single_source_inner_smoke_not_main_result"
 DETECTOR_PROTOCOL_SCOPES = (
     MULTI_SOURCE_PROTOCOL_SCOPE,
     SINGLE_SOURCE_SMOKE_SCOPE,
+)
+DEPLOYMENT_PROTOCOL_CONTRACT_VERSION = "rc-irstd.deployment-protocol.v1"
+ONLINE_DECISION_CONTRACT_VERSION = "rc-irstd.online-decision.v1"
+CAUSAL_PARTITION_RULE = "ordered_manifest_prefix_context_then_contiguous_query"
+REJECT_SCORE_RULE = "sigmoid_reject_logit"
+REJECT_COMPARISON_RULE = "greater_than_or_equal"
+EVALUATION_MATCHING_CONTRACT_VERSION = "rc-irstd.evaluation-matching.v1"
+DEFAULT_MATCHING_RULE = "overlap"
+DEFAULT_CENTROID_DISTANCE = 3.0
+STATISTICS_ALGORITHM_VERSION = "rc-domain-statistics-v3-bounded-quantiles"
+STATISTICS_QUANTILE_ESTIMATOR = "splitmix64_priority_bottom_k_stream_index_v1"
+STATISTICS_QUANTILE_SAMPLE_LIMIT = 262_144
+SCORE_SPLIT_CONTRACT_VERSION = 1
+OFFICIAL_TRAIN_SPLIT_ROLE = "official_train"
+OFFICIAL_TEST_SPLIT_ROLE = "official_test"
+SCORE_SPLIT_ROLES = (
+    OFFICIAL_TRAIN_SPLIT_ROLE,
+    OFFICIAL_TEST_SPLIT_ROLE,
+)
+
+
+_EPISODE_SCORE_SPLIT_FIELDS = (
+    "schema_version",
+    "role",
+    "selected_split_file",
+    "selected_split_sha256",
+    "selected_num_images",
+    "selected_ids_sha256",
+    "official_train_split_file",
+    "official_train_split_sha256",
+    "official_train_num_images",
+    "official_train_ids_sha256",
+    "official_train_split_image_artifact_sha256",
+    "official_test_split_file",
+    "official_test_split_sha256",
+    "official_test_num_images",
+    "official_test_ids_sha256",
+    "official_test_split_image_artifact_sha256",
+    "ordered_sample_ids_algorithm",
+    "split_image_artifact_algorithm",
+    "train_test_id_overlap_count",
+    "train_test_id_overlap_ids",
+    "train_test_image_content_overlap_count",
+    "train_test_image_content_overlap_sha256_leaves",
+    "disjointness_verified",
 )
 
 
@@ -39,6 +89,140 @@ def _validate_sha256(value: str, name: str) -> str:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError(f"{name} must be a lowercase 64-character SHA-256 digest")
     return value
+
+
+def _strict_nonnegative_integer(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
+def canonicalize_episode_score_split_contract(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and compact the score manifest's official-split proof.
+
+    The native score manifest carries ordered image-artifact leaves for both
+    official splits.  Repeating those potentially large arrays in every meta
+    episode would make JSONL collections quadratic in the number of windows,
+    so an episode stores the immutable split/list/artifact digests plus the
+    disjointness result.  The score-manifest SHA in :class:`EpisodeProvenance`
+    remains the binding to the complete leaf lists.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("episode split_contract must be a mapping")
+    missing = set(_EPISODE_SCORE_SPLIT_FIELDS).difference(payload)
+    if missing:
+        raise KeyError(
+            "episode split_contract is missing required fields: "
+            f"{sorted(missing)}"
+        )
+
+    version = payload["schema_version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("episode split_contract schema_version must be an integer")
+    if version != SCORE_SPLIT_CONTRACT_VERSION:
+        raise ValueError(
+            "unsupported episode split_contract schema_version: "
+            f"{version!r}"
+        )
+    role = str(payload["role"])
+    if role not in SCORE_SPLIT_ROLES:
+        raise ValueError(
+            f"episode split_contract role must be one of {SCORE_SPLIT_ROLES}"
+        )
+
+    result: dict[str, Any] = {
+        "schema_version": version,
+        "role": role,
+    }
+    for name in (
+        "selected_split_file",
+        "official_train_split_file",
+        "official_test_split_file",
+        "ordered_sample_ids_algorithm",
+        "split_image_artifact_algorithm",
+    ):
+        value = str(payload[name])
+        if not value or value != value.strip():
+            raise ValueError(f"episode split_contract {name} must be non-empty")
+        result[name] = value
+
+    for name in (
+        "selected_split_sha256",
+        "selected_ids_sha256",
+        "official_train_split_sha256",
+        "official_train_ids_sha256",
+        "official_train_split_image_artifact_sha256",
+        "official_test_split_sha256",
+        "official_test_ids_sha256",
+        "official_test_split_image_artifact_sha256",
+    ):
+        result[name] = _validate_sha256(
+            str(payload[name]), f"episode split_contract {name}"
+        )
+
+    for name in (
+        "selected_num_images",
+        "official_train_num_images",
+        "official_test_num_images",
+    ):
+        value = _strict_nonnegative_integer(
+            payload[name], f"episode split_contract {name}"
+        )
+        if value <= 0:
+            raise ValueError(f"episode split_contract {name} must be positive")
+        result[name] = value
+
+    selected_prefix = role.removeprefix("official_")
+    role_prefix = f"official_{selected_prefix}"
+    expected_selected = {
+        "selected_split_file": result[f"{role_prefix}_split_file"],
+        "selected_split_sha256": result[f"{role_prefix}_split_sha256"],
+        "selected_num_images": result[f"{role_prefix}_num_images"],
+        "selected_ids_sha256": result[f"{role_prefix}_ids_sha256"],
+    }
+    for name, expected in expected_selected.items():
+        if result[name] != expected:
+            raise ValueError(
+                f"episode split_contract {name} disagrees with role={role!r}"
+            )
+
+    for count_name, leaves_name in (
+        ("train_test_id_overlap_count", "train_test_id_overlap_ids"),
+        (
+            "train_test_image_content_overlap_count",
+            "train_test_image_content_overlap_sha256_leaves",
+        ),
+    ):
+        count = _strict_nonnegative_integer(
+            payload[count_name], f"episode split_contract {count_name}"
+        )
+        leaves = payload[leaves_name]
+        if isinstance(leaves, (str, bytes)) or not isinstance(leaves, Sequence):
+            raise TypeError(f"episode split_contract {leaves_name} must be a sequence")
+        compact_leaves = [str(value) for value in leaves]
+        if len(compact_leaves) != count:
+            raise ValueError(
+                f"episode split_contract {count_name} disagrees with {leaves_name}"
+            )
+        if count != 0:
+            raise ValueError(
+                "episode split_contract requires zero official train/test overlap; "
+                f"{count_name}={count}"
+            )
+        result[count_name] = count
+        result[leaves_name] = compact_leaves
+
+    if payload["disjointness_verified"] is not True:
+        raise ValueError(
+            "episode split_contract disjointness_verified must be exactly true"
+        )
+    result["disjointness_verified"] = True
+    return {name: result[name] for name in _EPISODE_SCORE_SPLIT_FIELDS}
 
 
 def _validate_protocol_scope_cardinality(
@@ -77,7 +261,9 @@ class StatisticsConfig:
     plateau_mode: str = "kernel_local_row_major_rank_nms"
     plateau_atol: float = 0.0
     grayscale_normalization: str = "dtype_or_robust_0_1"
-    algorithm_version: str = "rc-domain-statistics-v2"
+    quantile_sample_limit: int = STATISTICS_QUANTILE_SAMPLE_LIMIT
+    quantile_estimator: str = STATISTICS_QUANTILE_ESTIMATOR
+    algorithm_version: str = STATISTICS_ALGORITHM_VERSION
 
     def __post_init__(self) -> None:
         if self.peak_kernel_size <= 0 or self.peak_kernel_size % 2 == 0:
@@ -85,16 +271,24 @@ class StatisticsConfig:
         if not 0.0 <= self.peak_min_score <= 1.0:
             raise ValueError("peak_min_score must lie in [0, 1]")
         if self.probability_histogram_bins != 32 or self.peak_histogram_bins != 32:
-            raise ValueError("the v2 feature schema fixes both histogram counts at 32")
+            raise ValueError("the v3 feature schema fixes both histogram counts at 32")
         if self.quantiles != (0.50, 0.75, 0.90, 0.95, 0.99, 0.995, 0.999):
-            raise ValueError("the v2 feature schema fixes the seven probability quantiles")
+            raise ValueError("the v3 feature schema fixes the seven probability quantiles")
         if self.plateau_mode != "kernel_local_row_major_rank_nms":
             raise ValueError("statistics plateau_mode must match detector local-peak loss")
         if self.plateau_atol < 0.0:
             raise ValueError("plateau_atol must be non-negative")
         if self.grayscale_normalization != "dtype_or_robust_0_1":
             raise ValueError("unsupported grayscale_normalization")
-        if self.algorithm_version != "rc-domain-statistics-v2":
+        if isinstance(self.quantile_sample_limit, bool) or not isinstance(
+            self.quantile_sample_limit, int
+        ):
+            raise TypeError("quantile_sample_limit must be an integer")
+        if self.quantile_sample_limit <= 0:
+            raise ValueError("quantile_sample_limit must be positive")
+        if self.quantile_estimator != STATISTICS_QUANTILE_ESTIMATOR:
+            raise ValueError("unsupported statistics quantile_estimator")
+        if self.algorithm_version != STATISTICS_ALGORITHM_VERSION:
             raise ValueError("unsupported statistics algorithm_version")
 
     def to_dict(self) -> dict[str, Any]:
@@ -107,6 +301,8 @@ class StatisticsConfig:
             "plateau_mode": self.plateau_mode,
             "plateau_atol": self.plateau_atol,
             "grayscale_normalization": self.grayscale_normalization,
+            "quantile_sample_limit": self.quantile_sample_limit,
+            "quantile_estimator": self.quantile_estimator,
             "algorithm_version": self.algorithm_version,
         }
 
@@ -125,7 +321,15 @@ class StatisticsConfig:
             grayscale_normalization=str(
                 payload.get("grayscale_normalization", "dtype_or_robust_0_1")
             ),
-            algorithm_version=str(payload.get("algorithm_version", "rc-domain-statistics-v2")),
+            quantile_sample_limit=payload.get(
+                "quantile_sample_limit", STATISTICS_QUANTILE_SAMPLE_LIMIT
+            ),
+            quantile_estimator=str(
+                payload.get("quantile_estimator", STATISTICS_QUANTILE_ESTIMATOR)
+            ),
+            algorithm_version=str(
+                payload.get("algorithm_version", STATISTICS_ALGORITHM_VERSION)
+            ),
         )
 
 
@@ -372,6 +576,160 @@ class FoldContract:
 
 
 @dataclass(frozen=True)
+class DeploymentProtocolContract:
+    """Target-label-free parameters frozen before final-target adaptation.
+
+    The context/query geometry is learned and validated on pseudo-target
+    episodes.  The rejection cutoff is selected during calibrator training.
+    Neither may be changed after the final target score manifest is opened in
+    a claim-bearing run.
+    """
+
+    context_size: int
+    query_size: int
+    reject_cutoff: float
+    partition_rule: str = CAUSAL_PARTITION_RULE
+    reject_score: str = REJECT_SCORE_RULE
+    reject_comparison: str = REJECT_COMPARISON_RULE
+    matching_rule: str = DEFAULT_MATCHING_RULE
+    centroid_distance: float = DEFAULT_CENTROID_DISTANCE
+    target_reject_cutoff_override_allowed: bool = False
+    schema_version: str = DEPLOYMENT_PROTOCOL_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != DEPLOYMENT_PROTOCOL_CONTRACT_VERSION:
+            raise ValueError(
+                "unsupported deployment protocol contract schema_version: "
+                f"{self.schema_version!r}"
+            )
+        if isinstance(self.context_size, bool) or not isinstance(
+            self.context_size, int
+        ):
+            raise TypeError("deployment context_size must be an integer")
+        if isinstance(self.query_size, bool) or not isinstance(self.query_size, int):
+            raise TypeError("deployment query_size must be an integer")
+        if self.context_size <= 0 or self.query_size <= 0:
+            raise ValueError("deployment context_size and query_size must be positive")
+        cutoff = _finite_float(self.reject_cutoff, "deployment reject_cutoff")
+        if not 0.0 <= cutoff <= 1.0:
+            raise ValueError("deployment reject_cutoff must lie in [0, 1]")
+        if self.partition_rule != CAUSAL_PARTITION_RULE:
+            raise ValueError("unsupported deployment causal partition rule")
+        if self.reject_score != REJECT_SCORE_RULE:
+            raise ValueError("unsupported deployment reject score rule")
+        if self.reject_comparison != REJECT_COMPARISON_RULE:
+            raise ValueError("unsupported deployment reject comparison rule")
+        if self.matching_rule not in {"overlap", "centroid"}:
+            raise ValueError("deployment matching_rule must be 'overlap' or 'centroid'")
+        centroid_distance = _finite_float(
+            self.centroid_distance, "deployment centroid_distance"
+        )
+        if centroid_distance <= 0.0:
+            raise ValueError("deployment centroid_distance must be positive")
+        if not isinstance(self.target_reject_cutoff_override_allowed, bool):
+            raise TypeError(
+                "target_reject_cutoff_override_allowed must be boolean"
+            )
+        if self.target_reject_cutoff_override_allowed:
+            raise ValueError(
+                "claim-bearing deployment must forbid final-target reject-cutoff overrides"
+            )
+
+    def assert_runtime_sizes(self, *, context_size: int, query_size: int) -> None:
+        observed = (int(context_size), int(query_size))
+        expected = (self.context_size, self.query_size)
+        if observed != expected:
+            raise ValueError(
+                "online context/query sizes differ from the frozen deployment "
+                f"contract: observed={observed}, expected={expected}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "context_size": self.context_size,
+            "query_size": self.query_size,
+            "partition_rule": self.partition_rule,
+            "reject_score": self.reject_score,
+            "reject_comparison": self.reject_comparison,
+            "reject_cutoff": self.reject_cutoff,
+            "evaluation_matching": {
+                "schema_version": EVALUATION_MATCHING_CONTRACT_VERSION,
+                "matching_rule": self.matching_rule,
+                "centroid_distance": self.centroid_distance,
+            },
+            "target_reject_cutoff_override_allowed": (
+                self.target_reject_cutoff_override_allowed
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DeploymentProtocolContract":
+        required = {
+            "schema_version",
+            "context_size",
+            "query_size",
+            "partition_rule",
+            "reject_score",
+            "reject_comparison",
+            "reject_cutoff",
+            "target_reject_cutoff_override_allowed",
+        }
+        missing = required.difference(payload)
+        if missing:
+            raise KeyError(
+                f"deployment protocol contract is missing: {sorted(missing)}"
+            )
+        for name in ("context_size", "query_size"):
+            value = payload[name]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"deployment protocol {name} must be an integer")
+        override_allowed = payload["target_reject_cutoff_override_allowed"]
+        if not isinstance(override_allowed, bool):
+            raise TypeError(
+                "deployment protocol target_reject_cutoff_override_allowed must be boolean"
+            )
+        evaluation_matching = payload.get(
+            "evaluation_matching",
+            {
+                "schema_version": EVALUATION_MATCHING_CONTRACT_VERSION,
+                "matching_rule": DEFAULT_MATCHING_RULE,
+                "centroid_distance": DEFAULT_CENTROID_DISTANCE,
+            },
+        )
+        if not isinstance(evaluation_matching, Mapping):
+            raise TypeError("deployment protocol evaluation_matching must be a mapping")
+        matching_required = {
+            "schema_version",
+            "matching_rule",
+            "centroid_distance",
+        }
+        matching_missing = matching_required.difference(evaluation_matching)
+        if matching_missing:
+            raise KeyError(
+                "deployment evaluation matching contract is missing: "
+                f"{sorted(matching_missing)}"
+            )
+        if (
+            evaluation_matching["schema_version"]
+            != EVALUATION_MATCHING_CONTRACT_VERSION
+        ):
+            raise ValueError("unsupported evaluation matching contract schema_version")
+        return cls(
+            schema_version=str(payload["schema_version"]),
+            context_size=payload["context_size"],
+            query_size=payload["query_size"],
+            partition_rule=str(payload["partition_rule"]),
+            reject_score=str(payload["reject_score"]),
+            reject_comparison=str(payload["reject_comparison"]),
+            reject_cutoff=float(payload["reject_cutoff"]),
+            matching_rule=str(evaluation_matching["matching_rule"]),
+            centroid_distance=float(evaluation_matching["centroid_distance"]),
+            target_reject_cutoff_override_allowed=override_allowed,
+        )
+
+
+@dataclass(frozen=True)
 class EpisodeProvenance:
     status: str
     curve_file_sha256: str
@@ -381,6 +739,7 @@ class EpisodeProvenance:
     query_score_target_dataset: str
     label_manifest_sha256: str = ""
     label_manifest_content_sha256: str = ""
+    split_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in PROVENANCE_STATUSES:
@@ -409,6 +768,12 @@ class EpisodeProvenance:
                 _validate_sha256(getattr(self, name), name)
         if not self.query_score_target_dataset:
             raise ValueError("query_score_target_dataset must be non-empty")
+        if self.split_contract is not None:
+            object.__setattr__(
+                self,
+                "split_contract",
+                canonicalize_episode_score_split_contract(self.split_contract),
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -420,6 +785,9 @@ class EpisodeProvenance:
             "query_score_target_dataset": self.query_score_target_dataset,
             "label_manifest_sha256": self.label_manifest_sha256,
             "label_manifest_content_sha256": self.label_manifest_content_sha256,
+            "split_contract": (
+                None if self.split_contract is None else dict(self.split_contract)
+            ),
         }
 
     @classmethod
@@ -436,6 +804,11 @@ class EpisodeProvenance:
             label_manifest_sha256=str(payload.get("label_manifest_sha256", "")),
             label_manifest_content_sha256=str(
                 payload.get("label_manifest_content_sha256", "")
+            ),
+            split_contract=(
+                None
+                if payload.get("split_contract") is None
+                else payload["split_contract"]
             ),
         )
 
@@ -536,9 +909,25 @@ class RCEpisode:
     schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_EPISODE_SCHEMA_VERSIONS:
             raise ValueError(
-                f"unsupported episode schema {self.schema_version!r}; expected {SCHEMA_VERSION!r}"
+                "unsupported episode schema "
+                f"{self.schema_version!r}; expected one of "
+                f"{SUPPORTED_EPISODE_SCHEMA_VERSIONS!r}"
+            )
+        if (
+            self.schema_version == SCHEMA_VERSION
+            and self.provenance.split_contract is None
+        ):
+            raise ValueError(
+                f"episode schema {SCHEMA_VERSION!r} requires provenance.split_contract"
+            )
+        if (
+            self.schema_version == LEGACY_EPISODE_SCHEMA_VERSION
+            and self.provenance.split_contract is not None
+        ):
+            raise ValueError(
+                "legacy meta-episode v3 must not claim the v4 official-split proof"
             )
         if not self.episode_id:
             raise ValueError("episode_id must be non-empty")

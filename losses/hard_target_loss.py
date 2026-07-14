@@ -46,12 +46,46 @@ def _component_flat_indices(mask: torch.Tensor) -> List[np.ndarray]:
     ]
 
 
+def _object_top_fraction_values(
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    object_pixel_fraction: float,
+    *,
+    logit_space: bool,
+) -> List[torch.Tensor]:
+    _check_fraction(object_pixel_fraction, "object_pixel_fraction")
+    logits, masks = _normalise_inputs(logits, masks)
+    values = logits if logit_space else torch.sigmoid(logits)
+    scores_by_image: List[torch.Tensor] = []
+
+    for image_index in range(values.shape[0]):
+        flat_values = values[image_index, 0].reshape(-1)
+        object_scores = []
+        for indices in _component_flat_indices(masks[image_index, 0]):
+            torch_indices = torch.as_tensor(
+                indices,
+                device=logits.device,
+                dtype=torch.long,
+            )
+            pixels = flat_values.index_select(0, torch_indices)
+            object_scores.append(top_fraction_mean(pixels, object_pixel_fraction))
+
+        if object_scores:
+            scores_by_image.append(torch.stack(object_scores))
+        else:
+            # A length-zero view tied to logits gives downstream callers a
+            # differentiable zero path without inventing a fake target.
+            scores_by_image.append(flat_values[:0])
+
+    return scores_by_image
+
+
 def object_top_fraction_scores(
     logits: torch.Tensor,
     masks: torch.Tensor,
     object_pixel_fraction: float = 0.25,
 ) -> List[torch.Tensor]:
-    """Return one differentiable detection score per 8-connected GT object.
+    """Return one differentiable probability score per 8-connected GT object.
 
     Each object's score is the mean of its highest predicted foreground
     probabilities.  Connected-component discovery is discrete and runs on a
@@ -60,31 +94,33 @@ def object_top_fraction_scores(
     images.
     """
 
-    _check_fraction(object_pixel_fraction, "object_pixel_fraction")
-    logits, masks = _normalise_inputs(logits, masks)
-    probabilities = torch.sigmoid(logits)
-    scores_by_image: List[torch.Tensor] = []
+    return _object_top_fraction_values(
+        logits,
+        masks,
+        object_pixel_fraction,
+        logit_space=False,
+    )
 
-    for image_index in range(probabilities.shape[0]):
-        flat_probabilities = probabilities[image_index, 0].reshape(-1)
-        object_scores = []
-        for indices in _component_flat_indices(masks[image_index, 0]):
-            torch_indices = torch.as_tensor(
-                indices,
-                device=logits.device,
-                dtype=torch.long,
-            )
-            pixels = flat_probabilities.index_select(0, torch_indices)
-            object_scores.append(top_fraction_mean(pixels, object_pixel_fraction))
 
-        if object_scores:
-            scores_by_image.append(torch.stack(object_scores))
-        else:
-            # A length-zero view tied to logits gives downstream callers a
-            # differentiable zero path without inventing a fake target.
-            scores_by_image.append(flat_probabilities[:0])
+def object_top_fraction_logits(
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    object_pixel_fraction: float = 0.25,
+) -> List[torch.Tensor]:
+    """Return object scores in logit space for shift-invariant margins.
 
-    return scores_by_image
+    Ranking the pixels in logit space selects the same top fraction as ranking
+    probabilities because sigmoid is monotone.  Averaging logits, rather than
+    probabilities, makes a target--background difference invariant to a
+    common logit shift.
+    """
+
+    return _object_top_fraction_values(
+        logits,
+        masks,
+        object_pixel_fraction,
+        logit_space=True,
+    )
 
 
 def hard_target_miss_loss(

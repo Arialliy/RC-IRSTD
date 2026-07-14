@@ -33,6 +33,9 @@ CURVE_SCHEMA_VERSION = 2
 THRESHOLD_GRID_VERSION = "rc-tail-grid-v1"
 THRESHOLD_SEMANTICS = STRICT_THRESHOLD_SEMANTICS
 THRESHOLD_MODES = ("fixed", "adaptive", "exact")
+ORACLE_ONLY = True
+ORACLE_SELECTION_SCOPE = "post_hoc_labeled_evaluation_curve"
+ORACLE_DEPLOYMENT_STATUS = "prohibited_label_oracle"
 DEFAULT_HIGH_TAIL_LOWER_BOUND = 0.99
 DEFAULT_EVENT_THRESHOLD_CAP = 4096
 
@@ -272,7 +275,7 @@ def load_score_map(path: str | Path) -> ScoreMapRecord:
     with np.load(score_path, allow_pickle=False) as payload:
         if "prob" not in payload or "mask" not in payload:
             raise KeyError(f"Score map must contain 'prob' and 'mask': {score_path}")
-        probability = np.asarray(payload["prob"], dtype=np.float32).squeeze()
+        probability = np.asarray(payload["prob"], dtype=np.float64).squeeze()
         mask = np.asarray(payload["mask"]).squeeze()
         if "image_id" in payload:
             image_id = str(np.asarray(payload["image_id"]).item())
@@ -289,7 +292,7 @@ def load_score_map(path: str | Path) -> ScoreMapRecord:
 
 
 def validate_score_map(record: ScoreMapRecord) -> ScoreMapRecord:
-    probability = np.asarray(record.probability, dtype=np.float32).squeeze()
+    probability = np.asarray(record.probability, dtype=np.float64).squeeze()
     mask = np.asarray(record.mask).squeeze()
     if probability.ndim != 2 or mask.ndim != 2:
         raise ValueError(
@@ -385,7 +388,7 @@ def load_attached_score_maps(
         if score_item.image_id != label_item.image_id:
             raise RuntimeError("verified score/label selection order changed")
         with np.load(score_item.score_path, allow_pickle=False) as payload:
-            probability = np.asarray(payload["prob"], dtype=np.float32)
+            probability = np.asarray(payload["prob"], dtype=np.float64)
         records.append(
             validate_score_map(
                 ScoreMapRecord(
@@ -525,6 +528,18 @@ def write_curve_csv(
             if label_manifest is not None
             else "legacy_combined_npz_diagnostic"
         )
+        # Every row in this curve was computed with ground-truth masks.  It is
+        # valid evaluation evidence (and may be used to construct supervised
+        # meta-training labels), but selecting a threshold from the same curve
+        # is a post-hoc label oracle rather than a deployable decision rule.
+        # Keep this contract top-level and machine-readable so downstream
+        # tooling cannot accidentally present the selected point as the
+        # method's target-label-free operating point.
+        manifest["oracle_only"] = ORACLE_ONLY
+        manifest["selection_scope"] = ORACLE_SELECTION_SCOPE
+        manifest["deployable"] = False
+        manifest["deployment_status"] = ORACLE_DEPLOYMENT_STATUS
+        manifest["selection_uses_ground_truth_labels"] = True
         if image_ids is not None:
             ids = [str(value) for value in image_ids]
             if len(ids) != int(rows[0].get("num_images", len(ids))):

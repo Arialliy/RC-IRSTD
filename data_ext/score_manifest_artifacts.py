@@ -9,6 +9,7 @@ NPZ contract before loading any selected score map.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,14 +18,22 @@ import numpy as np
 from PIL import Image
 
 from .dataset_identity import (
+    ORDERED_SAMPLE_IDS_ALGORITHM,
     SCORE_MANIFEST_CONTENT_ALGORITHM,
+    SPLIT_IMAGE_ARTIFACT_ALGORITHM,
+    ordered_sample_ids_sha256,
     score_manifest_content_sha256,
     sha256_file,
+    validate_dataset_record,
 )
+from .split_utils import read_split_entries, resolve_sample_file, sample_id_from_entry
 
 
 SIGMOID_SCORE_TYPE = "sigmoid_probability"
 STRICT_THRESHOLD_SEMANTICS = "prediction = probability > threshold"
+SCORE_MANIFEST_SCHEMA_VERSION = 3
+SPLIT_CONTRACT_SCHEMA_VERSION = 1
+OFFICIAL_SPLIT_ROLES = ("official_train", "official_test")
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,9 @@ class VerifiedScoreManifest:
     selected_items: tuple[VerifiedScoreItem, ...]
     content_sha256: str
     manifest_sha256: str
+    split_contract: Mapping[str, Any] | None
+    split_role: str | None
+    legacy_final_evaluation_only: bool
 
 
 def verify_score_manifest_artifacts(
@@ -59,6 +71,7 @@ def verify_score_manifest_artifacts(
     require_native_contract: bool = True,
     verify_artifact_bytes: bool = True,
     allow_legacy_combined_diagnostic: bool = False,
+    required_split_role: str | None = None,
 ) -> VerifiedScoreManifest:
     """Verify a score manifest and the selected/relevant sample artifacts.
 
@@ -69,6 +82,11 @@ def verify_score_manifest_artifacts(
     aggregate and item metadata.  Online consumers use that mode to discover
     the query IDs without touching query artifacts, then make a second call
     for the selected context IDs only.
+
+    Calibration episode consumers must pass
+    ``required_split_role="official_train"``.  A schema-v2/role-less manifest
+    is accepted only when that gate is omitted, preserving historical final
+    test evaluation without allowing it into new calibration episodes.
     """
 
     if require_mask and not allow_legacy_combined_diagnostic:
@@ -146,6 +164,13 @@ def verify_score_manifest_artifacts(
         by_id[image_id] = (index, item)
         ordered_ids.append(image_id)
 
+    split_contract = validate_score_split_contract(
+        payload,
+        items=items,
+        manifest_root=path.parent,
+        required_split_role=required_split_role,
+    )
+
     if not verify_artifact_bytes:
         if require_mask:
             raise ValueError(
@@ -190,7 +215,354 @@ def verify_score_manifest_artifacts(
         selected_items=tuple(selected),
         content_sha256=calculated_content_sha256,
         manifest_sha256=manifest_sha256,
+        split_contract=split_contract,
+        split_role=(
+            None if split_contract is None else str(split_contract["role"])
+        ),
+        legacy_final_evaluation_only=split_contract is None,
     )
+
+
+def validate_score_split_contract(
+    payload: Mapping[str, Any],
+    *,
+    items: Sequence[Mapping[str, Any]],
+    manifest_root: str | Path | None = None,
+    required_split_role: str | None = None,
+) -> dict[str, Any] | None:
+    """Validate and normalise a replayable official train/test contract.
+
+    Score-manifest schema v3 requires this contract.  Earlier role-less
+    manifests remain readable only when ``required_split_role`` is omitted;
+    they are final-test-evaluation-only compatibility artifacts.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("score manifest payload must be a mapping")
+    if required_split_role is not None:
+        required_split_role = str(required_split_role).strip()
+        if required_split_role not in OFFICIAL_SPLIT_ROLES:
+            raise ValueError(
+                "required_split_role must be one of "
+                + ", ".join(OFFICIAL_SPLIT_ROLES)
+            )
+    raw_schema = payload.get("schema_version")
+    if raw_schema is None:
+        if "split_contract" in payload:
+            raise ValueError(
+                "a score manifest declaring split_contract requires schema_version=3"
+            )
+        if required_split_role is not None:
+            raise ValueError(
+                "legacy/role-less score manifests are final-test-evaluation-only "
+                f"and cannot satisfy required_split_role={required_split_role!r}"
+            )
+        return None
+    schema_version = _exact_integer(
+        raw_schema,
+        "score manifest schema_version",
+        minimum=1,
+    )
+    if schema_version != SCORE_MANIFEST_SCHEMA_VERSION:
+        if "split_contract" in payload:
+            raise ValueError(
+                "only score manifest schema_version=3 may declare split_contract"
+            )
+        if required_split_role is not None:
+            raise ValueError(
+                "legacy/role-less score manifests are final-test-evaluation-only "
+                f"and cannot satisfy required_split_role={required_split_role!r}"
+            )
+        return None
+
+    raw_contract = payload.get("split_contract")
+    if not isinstance(raw_contract, Mapping):
+        raise ValueError("score manifest schema_version=3 requires split_contract")
+    contract = dict(raw_contract)
+    contract_schema = _exact_integer(
+        contract.get("schema_version"),
+        "split_contract.schema_version",
+        minimum=1,
+    )
+    if contract_schema != SPLIT_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("unsupported score split_contract schema_version")
+    role = _nonempty_string(contract.get("role"), "split_contract.role")
+    if role not in OFFICIAL_SPLIT_ROLES:
+        raise ValueError(
+            "split_contract.role must be 'official_train' or 'official_test'"
+        )
+    if required_split_role is not None and role != required_split_role:
+        raise ValueError(
+            f"score manifest split role {role!r} cannot satisfy required "
+            f"role {required_split_role!r}"
+        )
+    if contract.get("ordered_sample_ids_algorithm") != ORDERED_SAMPLE_IDS_ALGORITHM:
+        raise ValueError("split_contract ordered_sample_ids_algorithm mismatch")
+    if contract.get("split_image_artifact_algorithm") != SPLIT_IMAGE_ARTIFACT_ALGORITHM:
+        raise ValueError("split_contract split_image_artifact_algorithm mismatch")
+
+    if manifest_root is None:
+        raise ValueError(
+            "manifest_root is required to replay schema-v3 split files and image bytes"
+        )
+    root = Path(manifest_root).expanduser().resolve()
+    dataset_dir = _relative_path_value(
+        payload.get("dataset_dir"),
+        "score manifest dataset_dir",
+    )
+    dataset_root = _resolve_path(root, dataset_dir)
+    if not dataset_root.is_dir():
+        raise FileNotFoundError(
+            f"score manifest dataset_dir does not exist: {dataset_root}"
+        )
+    role_records = {
+        official_role: _validate_official_split_record(
+            contract,
+            official_role,
+            manifest_root=root,
+            dataset_root=dataset_root,
+        )
+        for official_role in OFFICIAL_SPLIT_ROLES
+    }
+    train = role_records["official_train"]
+    test = role_records["official_test"]
+    id_overlap = sorted(set(train["sample_ids"]) & set(test["sample_ids"]))
+    content_overlap = sorted(
+        set(train["image_sha256s"]) & set(test["image_sha256s"])
+    )
+    declared_id_count = _exact_integer(
+        contract.get("train_test_id_overlap_count"),
+        "split_contract.train_test_id_overlap_count",
+        minimum=0,
+    )
+    declared_content_count = _exact_integer(
+        contract.get("train_test_image_content_overlap_count"),
+        "split_contract.train_test_image_content_overlap_count",
+        minimum=0,
+    )
+    declared_ids = _string_list(
+        contract.get("train_test_id_overlap_ids"),
+        "split_contract.train_test_id_overlap_ids",
+    )
+    declared_content = _sha256_list(
+        contract.get("train_test_image_content_overlap_sha256_leaves"),
+        "split_contract.train_test_image_content_overlap_sha256_leaves",
+    )
+    if declared_ids != id_overlap or declared_id_count != len(id_overlap):
+        raise ValueError("split_contract train/test sample-ID overlap audit mismatch")
+    if (
+        declared_content != content_overlap
+        or declared_content_count != len(content_overlap)
+    ):
+        raise ValueError("split_contract train/test image-content overlap audit mismatch")
+    if id_overlap or content_overlap:
+        raise ValueError(
+            "score manifest official train/test splits are not ID/content disjoint"
+        )
+    if contract.get("disjointness_verified") is not True:
+        raise ValueError("split_contract disjointness_verified must be exactly true")
+
+    selected = role_records[role]
+    selected_fields = {
+        "selected_split_file": selected["split_file"],
+        "selected_split_sha256": selected["split_sha256"],
+        "selected_num_images": selected["num_images"],
+        "selected_ids_sha256": selected["ids_sha256"],
+    }
+    for field, expected in selected_fields.items():
+        if contract.get(field) != expected:
+            raise ValueError(
+                f"split_contract {field} does not match its declared {role} record"
+            )
+    if payload.get("split_file") != selected["split_file"]:
+        raise ValueError(
+            "score manifest split_file does not match split_contract selected split"
+        )
+
+    selected_ids = [str(item["sample_id"]) for item in selected["items"]]
+    selected_hashes = [str(item["image_sha256"]) for item in selected["items"]]
+    manifest_ids = [
+        _nonempty_string(item.get("image_id"), f"items[{index}].image_id")
+        for index, item in enumerate(items)
+    ]
+    manifest_hashes = [
+        _sha256_value(
+            item.get("gray_file_sha256"),
+            f"items[{index}].gray_file_sha256",
+        )
+        for index, item in enumerate(items)
+    ]
+    if manifest_ids != selected_ids:
+        raise ValueError(
+            "score manifest item IDs do not exactly match the selected official split"
+        )
+    if manifest_hashes != selected_hashes:
+        raise ValueError(
+            "score manifest image hashes do not exactly match the selected official split"
+        )
+
+    raw_target_record = payload.get("target_dataset_record")
+    if raw_target_record is None:
+        raise KeyError("score manifest schema_version=3 is missing target_dataset_record")
+    target_record = validate_dataset_record(
+        raw_target_record,
+        require_source_name=False,
+        require_training_artifact=False,
+    )
+    target_expected = {
+        "split_sha256": selected["split_sha256"],
+        "num_samples": selected["num_images"],
+        "ordered_sample_ids_sha256": selected["ids_sha256"],
+        "split_image_artifact_sha256": selected["split_image_artifact_sha256"],
+        "split_image_artifact_items": selected["items"],
+    }
+    for field, expected in target_expected.items():
+        if target_record[field] != expected:
+            raise ValueError(
+                f"target_dataset_record {field} disagrees with split_contract"
+            )
+
+    # Consumers may copy this result into episode provenance without retaining
+    # attacker-controlled extra fields from the raw JSON mapping.
+    normalised: dict[str, Any] = {
+        "schema_version": SPLIT_CONTRACT_SCHEMA_VERSION,
+        "role": role,
+        "ordered_sample_ids_algorithm": ORDERED_SAMPLE_IDS_ALGORITHM,
+        "split_image_artifact_algorithm": SPLIT_IMAGE_ARTIFACT_ALGORITHM,
+        **selected_fields,
+        "train_test_id_overlap_count": 0,
+        "train_test_id_overlap_ids": [],
+        "train_test_image_content_overlap_count": 0,
+        "train_test_image_content_overlap_sha256_leaves": [],
+        "disjointness_verified": True,
+    }
+    for official_role, record in role_records.items():
+        normalised.update(
+            {
+                f"{official_role}_split_file": record["split_file"],
+                f"{official_role}_split_sha256": record["split_sha256"],
+                f"{official_role}_num_images": record["num_images"],
+                f"{official_role}_ids_sha256": record["ids_sha256"],
+                f"{official_role}_split_image_artifact_sha256": record[
+                    "split_image_artifact_sha256"
+                ],
+                f"{official_role}_split_image_artifact_items": record["items"],
+            }
+        )
+    return normalised
+
+
+def _validate_official_split_record(
+    contract: Mapping[str, Any],
+    role: str,
+    *,
+    manifest_root: Path | None,
+    dataset_root: Path | None,
+) -> dict[str, Any]:
+    prefix = f"{role}_"
+    split_file = _relative_path_value(
+        contract.get(prefix + "split_file"),
+        f"split_contract.{prefix}split_file",
+    )
+    split_sha256 = _sha256_value(
+        contract.get(prefix + "split_sha256"),
+        f"split_contract.{prefix}split_sha256",
+    )
+    num_images = _exact_integer(
+        contract.get(prefix + "num_images"),
+        f"split_contract.{prefix}num_images",
+        minimum=1,
+    )
+    ids_sha256 = _sha256_value(
+        contract.get(prefix + "ids_sha256"),
+        f"split_contract.{prefix}ids_sha256",
+    )
+    artifact_sha256 = _sha256_value(
+        contract.get(prefix + "split_image_artifact_sha256"),
+        f"split_contract.{prefix}split_image_artifact_sha256",
+    )
+    raw_items = contract.get(prefix + "split_image_artifact_items")
+    if not isinstance(raw_items, (list, tuple)) or len(raw_items) != num_images:
+        raise ValueError(
+            f"split_contract {prefix}split_image_artifact_items must contain "
+            f"exactly {num_images} records"
+        )
+    items: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    artifact_digest = hashlib.sha256()
+    _update_frame(artifact_digest, SPLIT_IMAGE_ARTIFACT_ALGORITHM)
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, Mapping):
+            raise TypeError(
+                f"split_contract {prefix}split_image_artifact_items[{index}] "
+                "must be a mapping"
+            )
+        sample_id = _nonempty_string(
+            raw_item.get("sample_id"),
+            f"split_contract.{prefix}items[{index}].sample_id",
+        )
+        if sample_id in seen_ids:
+            raise ValueError(f"split_contract {role} contains duplicate sample IDs")
+        seen_ids.add(sample_id)
+        image_sha256 = _sha256_value(
+            raw_item.get("image_sha256"),
+            f"split_contract.{prefix}items[{index}].image_sha256",
+        )
+        _update_frame(artifact_digest, sample_id)
+        _update_frame(artifact_digest, image_sha256)
+        items.append({"sample_id": sample_id, "image_sha256": image_sha256})
+    sample_ids = [item["sample_id"] for item in items]
+    if ordered_sample_ids_sha256(sample_ids) != ids_sha256:
+        raise ValueError(f"split_contract {role} ordered sample-ID SHA-256 mismatch")
+    if artifact_digest.hexdigest() != artifact_sha256:
+        raise ValueError(f"split_contract {role} split-image artifact SHA-256 mismatch")
+
+    if manifest_root is not None:
+        path = _resolve_path(manifest_root, split_file)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"score split_contract references missing {role} split file: {path}"
+            )
+        before = sha256_file(path)
+        if before != split_sha256:
+            raise ValueError(f"score split_contract {role} split-file SHA-256 mismatch")
+        entries = read_split_entries(path)
+        actual_ids = [sample_id_from_entry(entry) for entry in entries]
+        after = sha256_file(path)
+        if after != before:
+            raise RuntimeError(f"official split file changed while verified: {path}")
+        if actual_ids != sample_ids:
+            raise ValueError(
+                f"score split_contract {role} IDs do not match the frozen split file"
+            )
+        if dataset_root is None:
+            raise RuntimeError("dataset_root is required for split-content replay")
+        actual_hashes = []
+        for entry in entries:
+            image_path = resolve_sample_file(
+                dataset_root,
+                "images",
+                entry,
+                kind="image",
+            )
+            actual_hashes.append(sha256_file(image_path))
+        embedded_hashes = [item["image_sha256"] for item in items]
+        if actual_hashes != embedded_hashes:
+            raise ValueError(
+                f"score split_contract {role} image hashes do not match the "
+                "actual official split images"
+            )
+
+    return {
+        "split_file": split_file,
+        "split_sha256": split_sha256,
+        "num_images": num_images,
+        "ids_sha256": ids_sha256,
+        "split_image_artifact_sha256": artifact_sha256,
+        "items": items,
+        "sample_ids": sample_ids,
+        "image_sha256s": [item["image_sha256"] for item in items],
+    }
 
 
 def _verify_selected_item(
@@ -258,6 +630,12 @@ def _verify_selected_item(
             float(probability.min()) < 0.0 or float(probability.max()) > 1.0
         ):
             raise ValueError(f"score NPZ prob is outside [0, 1]: {score_path}")
+        declared_dtype = manifest.get("score_dtype")
+        if declared_dtype is not None and str(probability.dtype) != str(declared_dtype):
+            raise ValueError(
+                f"score NPZ prob dtype disagrees with manifest for {image_id!r}: "
+                f"{probability.dtype} != {declared_dtype}"
+            )
         if "image_id" not in score_payload:
             raise KeyError(f"score NPZ is missing 'image_id': {score_path}")
         stored_id = _npz_scalar_string(score_payload["image_id"], "image_id", score_path)
@@ -336,10 +714,21 @@ def _verify_native_manifest_contract(
             "score manifest threshold_semantics must equal "
             f"{STRICT_THRESHOLD_SEMANTICS!r}"
         )
+    if payload.get("extreme_tail_precision_verified") is True:
+        if payload.get("score_dtype") != "float64":
+            raise ValueError(
+                "extreme-tail precision requires score_dtype='float64'"
+            )
+        if payload.get("sigmoid_compute_dtype") != "float64":
+            raise ValueError(
+                "extreme-tail precision requires sigmoid_compute_dtype='float64'"
+            )
     if allow_legacy_combined_diagnostic:
         return
-    if payload.get("schema_version") != 2:
-        raise ValueError("verified label-free score manifest schema_version must equal 2")
+    if payload.get("schema_version") not in {2, SCORE_MANIFEST_SCHEMA_VERSION}:
+        raise ValueError(
+            "verified label-free score manifest schema_version must equal 2 or 3"
+        )
     if payload.get("artifact_type") != "label_free_score_export":
         raise ValueError(
             "verified score manifest artifact_type must be 'label_free_score_export'"
@@ -435,6 +824,56 @@ def _nonempty_string(value: object, name: str) -> str:
     if not result:
         raise ValueError(f"{name} must be non-empty")
     return result
+
+
+def _relative_path_value(value: object, name: str) -> str:
+    rendered = _nonempty_string(value, name)
+    if Path(rendered).expanduser().is_absolute():
+        raise ValueError(f"{name} must be relative to the manifest directory")
+    return rendered
+
+
+def _exact_integer(value: object, name: str, *, minimum: int) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be an integer")
+    try:
+        result = int(value)
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be an integer") from error
+    if not np.isfinite(numeric) or numeric != float(result) or result < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return result
+
+
+def _string_list(value: object, name: str) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{name} must be an ordered list")
+    result = [
+        _nonempty_string(item, f"{name}[{index}]")
+        for index, item in enumerate(value)
+    ]
+    if result != sorted(set(result)):
+        raise ValueError(f"{name} must be sorted and unique")
+    return result
+
+
+def _sha256_list(value: object, name: str) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{name} must be an ordered list")
+    result = [
+        _sha256_value(item, f"{name}[{index}]")
+        for index, item in enumerate(value)
+    ]
+    if result != sorted(set(result)):
+        raise ValueError(f"{name} must be sorted and unique")
+    return result
+
+
+def _update_frame(digest: Any, value: str) -> None:
+    encoded = str(value).encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+    digest.update(encoded)
 
 
 def _sha256_value(value: object, name: str) -> str:

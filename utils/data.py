@@ -11,16 +11,21 @@ import random
 import shutil
 from glob import glob
 
+from data_ext.mask_alignment import align_mask_to_image
+
 
 class IRSTD_Dataset(Data.Dataset):
     def __init__(self, args, mode='train'):
         
         dataset_dir = args.dataset_dir
 
+        mode_split_file = getattr(args, '{}_split_file'.format(mode), None)
+        if mode_split_file is None:
+            mode_split_file = getattr(args, 'split_file', None)
         self.list_dir = self._find_split_file(
             dataset_dir,
             mode,
-            getattr(args, 'split_file', None),
+            mode_split_file,
         )
         self.imgs_dir = osp.join(dataset_dir, 'images')
         self.label_dir = osp.join(dataset_dir, 'masks')
@@ -42,12 +47,15 @@ class IRSTD_Dataset(Data.Dataset):
         img_path = self._resolve_image_path(self.imgs_dir, name)
         label_path = self._resolve_mask_path(self.label_dir, name)
 
-        img = Image.open(img_path).convert('RGB')
-        mask = Image.open(label_path)
+        with Image.open(img_path) as image_file:
+            img = image_file.convert('RGB')
+        with Image.open(label_path) as mask_file:
+            mask = mask_file.convert('L')
+        mask = align_mask_to_image(mask, img, name)
 
         if self.mode == 'train':
             img, mask = self._sync_transform(img, mask)
-        elif self.mode == 'val':
+        elif self.mode in ('val', 'test'):
             img, mask = self._testval_sync_transform(img, mask)
         else:
             raise ValueError("Unkown self.mode")
@@ -77,6 +85,9 @@ class IRSTD_Dataset(Data.Dataset):
             ]
             pattern = osp.join(dataset_dir, 'img_idx', 'train*.txt')
         elif mode == 'val':
+            candidates = [osp.join(dataset_dir, 'val.txt')]
+            pattern = osp.join(dataset_dir, 'img_idx', 'val*.txt')
+        elif mode == 'test':
             candidates = [osp.join(dataset_dir, 'test.txt')]
             pattern = osp.join(dataset_dir, 'img_idx', 'test*.txt')
         else:

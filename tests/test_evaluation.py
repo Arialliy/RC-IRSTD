@@ -28,6 +28,8 @@ from data_ext.label_manifest_artifacts import (
     LABEL_MANIFEST_SCHEMA_VERSION,
     label_manifest_content_sha256,
 )
+from data_ext.mask_alignment import align_mask_to_image
+from data_ext.score_manifest_artifacts import verify_score_manifest_artifacts
 from data_ext.split_utils import resolve_image_and_mask, resolve_split_file
 from evaluation.budget_metrics import compute_budget_metrics
 from evaluation.component_matching import match_components
@@ -59,7 +61,11 @@ try:
         sample_meta_from_batch,
     )
     from data_ext.eval_dataset import IRSTDEvalDataset
-    from evaluation.export_score_maps import checkpoint_provenance, export_score_maps
+    from evaluation.export_score_maps import (
+        checkpoint_provenance,
+        export_score_maps,
+        high_precision_sigmoid,
+    )
 
     HAS_TORCH_STACK = True
 except ModuleNotFoundError:
@@ -70,6 +76,16 @@ requires_torch = pytest.mark.skipif(
     not HAS_TORCH_STACK,
     reason="PyTorch/torchvision evaluation stack is not installed",
 )
+
+
+@requires_torch
+def test_float64_sigmoid_preserves_extreme_logit_order() -> None:
+    logits = torch.tensor([18.0, 19.0], dtype=torch.float32)
+    saturated = torch.sigmoid(logits)
+    precise = high_precision_sigmoid(logits)
+    assert saturated[0] == saturated[1]
+    assert precise.dtype == torch.float64
+    assert precise[0] < precise[1] < 1.0
 
 
 def _make_nuaa_style_dataset(root: Path) -> Path:
@@ -87,6 +103,20 @@ def _make_nuaa_style_dataset(root: Path) -> Path:
         encoding="utf-8",
     )
     return root
+
+
+def _add_disjoint_official_train_split(root: Path) -> None:
+    with Image.open(root / "images" / "Misc_1.png") as image_file:
+        train_image = np.asarray(image_file.convert("RGB")).copy()
+    train_image[0, 0] = (17, 31, 47)
+    Image.fromarray(train_image).save(root / "images" / "Misc_train.png")
+    with Image.open(root / "masks" / "Misc_1_pixels0.png") as mask_file:
+        mask = np.asarray(mask_file).copy()
+    Image.fromarray(mask).save(root / "masks" / "Misc_train_pixels0.png")
+    (root / "img_idx" / "train_NUAA-SIRST.txt").write_text(
+        "Misc_train.png\n",
+        encoding="utf-8",
+    )
 
 
 def _fake_source_record(source_name: str, identity_hex: str) -> dict[str, object]:
@@ -262,6 +292,17 @@ def test_training_source_records_are_ordered_and_reject_dataset_aliases(
         )
 
 
+@requires_torch
+def test_formal_trainer_rejects_source_test_contamination(tmp_path: Path) -> None:
+    from scripts.train_multisource_tail import audited_source_train_split
+
+    root = _make_nuaa_style_dataset(tmp_path / "NUAA-SIRST")
+    contaminated = root / "trainval.txt"
+    contaminated.write_text("Misc_1.png\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="overlaps the official test split"):
+        audited_source_train_split(root, contaminated)
+
+
 def test_score_manifest_content_hash_is_ordered_and_fail_closed() -> None:
     items = [
         {
@@ -333,6 +374,13 @@ def test_nuaa_mismatched_mask_is_aligned_to_image_canvas(tmp_path: Path) -> None
     assert meta.transform.original_hw == (4, 8)
     assert meta.mask_original_hw == (8, 16)
     assert tuple(dataset.load_original_mask(0).shape) == (1, 4, 8)
+
+
+def test_mask_alignment_rejects_true_aspect_ratio_mismatch() -> None:
+    image = Image.new("RGB", (8, 4))
+    mask = Image.new("L", (8, 8))
+    with pytest.raises(ValueError, match="aspect-ratio mismatch"):
+        align_mask_to_image(mask, image, "wrong_pair")
 
 
 @requires_torch
@@ -417,9 +465,14 @@ def test_export_manifest_binds_dataset_and_score_gray_content(
     exporter_module = importlib.import_module("evaluation.export_score_maps")
     target = _make_nuaa_style_dataset(tmp_path / "NUAA-SIRST")
     source = _make_nuaa_style_dataset(tmp_path / "SOURCE-data")
+    _add_disjoint_official_train_split(target)
+    _add_disjoint_official_train_split(source)
     source_image = np.zeros((4, 8, 3), dtype=np.uint8)
     source_image[0, 0] = 255
     Image.fromarray(source_image).save(source / "images" / "Misc_1.png")
+    source_train_image = np.zeros((4, 8, 3), dtype=np.uint8)
+    source_train_image[0, 1] = 251
+    Image.fromarray(source_train_image).save(source / "images" / "Misc_train.png")
     source_record = build_dataset_record(
         source,
         resolve_split_file(source, "test"),
@@ -484,8 +537,85 @@ def test_export_manifest_binds_dataset_and_score_gray_content(
     assert item["gray_file_sha256"] == sha256_file(original_image)
     with np.load(output / item["file"], allow_pickle=False) as score_payload:
         assert "prob" in score_payload
+        assert score_payload["prob"].dtype == np.float64
         assert "mask" not in score_payload
+    assert manifest["score_dtype"] == "float64"
+    assert manifest["sigmoid_compute_dtype"] == "float64"
+    assert manifest["extreme_tail_precision_verified"] is True
     assert manifest["labels_embedded"] is False
+    assert manifest["schema_version"] == 3
+    split_contract = manifest["split_contract"]
+    assert split_contract["role"] == "official_test"
+    assert split_contract["selected_num_images"] == 1
+    assert split_contract["official_train_num_images"] == 1
+    assert split_contract["official_test_num_images"] == 1
+    assert split_contract["train_test_id_overlap_count"] == 0
+    assert split_contract["train_test_image_content_overlap_count"] == 0
+    assert split_contract["disjointness_verified"] is True
+    verified_test = verify_score_manifest_artifacts(
+        output / "manifest.json",
+        required_split_role="official_test",
+    )
+    assert verified_test.split_role == "official_test"
+    assert verified_test.legacy_final_evaluation_only is False
+    with pytest.raises(ValueError, match="cannot satisfy required role"):
+        verify_score_manifest_artifacts(
+            output / "manifest.json",
+            required_split_role="official_train",
+        )
+
+    # Training score export requires an explicit role as well as split name.
+    with pytest.raises(ValueError, match="split_role='official_train'"):
+        export_score_maps(
+            dataset_dir=target,
+            weight_path=checkpoint,
+            output_dir=tmp_path / "implicit-train-scores",
+            base_size=16,
+            split="train",
+            device="cpu",
+        )
+    train_output = tmp_path / "train-scores"
+    train_manifest = export_score_maps(
+        dataset_dir=target,
+        weight_path=checkpoint,
+        output_dir=train_output,
+        base_size=16,
+        split="train",
+        split_role="official_train",
+        device="cpu",
+    )
+    assert train_manifest["split_contract"]["role"] == "official_train"
+    assert train_manifest["items"][0]["image_id"] == "Misc_train"
+    verified_train = verify_score_manifest_artifacts(
+        train_output / "manifest.json",
+        required_split_role="official_train",
+    )
+    assert verified_train.split_role == "official_train"
+
+    # Role-less v2 remains readable only without a claim-bearing role gate.
+    legacy_path = output / "legacy-manifest.json"
+    legacy_payload = dict(manifest)
+    legacy_payload["schema_version"] = 2
+    legacy_payload.pop("split_contract")
+    legacy_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    legacy = verify_score_manifest_artifacts(legacy_path)
+    assert legacy.split_role is None
+    assert legacy.legacy_final_evaluation_only is True
+    with pytest.raises(ValueError, match="final-test-evaluation-only"):
+        verify_score_manifest_artifacts(
+            legacy_path,
+            required_split_role="official_train",
+        )
+
+    tampered_path = output / "tampered-split-manifest.json"
+    tampered_payload = json.loads(json.dumps(manifest))
+    tampered_payload["split_contract"]["train_test_id_overlap_count"] = 1
+    tampered_path.write_text(json.dumps(tampered_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="sample-ID overlap audit mismatch"):
+        verify_score_manifest_artifacts(
+            tampered_path,
+            required_split_role="official_test",
+        )
 
     from data_ext.label_manifest_artifacts import (
         load_label_mask,
@@ -589,7 +719,48 @@ def test_export_manifest_binds_dataset_and_score_gray_content(
     assert collision_manifest["logical_target_exclusion_verified"] is True
     assert collision_manifest["target_identity_exclusion_verified"] is False
     assert collision_manifest["target_exclusion_verified"] is False
-    assert collision_manifest["target_identity_collision_audit"]["collision_count"] == 1
+    assert collision_manifest["target_identity_collision_audit"]["collision_count"] == 2
+
+    # The verifier replays raw bytes for both official splits, including the
+    # unselected train split of this official-test export.
+    changed_train = np.zeros((4, 8, 3), dtype=np.uint8)
+    changed_train[0, 2] = 199
+    Image.fromarray(changed_train).save(target / "images" / "Misc_train.png")
+    with pytest.raises(ValueError, match="official_train image hashes"):
+        verify_score_manifest_artifacts(
+            output / "manifest.json",
+            required_split_role="official_test",
+        )
+
+
+@requires_torch
+@pytest.mark.parametrize("overlap_kind", ("sample_id", "image_content"))
+def test_exporter_rejects_official_train_test_contamination(
+    tmp_path: Path,
+    overlap_kind: str,
+) -> None:
+    target = _make_nuaa_style_dataset(tmp_path / "NUAA-SIRST")
+    _add_disjoint_official_train_split(target)
+    if overlap_kind == "sample_id":
+        (target / "img_idx" / "train_NUAA-SIRST.txt").write_text(
+            "Misc_1.png\n",
+            encoding="utf-8",
+        )
+        expected = "sample-ID overlap=1"
+    else:
+        shutil.copyfile(
+            target / "images" / "Misc_1.png",
+            target / "images" / "Misc_train.png",
+        )
+        expected = "raw-image-content overlap=1"
+    with pytest.raises(ValueError, match=expected):
+        export_score_maps(
+            dataset_dir=target,
+            weight_path=tmp_path / "unused.pt",
+            output_dir=tmp_path / f"scores-{overlap_kind}",
+            base_size=16,
+            device="cpu",
+        )
 
 
 @requires_torch
@@ -652,6 +823,21 @@ def test_centroid_matching_is_one_to_one() -> None:
     assert result.num_tp_objects == 2
     assert result.num_fp_components == 0
     assert result.num_fp_pixels == 2
+
+
+def test_component_false_alarms_can_increase_when_threshold_tightens() -> None:
+    scores = np.asarray(
+        [[0.0, 0.0, 0.0], [0.9, 0.2, 0.9], [0.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    target = np.zeros_like(scores, dtype=np.uint8)
+    loose = match_components(scores > 0.1, target, rule="overlap")
+    strict = match_components(scores > 0.5, target, rule="overlap")
+
+    assert loose.num_fp_pixels == 3
+    assert strict.num_fp_pixels == 2
+    assert loose.num_fp_components == 1
+    assert strict.num_fp_components == 2
 
 
 def test_threshold_sweep_has_explicit_endpoints_and_monotone_pixel_fa() -> None:
@@ -936,15 +1122,32 @@ def test_rejection_aware_dual_budget_metrics() -> None:
 
 def _write_adapter_replay_fixture(
     tmp_path: Path,
+    *,
+    reject_bias: float = -2.0,
 ) -> tuple[Path, dict[str, object], Path, Path]:
     score_dir = tmp_path / "scores"
     score_dir.mkdir()
-    context_gray = score_dir / "context.png"
-    query_gray = score_dir / "query.png"
+    dataset_root = tmp_path / "TARGET"
+    (dataset_root / "images").mkdir(parents=True)
+    (dataset_root / "img_idx").mkdir()
+    context_gray = dataset_root / "images" / "context.png"
+    query_gray = dataset_root / "images" / "query.png"
+    train_gray = dataset_root / "images" / "train.png"
     Image.fromarray(np.zeros((2, 2), dtype=np.uint8), mode="L").save(context_gray)
     Image.fromarray(
         np.asarray([[255, 128], [32, 64]], dtype=np.uint8), mode="L"
     ).save(query_gray)
+    Image.fromarray(
+        np.asarray([[3, 17], [101, 203]], dtype=np.uint8), mode="L"
+    ).save(train_gray)
+    (dataset_root / "img_idx" / "train_TARGET.txt").write_text(
+        "train.png\n",
+        encoding="utf-8",
+    )
+    (dataset_root / "img_idx" / "test_TARGET.txt").write_text(
+        "context.png\nquery.png\n",
+        encoding="utf-8",
+    )
     np.savez_compressed(
         score_dir / "context.npz",
         prob=np.zeros((2, 2), dtype=np.float32),
@@ -965,7 +1168,7 @@ def _write_adapter_replay_fixture(
             "image_id": "context",
             "file": "context.npz",
             "score_file_sha256": sha256_file(score_dir / "context.npz"),
-            "image_path": "context.png",
+            "image_path": "../TARGET/images/context.png",
             "gray_file_sha256": sha256_file(context_gray),
             "original_hw": [2, 2],
         },
@@ -973,19 +1176,36 @@ def _write_adapter_replay_fixture(
             "image_id": "query",
             "file": "query.npz",
             "score_file_sha256": sha256_file(score_dir / "query.npz"),
-            "image_path": "query.png",
+            "image_path": "../TARGET/images/query.png",
             "gray_file_sha256": sha256_file(query_gray),
             "original_hw": [2, 2],
         },
     ]
+    from data_ext.inference_dataset import IRSTDInferenceDataset
+    from evaluation.export_score_maps import build_official_split_contract
+
+    inference_dataset = IRSTDInferenceDataset(
+        dataset_root,
+        base_size=16,
+        split="test",
+    )
+    split_contract, target_dataset_record = build_official_split_contract(
+        inference_dataset,
+        split_role="official_test",
+        manifest_root=score_dir,
+    )
     manifest_path = score_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "artifact_type": "label_free_score_export",
                 "path_anchor": "manifest_directory",
                 "target_dataset": "TARGET",
+                "target_dataset_record": target_dataset_record,
+                "split_contract": split_contract,
+                "dataset_dir": "../TARGET",
+                "split_file": split_contract["selected_split_file"],
                 "weight_sha256": detector_sha,
                 "outer_fold_id": "fold-target",
                 "outer_target": "TARGET",
@@ -1060,7 +1280,12 @@ def _write_adapter_replay_fixture(
     from rc.domain_statistics import BASE_FEATURE_DIM, FEATURE_NAMES
     from rc.meta_dataset import FeatureStandardizer
     from rc.online_adapter import main as online_adapter_main
-    from rc.schema import SourceContract, SourceReference, StatisticsConfig
+    from rc.schema import (
+        DeploymentProtocolContract,
+        SourceContract,
+        SourceReference,
+        StatisticsConfig,
+    )
 
     config = StatisticsConfig(peak_kernel_size=3, peak_min_score=0.05)
     contract = SourceContract(
@@ -1096,7 +1321,12 @@ def _write_adapter_replay_fixture(
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
-        model.reject_head.bias.fill_(-2.0)
+        model.reject_head.bias.fill_(reject_bias)
+    deployment_protocol_contract = DeploymentProtocolContract(
+        context_size=1,
+        query_size=1,
+        reject_cutoff=0.5,
+    )
     checkpoint_path = tmp_path / "calibrator.pt"
     torch.save(
         {
@@ -1140,6 +1370,7 @@ def _write_adapter_replay_fixture(
             "deployment_held_out_domains": ["TARGET"],
             "deployment_protocol_scope": "multi_source_protocol_candidate",
             "deployment_source_reference": reference.to_dict(),
+            "deployment_protocol_contract": deployment_protocol_contract.to_dict(),
             "reject_probability": 0.5,
         },
         checkpoint_path,
@@ -1247,12 +1478,15 @@ def test_rejected_adapter_has_no_fabricated_metrics_and_summary_is_coverage_awar
         calibrator_checkpoint=checkpoint_path,
         label_manifest=label_manifest_path,
     )
-    adapter["reject_cutoff"] = 0.0
-    adapter["reject"] = True
+    rejected_root = tmp_path / "genuine-rejection"
+    rejected_root.mkdir()
+    rejected_manifest, rejected_adapter, rejected_checkpoint, _ = (
+        _write_adapter_replay_fixture(rejected_root, reject_bias=2.0)
+    )
     rejected = evaluate_adapter_output(
-        adapter,
-        manifest_path,
-        calibrator_checkpoint=checkpoint_path,
+        rejected_adapter,
+        rejected_manifest,
+        calibrator_checkpoint=rejected_checkpoint,
         # The rejected branch must not resolve or open any label artifact.
         label_manifest=tmp_path / "intentionally-missing-label-manifest.json",
     )
@@ -1266,6 +1500,83 @@ def test_rejected_adapter_has_no_fabricated_metrics_and_summary_is_coverage_awar
     assert summary["covered_pd"] == pytest.approx(1.0)
     assert summary["covered_tp_objects"] == 1
     assert summary["covered_gt_objects"] == 1
+
+
+def test_adapter_replay_rejects_final_target_cutoff_tampering(tmp_path: Path) -> None:
+    manifest_path, adapter, checkpoint_path, label_manifest_path = (
+        _write_adapter_replay_fixture(tmp_path)
+    )
+    adapter["reject_cutoff"] = 0.0
+    adapter["reject"] = True
+    with pytest.raises(ValueError, match="deterministic calibrator replay"):
+        evaluate_adapter_output(
+            adapter,
+            manifest_path,
+            calibrator_checkpoint=checkpoint_path,
+            label_manifest=label_manifest_path,
+        )
+
+
+def test_adapter_evaluation_rejects_matching_contract_override(tmp_path: Path) -> None:
+    manifest_path, adapter, checkpoint_path, label_manifest_path = (
+        _write_adapter_replay_fixture(tmp_path)
+    )
+    with pytest.raises(ValueError, match="requested matching_rule differs"):
+        evaluate_adapter_output(
+            adapter,
+            manifest_path,
+            calibrator_checkpoint=checkpoint_path,
+            label_manifest=label_manifest_path,
+            matching_rule="centroid",
+        )
+
+
+def test_adapter_replay_rejects_coordinated_matching_contract_tampering(
+    tmp_path: Path,
+) -> None:
+    manifest_path, adapter, checkpoint_path, label_manifest_path = (
+        _write_adapter_replay_fixture(tmp_path)
+    )
+    tampered = json.loads(json.dumps(adapter))
+    tampered["evaluation_contract"]["matching_rule"] = "centroid"
+    tampered["decision_contract"]["evaluation_matching"][
+        "matching_rule"
+    ] = "centroid"
+    tampered["deployment_protocol_contract"]["evaluation_matching"][
+        "matching_rule"
+    ] = "centroid"
+    with pytest.raises(ValueError, match="deterministic calibrator replay"):
+        evaluate_adapter_output(
+            tampered,
+            manifest_path,
+            calibrator_checkpoint=checkpoint_path,
+            label_manifest=label_manifest_path,
+        )
+
+
+def test_adapter_evaluation_cli_rejects_matching_contract_override(
+    tmp_path: Path,
+) -> None:
+    manifest_path, adapter, checkpoint_path, label_manifest_path = (
+        _write_adapter_replay_fixture(tmp_path)
+    )
+    adapter_path = tmp_path / "adapter.json"
+    adapter_path.write_text(json.dumps(adapter), encoding="utf-8")
+    with pytest.raises(ValueError, match="requested matching_rule differs"):
+        evaluate_adapter_main(
+            [
+                "--adapter-output",
+                str(adapter_path),
+                "--score-manifest",
+                str(manifest_path),
+                "--calibrator-checkpoint",
+                str(checkpoint_path),
+                "--label-manifest",
+                str(label_manifest_path),
+                "--matching-rule",
+                "centroid",
+            ]
+        )
 
 
 def test_adapter_replay_cli_writes_json(tmp_path: Path) -> None:
