@@ -3,7 +3,7 @@
 > **仓库**：`https://github.com/Arialliy/RC-IRSTD`
 > **日期**：2026-07-15
 > **方法版本**：Two-Stage / No-Reject / schema-v4 / v5 calibrator
-> **当前结论**：**RC1 D0 因旧 SLS 实现偏差已标记 implementation-invalid；RC2 修复已完成预发布 CPU 验证，Stage 1 仅在新 commit、tag、归档和 sealed preflight 通过后 GO。Stage 2 仅 synthetic/engineering smoke GO；三域真实 Stage 2 训练、正式主实验与 AAAI 结论 NO-GO。**
+> **当前结论**：**RC1 D0 因旧 SLS 实现偏差已标记 implementation-invalid；RC2 sealed preflight 因 split manifest 键顺序不可字节重放而失败；RC3 已修正并等待 clean-release sealed preflight。Stage 1 仅在 RC3 全部通过后 GO。Stage 2 仅 synthetic/engineering smoke GO；三域真实 Stage 2 训练、正式主实验与 AAAI 结论 NO-GO。**
 
 ---
 
@@ -16,7 +16,8 @@
 - Stage 1 的域级目标下尾—背景上尾间隔、GT 邻域排除和确定性 plateau collapse 已接入；
 - Stage 2 的完整预算单调曲线、无 Reject v5 模型、query-risk-aligned loss、schema-v4 grouped episodes、checkpoint 审计和原分辨率 exact replay 已形成代码闭环；
 - RC1 sealed preflight 为 `PASS`：226 tests、10 subtests；但该测试集没有覆盖 strict Stage-1 入口误绑旧 SLS 的空目标语义，因此不能挽救已失效的 RC1 性能运行；
-- RC2 预发布 CPU 全量回归为 244 passed、10 subtests、1 个预期 CUDA skip；GPU 0/1/2 smoke 与 clean-release sealed preflight 仍须在 tag/archive 后重跑；
+- RC2 sealed preflight 已通过 GPU 0/1/2、compile 和 245 tests/10 subtests，但在 frozen split manifest 字节重放处 fail-closed，因此 RC2 未获训练授权；
+- RC3 已修正唯一的 JSON 键顺序差异；预发布 CPU 为 244 passed/10 subtests，D0/D3 的 GPU 0/1/2 DataParallel smoke 均 finite，仍须创建新 tag/archive 并从头重跑 clean-release sealed preflight；
 - 历史 engineering smoke 的最小训练 → checkpoint → 重载 → 无标签前缀适配 → CPU 阈值复算 → 标签后读 exact replay 闭环通过；该 smoke 不参与本轮模型选择或性能 Gate。
 
 当前已有一次真实训练尝试：
@@ -35,7 +36,7 @@ RC1 D0 all-three：完整 epoch 0--5；epoch 6 中受控停止
 AAAI 主张成立。
 ```
 
-RC1 失效证据和 RC2 修复合同见：
+RC1 失效证据和 RC3 修复合同见：
 
 ```text
 docs/AAAI27_RC1_SLS_IMPLEMENTATION_INVALID.md
@@ -44,9 +45,9 @@ docs/AAAI27_RC1_SLS_IMPLEMENTATION_INVALID.md
 下一步按以下唯一顺序推进：
 
 ```text
-完成 RC2 全量验证并冻结工作树与实验契约
+完成 RC3 全量验证并冻结工作树与实验契约
 → 完成并冻结近重复隔离、数据契约与分析计划
-→ RC2 Stage 1 从 epoch 0 单 seed、30 epoch 性能 Gate
+→ RC3 Stage 1 从 epoch 0 单 seed、30 epoch 性能 Gate
 → Gate 通过后扩展 3 seeds
 → 新增至少第 4 个独立域
 → 启动合法的 Stage 2 outer-fold pilot
@@ -59,7 +60,7 @@ docs/AAAI27_RC1_SLS_IMPLEMENTATION_INVALID.md
 
 ### 1.1 已确认的工程证据
 
-RC1 sealed preflight（仅作历史工程证据，不能替代 RC2 最终冻结）：
+RC1 sealed preflight（仅作历史工程证据，不能替代 RC3 最终冻结）：
 
 ```text
 outputs/preflight/aaai27_20260714_stage1_pilot_sealed_rc1_final/
@@ -284,7 +285,7 @@ git add .
 git diff --name-only
 git add <explicit-source-files> <explicit-config-files> <explicit-doc-files>
 git commit -m "freeze: AAAI27 two-stage no-reject experiment candidate"
-git tag aaai27-rc-irstd-v5-rc2
+git tag aaai27-rc-irstd-v5-rc3
 ```
 
 生成代码归档：
@@ -294,12 +295,12 @@ mkdir -p outputs/release
 
 git archive \
   --format=zip \
-  --output outputs/release/RC-IRSTD_v5_rc2.zip \
-  aaai27-rc-irstd-v5-rc2
+  --output outputs/release/RC-IRSTD_v5_rc3.zip \
+  aaai27-rc-irstd-v5-rc3
 
 sha256sum \
-  outputs/release/RC-IRSTD_v5_rc2.zip \
-  > outputs/release/RC-IRSTD_v5_rc2.zip.sha256
+  outputs/release/RC-IRSTD_v5_rc3.zip \
+  > outputs/release/RC-IRSTD_v5_rc3.zip.sha256
 ```
 
 正式运行必须满足：

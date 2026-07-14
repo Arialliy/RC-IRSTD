@@ -165,16 +165,16 @@ if ((require_clean_release)); then
     echo "Clean-release preflight requires an empty Git status" >&2
     exit 1
   fi
-  if ! git tag --points-at HEAD | grep -Fxq 'aaai27-rc-irstd-v5-rc2'; then
-    echo "Clean-release preflight requires tag aaai27-rc-irstd-v5-rc2 at HEAD" >&2
+  if ! git tag --points-at HEAD | grep -Fxq 'aaai27-rc-irstd-v5-rc3'; then
+    echo "Clean-release preflight requires tag aaai27-rc-irstd-v5-rc3 at HEAD" >&2
     exit 1
   fi
-  if [[ ! -s outputs/release/RC-IRSTD_v5_rc2.zip ]] \
-    || [[ ! -s outputs/release/RC-IRSTD_v5_rc2.zip.sha256 ]]; then
+  if [[ ! -s outputs/release/RC-IRSTD_v5_rc3.zip ]] \
+    || [[ ! -s outputs/release/RC-IRSTD_v5_rc3.zip.sha256 ]]; then
     echo "Clean-release preflight requires the source archive and SHA file" >&2
     exit 1
   fi
-  sha256sum -c outputs/release/RC-IRSTD_v5_rc2.zip.sha256 \
+  sha256sum -c outputs/release/RC-IRSTD_v5_rc3.zip.sha256 \
     | tee "$output_dir/source_archive_validation.txt"
 fi
 

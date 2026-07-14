@@ -14,13 +14,13 @@
     },
     "split_manifest": {
       "path": "splits/aaai27_v2/manifest.json",
-      "sha256": "0f378ed10ce98953fa66d9a05e0db3bf71f75351b302b9014a637de95c8d3bfa"
+      "sha256": "ea7aa2eb5e073853cbe2c9f3ec7f45c8b2b823511420617f822bd23d319da8ad"
     }
   },
   "release_contract": {
-    "tag": "aaai27-rc-irstd-v5-rc2",
-    "source_archive": "outputs/release/RC-IRSTD_v5_rc2.zip",
-    "source_archive_sha256_file": "outputs/release/RC-IRSTD_v5_rc2.zip.sha256"
+    "tag": "aaai27-rc-irstd-v5-rc3",
+    "source_archive": "outputs/release/RC-IRSTD_v5_rc3.zip",
+    "source_archive_sha256_file": "outputs/release/RC-IRSTD_v5_rc3.zip.sha256"
   },
   "protocol": {
     "seed": 42,
@@ -161,7 +161,7 @@
         2
       ],
       "data_parallel": true,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D0_all-three_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D0_all-three_s42"
     },
     {
       "run_id": "D3_all-three_s42",
@@ -212,7 +212,7 @@
         2
       ],
       "data_parallel": true,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D3_all-three_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D3_all-three_s42"
     },
     {
       "run_id": "D0_leave-NUAA_s42",
@@ -256,7 +256,7 @@
         0
       ],
       "data_parallel": false,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D0_leave-NUAA_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D0_leave-NUAA_s42"
     },
     {
       "run_id": "D0_leave-NUDT_s42",
@@ -300,7 +300,7 @@
         1
       ],
       "data_parallel": false,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D0_leave-NUDT_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D0_leave-NUDT_s42"
     },
     {
       "run_id": "D0_leave-IRSTD1K_s42",
@@ -344,7 +344,7 @@
         2
       ],
       "data_parallel": false,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D0_leave-IRSTD1K_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D0_leave-IRSTD1K_s42"
     },
     {
       "run_id": "D3_leave-NUAA_s42",
@@ -388,7 +388,7 @@
         0
       ],
       "data_parallel": false,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D3_leave-NUAA_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D3_leave-NUAA_s42"
     },
     {
       "run_id": "D3_leave-NUDT_s42",
@@ -432,7 +432,7 @@
         1
       ],
       "data_parallel": false,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D3_leave-NUDT_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D3_leave-NUDT_s42"
     },
     {
       "run_id": "D3_leave-IRSTD1K_s42",
@@ -476,7 +476,7 @@
         2
       ],
       "data_parallel": false,
-      "output_dir": "outputs/stage1_pilot_30ep_v5_rc2/D3_leave-IRSTD1K_s42"
+      "output_dir": "outputs/stage1_pilot_30ep_v5_rc3/D3_leave-IRSTD1K_s42"
     }
   ]
 }

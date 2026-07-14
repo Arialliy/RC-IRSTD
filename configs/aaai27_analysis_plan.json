@@ -41,7 +41,7 @@
     },
     "stage1_pilot_matrix": {
       "path": "configs/aaai27_stage1_pilot_matrix.json",
-      "sha256": "587a53ba190416f3070f1ae3f46c312c5880da08537c9737557f11140f2b7ac1"
+      "sha256": "b395471efdf1ca1acab4b4001185259af9aa70e92eb80845ca40fa00d7b72335"
     },
     "stage2_config": {
       "path": "configs/aaai27_calibrator_risk_aligned.json",
@@ -49,7 +49,7 @@
     },
     "official_train_split_manifest": {
       "path": "splits/aaai27_v2/manifest.json",
-      "sha256": "0f378ed10ce98953fa66d9a05e0db3bf71f75351b302b9014a637de95c8d3bfa"
+      "sha256": "ea7aa2eb5e073853cbe2c9f3ec7f45c8b2b823511420617f822bd23d319da8ad"
     },
     "near_duplicate_source_audit": {
       "path": "audits/aaai27/near_duplicates_original_official_splits_v2.json",
@@ -65,11 +65,11 @@
     },
     "dataset_contract": {
       "path": "audits/aaai27/dataset_contract_v1.json",
-      "sha256": "0020e3a5bba6fbf9fb6171aae38d60cc70b8a7929005d28adab4dc0b8d384ce1"
+      "sha256": "71c65ca9ee7b03d5eac00ec373e46aee26a61dc3c9de2f9274d01f8b25bc9be9"
     },
     "domain_independence_decision": {
       "path": "audits/aaai27/final_domain_independence_decision_v1.json",
-      "sha256": "7622ea7aeefa29a852e7bcc05f650a27dde18015f8b73848d5151d7e19239a70"
+      "sha256": "e91c6f9a88cb863788a3edad6ecfe37197d7e7e1f321348b62552d4d98fa3632"
     }
   },
   "domains": {

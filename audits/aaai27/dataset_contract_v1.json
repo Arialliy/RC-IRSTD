@@ -49725,6 +49725,6 @@
   "schema_version": "rc-irstd.aaai27-dataset-contract.v1",
   "split_manifest": {
     "path": "splits/aaai27_v2/manifest.json",
-    "sha256": "0f378ed10ce98953fa66d9a05e0db3bf71f75351b302b9014a637de95c8d3bfa"
+    "sha256": "ea7aa2eb5e073853cbe2c9f3ec7f45c8b2b823511420617f822bd23d319da8ad"
   }
 }
