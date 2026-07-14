@@ -26,7 +26,17 @@ from .dataset_identity import (
     sha256_file,
     validate_dataset_record,
 )
-from .split_utils import read_split_entries, resolve_sample_file, sample_id_from_entry
+from .development_split_contract import (
+    DETECTOR_DIAGNOSTIC_ROLE,
+    DEVELOPMENT_SPLIT_CONTRACT_SCHEMA_VERSION,
+    serialise_development_partition_contract,
+    verify_detector_diagnostic_partition,
+)
+from .split_utils import (
+    read_split_entries,
+    resolve_sample_file,
+    sample_id_from_entry,
+)
 
 
 SIGMOID_SCORE_TYPE = "sigmoid_probability"
@@ -34,6 +44,7 @@ STRICT_THRESHOLD_SEMANTICS = "prediction = probability > threshold"
 SCORE_MANIFEST_SCHEMA_VERSION = 3
 SPLIT_CONTRACT_SCHEMA_VERSION = 1
 OFFICIAL_SPLIT_ROLES = ("official_train", "official_test")
+SPLIT_ROLES = (*OFFICIAL_SPLIT_ROLES, DETECTOR_DIAGNOSTIC_ROLE)
 
 
 @dataclass(frozen=True)
@@ -241,10 +252,10 @@ def validate_score_split_contract(
         raise TypeError("score manifest payload must be a mapping")
     if required_split_role is not None:
         required_split_role = str(required_split_role).strip()
-        if required_split_role not in OFFICIAL_SPLIT_ROLES:
+        if required_split_role not in SPLIT_ROLES:
             raise ValueError(
                 "required_split_role must be one of "
-                + ", ".join(OFFICIAL_SPLIT_ROLES)
+                + ", ".join(SPLIT_ROLES)
             )
     raw_schema = payload.get("schema_version")
     if raw_schema is None:
@@ -284,12 +295,21 @@ def validate_score_split_contract(
         "split_contract.schema_version",
         minimum=1,
     )
-    if contract_schema != SPLIT_CONTRACT_SCHEMA_VERSION:
-        raise ValueError("unsupported score split_contract schema_version")
     role = _nonempty_string(contract.get("role"), "split_contract.role")
-    if role not in OFFICIAL_SPLIT_ROLES:
+    if role not in SPLIT_ROLES:
         raise ValueError(
-            "split_contract.role must be 'official_train' or 'official_test'"
+            "split_contract.role must be 'official_train', 'official_test', "
+            "or 'detector_diagnostic'"
+        )
+    expected_contract_schema = (
+        DEVELOPMENT_SPLIT_CONTRACT_SCHEMA_VERSION
+        if role == DETECTOR_DIAGNOSTIC_ROLE
+        else SPLIT_CONTRACT_SCHEMA_VERSION
+    )
+    if contract_schema != expected_contract_schema:
+        raise ValueError(
+            "unsupported score split_contract schema_version for role "
+            f"{role!r}"
         )
     if required_split_role is not None and role != required_split_role:
         raise ValueError(
@@ -362,7 +382,83 @@ def validate_score_split_contract(
     if contract.get("disjointness_verified") is not True:
         raise ValueError("split_contract disjointness_verified must be exactly true")
 
-    selected = role_records[role]
+    raw_target_record = payload.get("target_dataset_record")
+    if raw_target_record is None:
+        raise KeyError("score manifest schema_version=3 is missing target_dataset_record")
+    target_record = validate_dataset_record(
+        raw_target_record,
+        require_source_name=False,
+        require_training_artifact=False,
+    )
+
+    if role == DETECTOR_DIAGNOSTIC_ROLE:
+        derived_manifest_file = _relative_path_value(
+            contract.get("derived_split_manifest_file"),
+            "split_contract.derived_split_manifest_file",
+        )
+        derived_manifest_path = _resolve_path(root, derived_manifest_file)
+        selected_split_file = _relative_path_value(
+            contract.get("selected_split_file"),
+            "split_contract.selected_split_file",
+        )
+        selected_split_path = _resolve_path(root, selected_split_file)
+        verified_development = verify_detector_diagnostic_partition(
+            derived_manifest_path,
+            dataset_name=_nonempty_string(
+                payload.get("target_dataset"), "score manifest target_dataset"
+            ),
+            dataset_root=dataset_root,
+            selected_split_file=selected_split_path,
+            official_train_split=_resolve_path(root, train["split_file"]),
+            official_test_split=_resolve_path(root, test["split_file"]),
+            expected_manifest_sha256=contract.get(
+                "derived_split_manifest_sha256"
+            ),
+        )
+        expected_development = serialise_development_partition_contract(
+            verified_development,
+            path_anchor=root,
+        )
+        for field, expected in expected_development.items():
+            if contract.get(field) != expected:
+                raise ValueError(
+                    f"split_contract development field {field!r} disagrees "
+                    "with the frozen derived split manifest"
+                )
+        _validate_development_target_record(
+            target_record,
+            dataset_root=dataset_root,
+            split_path=selected_split_path,
+            expected_partition=expected_development["derived_partitions"][
+                DETECTOR_DIAGNOSTIC_ROLE
+            ],
+        )
+        selected = {
+            "split_file": selected_split_file,
+            "split_sha256": target_record["split_sha256"],
+            "num_images": target_record["num_samples"],
+            "ids_sha256": target_record["ordered_sample_ids_sha256"],
+            "split_image_artifact_sha256": target_record[
+                "split_image_artifact_sha256"
+            ],
+            "items": target_record["split_image_artifact_items"],
+        }
+        expected_scope_fields = {
+            "partition_scope": expected_development["partition_scope"],
+            "official_test_artifact": False,
+            "final_evaluation_eligible": False,
+            "development_only": True,
+            "source_dataset_assertion_authority": "informational_only",
+            "claim_bearing_final_evaluation": False,
+        }
+        for field, expected in expected_scope_fields.items():
+            if payload.get(field) != expected:
+                raise ValueError(
+                    f"development score manifest {field} must be exactly "
+                    f"{expected!r}"
+                )
+    else:
+        selected = role_records[role]
     selected_fields = {
         "selected_split_file": selected["split_file"],
         "selected_split_sha256": selected["split_sha256"],
@@ -401,14 +497,6 @@ def validate_score_split_contract(
             "score manifest image hashes do not exactly match the selected official split"
         )
 
-    raw_target_record = payload.get("target_dataset_record")
-    if raw_target_record is None:
-        raise KeyError("score manifest schema_version=3 is missing target_dataset_record")
-    target_record = validate_dataset_record(
-        raw_target_record,
-        require_source_name=False,
-        require_training_artifact=False,
-    )
     target_expected = {
         "split_sha256": selected["split_sha256"],
         "num_samples": selected["num_images"],
@@ -425,7 +513,7 @@ def validate_score_split_contract(
     # Consumers may copy this result into episode provenance without retaining
     # attacker-controlled extra fields from the raw JSON mapping.
     normalised: dict[str, Any] = {
-        "schema_version": SPLIT_CONTRACT_SCHEMA_VERSION,
+        "schema_version": contract_schema,
         "role": role,
         "ordered_sample_ids_algorithm": ORDERED_SAMPLE_IDS_ALGORITHM,
         "split_image_artifact_algorithm": SPLIT_IMAGE_ARTIFACT_ALGORITHM,
@@ -449,7 +537,60 @@ def validate_score_split_contract(
                 f"{official_role}_split_image_artifact_items": record["items"],
             }
         )
+    if role == DETECTOR_DIAGNOSTIC_ROLE:
+        normalised.update(expected_development)
     return normalised
+
+
+def _validate_development_target_record(
+    target_record: Mapping[str, Any],
+    *,
+    dataset_root: Path,
+    split_path: Path,
+    expected_partition: object,
+) -> None:
+    """Bind the diagnostic target record to its frozen IDs and image bytes."""
+
+    if not isinstance(expected_partition, Mapping):
+        raise TypeError("canonical detector_diagnostic partition must be a mapping")
+    expected_fields = {
+        "split_sha256": expected_partition.get("split_sha256"),
+        "num_samples": expected_partition.get("num_images"),
+        "ordered_sample_ids_sha256": expected_partition.get("ids_sha256"),
+    }
+    for field, expected in expected_fields.items():
+        if target_record.get(field) != expected:
+            raise ValueError(
+                f"target_dataset_record {field} disagrees with the frozen "
+                "detector_diagnostic partition"
+            )
+    entries = read_split_entries(split_path)
+    items = target_record.get("split_image_artifact_items")
+    if not isinstance(items, list) or len(items) != len(entries):
+        raise ValueError(
+            "target_dataset_record image items do not match detector_diagnostic"
+        )
+    for index, (entry, item) in enumerate(zip(entries, items)):
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                f"target_dataset_record split image item {index} must be a mapping"
+            )
+        image_id = sample_id_from_entry(entry)
+        if item.get("sample_id") != image_id:
+            raise ValueError(
+                "target_dataset_record ordered IDs differ from detector_diagnostic"
+            )
+        image_path = resolve_sample_file(
+            dataset_root,
+            "images",
+            entry,
+            kind="image",
+        )
+        if item.get("image_sha256") != sha256_file(image_path):
+            raise ValueError(
+                "target_dataset_record image hashes differ from the concrete "
+                "detector_diagnostic images"
+            )
 
 
 def _validate_official_split_record(

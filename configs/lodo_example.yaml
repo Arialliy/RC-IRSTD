@@ -1,0 +1,131 @@
+# RC-IRSTD 完整 Nested LODO 配置（静态图像主协议）
+# 所有相对路径以本 YAML 所在目录为基准。
+python: python
+working_directory: ..
+output_root: ../outputs/rc_irstd_nested_lodo
+
+datasets:
+  NUAA-SIRST:
+    path: /data/NUAA-SIRST
+    train_split: train
+    eval_split: test
+    dataset_type: iid_images
+  NUDT-SIRST:
+    path: /data/NUDT-SIRST
+    train_split: train
+    eval_split: test
+    dataset_type: iid_images
+  IRSTD-1K:
+    path: /data/IRSTD-1K
+    train_split: train
+    eval_split: test
+    dataset_type: iid_images
+  SIRST-UAVB:
+    path: /data/SIRST-UAVB
+    train_split: train
+    eval_split: test
+    dataset_type: iid_images
+  RealScene-ISTD:
+    path: /data/RealScene-ISTD
+    train_split: train
+    eval_split: test
+    dataset_type: iid_images
+  NUDT-SIRST-Sea:
+    path: /data/NUDT-SIRST-Sea
+    train_split: train
+    eval_split: test
+    dataset_type: iid_images
+
+outer_targets:
+  - NUAA-SIRST
+  - NUDT-SIRST
+  - IRSTD-1K
+  - SIRST-UAVB
+  - RealScene-ISTD
+  - NUDT-SIRST-Sea
+
+detector:
+  name: mshnet                 # 内置完整 MSHNet；无需外部仓库
+  base_loss: auto              # mshnet -> 内置稳定 SLS
+  resize: [256, 256]
+  normalization: imagenet      # 16 位原图也会先按位深归一化
+  dataset_type: iid_images
+  per_domain_batch: 2
+  epochs: 400
+  warm_epoch: 5
+  optimizer: adagrad
+  lr: 0.05
+  weight_decay: 0.0
+  lambda_tail: 0.10
+  lambda_miss: 0.10
+  auxiliary_weight: 1.0
+  tail_quantile: 0.95
+  miss_quantile: 0.80
+  peak_kernel: 5
+  exclusion_radius: 2
+  worst_gamma: 10.0
+  # detector checkpoint 按以下源域预算工作点选择，而非只按 IoU
+  pixel_budget: 1.0e-5
+  peak_budget: 5.0
+  grad_clip: 5.0
+  val_every: 1
+  save_every: 20
+  num_workers: 4
+  device: cuda
+  amp: true
+  deterministic: true
+  seed: 42
+  # 分数导出/最终评测协议
+  inference_mode: native_pad   # resize | native_pad | tiled
+  restore_original: true
+  stride_multiple: 32
+  tile_size: [512, 512]
+  tile_overlap: 64
+
+episodes:
+  # iid_images: 固定随机排列后的 support/query；不宣称时间因果。
+  # temporal: 真实过去 context -> 未来 horizon。
+  protocol: auto
+  seed: 42
+  context_size: 32
+  horizon: 16
+  train_stride: 16
+  # 正式目标域评测必须 >= context_size + horizon，防止图像重叠。
+  eval_stride: 48
+  peak_min_distance: 2
+  peak_min_score: 0.0
+  peak_border: 0
+  peak_tolerance: 2.0
+  max_candidates: 0
+
+curve:
+  quantile: 0.90
+  hidden_dim: 256
+  dropout: 0.10
+  lambda_peak: 1.0
+  lambda_crossing: 0.25
+  crossing_temperature: 0.25
+  focus_base_weight: 1.0
+  focus_weight: 4.0
+  focus_log_scale: 1.0
+  empty_action_weight: 0.10
+  batch_size: 64
+  epochs: 300
+  lr: 0.001
+  weight_decay: 0.0001
+  val_fraction: 0.20
+  patience: 40
+  num_workers: 0
+  device: cuda
+  seed: 42
+
+budgets:
+  pixel: 1.0e-6
+  peak_per_mp: 1.0
+
+calibration:
+  alpha: 0.10
+  unit: image                  # image = 真正按标注图像数计数
+  sizes: [10, 20, 50]
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  offset_step: 1

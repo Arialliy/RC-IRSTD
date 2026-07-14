@@ -27,6 +27,12 @@ from data_ext.dataset_identity import (
     sha256_file,
     validate_dataset_record,
 )
+from data_ext.development_split_contract import (
+    DETECTOR_DIAGNOSTIC_ROLE,
+    DEVELOPMENT_SPLIT_CONTRACT_SCHEMA_VERSION,
+    serialise_development_partition_contract,
+    verify_detector_diagnostic_partition,
+)
 from data_ext.inference_dataset import IRSTDInferenceDataset
 from data_ext.split_utils import (
     read_split_entries,
@@ -40,6 +46,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCORE_MANIFEST_SCHEMA_VERSION = 3
 SPLIT_CONTRACT_SCHEMA_VERSION = 1
 OFFICIAL_SPLIT_ROLES = ("official_train", "official_test")
+SPLIT_ROLES = (*OFFICIAL_SPLIT_ROLES, DETECTOR_DIAGNOSTIC_ROLE)
 
 
 def select_device(device: str) -> torch.device:
@@ -234,6 +241,16 @@ def checkpoint_provenance(checkpoint: object) -> dict[str, object]:
         raise ValueError(
             "checkpoint detector source count is inconsistent with protocol_scope"
         )
+    outer_fold_id = common["outer_fold_id"]
+    outer_target = common["outer_target"]
+    if not isinstance(outer_fold_id, str) or not outer_fold_id.strip():
+        raise ValueError("checkpoint_verified requires a non-empty outer_fold_id")
+    if not isinstance(outer_target, str) or not outer_target.strip():
+        raise ValueError("checkpoint_verified requires a non-empty outer_target")
+    if outer_target not in held_out:
+        raise ValueError(
+            "checkpoint_verified requires outer_target in held_out_domains"
+        )
     return {
         "provenance_level": "checkpoint_verified",
         **common,
@@ -273,8 +290,10 @@ def build_official_split_contract(
     *,
     split_role: str,
     manifest_root: str | Path,
+    derived_split_manifest: str | Path | None = None,
+    derived_split_manifest_sha256: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Freeze and audit the dataset's official train/test protocol split.
+    """Freeze and audit an official or official-train-derived score split.
 
     ``split_role`` is deliberately independent of the historical ``split``
     argument.  A caller exporting training scores must opt in with
@@ -284,13 +303,31 @@ def build_official_split_contract(
     The returned dataset record is the record for the selected role.  Both
     official records are built from the concrete split files and raw image
     bytes, then reduced to the fields needed to replay the disjointness audit
-    without embedding labels.
+    without embedding labels. ``detector_diagnostic`` is accepted only when
+    ``derived_split_manifest`` names the frozen v2 manifest and
+    ``dataset.split_file`` is the exact path declared there. Matching bytes
+    copied to another path are insufficient.
     """
 
     role = str(split_role).strip()
-    if role not in OFFICIAL_SPLIT_ROLES:
+    if role not in SPLIT_ROLES:
         raise ValueError(
-            "split_role must be one of " + ", ".join(OFFICIAL_SPLIT_ROLES)
+            "split_role must be one of " + ", ".join(SPLIT_ROLES)
+        )
+    if role == DETECTOR_DIAGNOSTIC_ROLE and (
+        derived_split_manifest is None or derived_split_manifest_sha256 is None
+    ):
+        raise ValueError(
+            "split_role='detector_diagnostic' requires derived_split_manifest "
+            "and derived_split_manifest_sha256"
+        )
+    if role in OFFICIAL_SPLIT_ROLES and (
+        derived_split_manifest is not None
+        or derived_split_manifest_sha256 is not None
+    ):
+        raise ValueError(
+            "derived_split_manifest is valid only for "
+            "split_role='detector_diagnostic'"
         )
 
     split_records: dict[str, dict[str, object]] = {}
@@ -325,15 +362,37 @@ def build_official_split_contract(
             )
 
     selected_path = Path(dataset.split_file).expanduser().resolve()
-    expected_selected_path = split_paths[role]
-    if selected_path != expected_selected_path:
-        raise ValueError(
-            f"split_role={role!r} requires the concrete official split file "
-            f"{expected_selected_path}, but the selected split resolves to {selected_path}. "
-            "Calibration exports must explicitly use split='train' together with "
-            "split_role='official_train'."
+    development_partition = None
+    if role in OFFICIAL_SPLIT_ROLES:
+        expected_selected_path = split_paths[role]
+        if selected_path != expected_selected_path:
+            raise ValueError(
+                f"split_role={role!r} requires the concrete official split file "
+                f"{expected_selected_path}, but the selected split resolves to "
+                f"{selected_path}. Calibration exports must explicitly use "
+                "split='train' together with split_role='official_train'."
+            )
+        selected_record = split_records[role]
+    else:
+        development_partition = verify_detector_diagnostic_partition(
+            derived_split_manifest,
+            dataset_name=dataset.dataset_name,
+            dataset_root=dataset.root,
+            selected_split_file=selected_path,
+            official_train_split=split_paths["official_train"],
+            official_test_split=split_paths["official_test"],
+            expected_manifest_sha256=derived_split_manifest_sha256,
         )
-    selected_record = split_records[role]
+        diagnostic_ids = list(
+            development_partition.partitions[
+                DETECTOR_DIAGNOSTIC_ROLE
+            ].sample_ids
+        )
+        selected_record = validate_dataset_record(
+            build_dataset_record(dataset.root, selected_path, diagnostic_ids),
+            require_source_name=False,
+            require_training_artifact=False,
+        )
     selected_ids = [str(sample[0]) for sample in dataset.samples]
     selected_record_ids = [
         str(item["sample_id"])
@@ -365,7 +424,11 @@ def build_official_split_contract(
         )
 
     contract: dict[str, object] = {
-        "schema_version": SPLIT_CONTRACT_SCHEMA_VERSION,
+        "schema_version": (
+            SPLIT_CONTRACT_SCHEMA_VERSION
+            if role in OFFICIAL_SPLIT_ROLES
+            else DEVELOPMENT_SPLIT_CONTRACT_SCHEMA_VERSION
+        ),
         "role": role,
         "selected_split_file": _portable_path(selected_path, manifest_root),
         "selected_split_sha256": selected_record["split_sha256"],
@@ -398,6 +461,13 @@ def build_official_split_contract(
                 ],
             }
         )
+    if development_partition is not None:
+        contract.update(
+            serialise_development_partition_contract(
+                development_partition,
+                path_anchor=manifest_root,
+            )
+        )
     return contract, selected_record
 
 
@@ -411,6 +481,8 @@ def export_score_maps(
     split: str = "test",
     split_file: str | Path | None = None,
     split_role: str = "official_test",
+    derived_split_manifest: str | Path | None = None,
+    derived_split_manifest_sha256: str | None = None,
     source_dataset: str | None = None,
     device: str = "auto",
     num_workers: int = 0,
@@ -458,6 +530,8 @@ def export_score_maps(
         dataset,
         split_role=split_role,
         manifest_root=output_root,
+        derived_split_manifest=derived_split_manifest,
+        derived_split_manifest_sha256=derived_split_manifest_sha256,
     )
     loader = DataLoader(
         dataset,
@@ -575,14 +649,31 @@ def export_score_maps(
                 }
             )
 
+    verified_split_role = str(split_contract["role"])
     manifest: dict[str, object] = {
         "schema_version": SCORE_MANIFEST_SCHEMA_VERSION,
         "artifact_type": "label_free_score_export",
         "source_dataset": source_dataset,
         "source_dataset_assertion": source_dataset,
+        "source_dataset_assertion_authority": "informational_only",
         "target_dataset": dataset.dataset_name,
         "target_dataset_record": target_dataset_record,
         "split_contract": split_contract,
+        "partition_scope": split_contract.get(
+            "partition_scope",
+            (
+                "official_final_evaluation"
+                if verified_split_role == "official_test"
+                else "official_train_development_or_calibration"
+            ),
+        ),
+        "official_test_artifact": verified_split_role == "official_test",
+        "final_evaluation_eligible": verified_split_role == "official_test",
+        "development_only": verified_split_role != "official_test",
+        # A score export alone never establishes a paper claim.  In
+        # particular, source_dataset is only an informational assertion and
+        # cannot upgrade a development partition into a final artifact.
+        "claim_bearing_final_evaluation": False,
         "path_anchor": "manifest_directory",
         "dataset_dir": _portable_path(dataset.root, output_root),
         "split_file": _portable_path(dataset.split_file, output_root),
@@ -682,12 +773,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-file")
     parser.add_argument(
         "--split-role",
-        choices=OFFICIAL_SPLIT_ROLES,
+        choices=SPLIT_ROLES,
         default="official_test",
         help=(
             "Protocol role for the selected split. Calibration requires the "
             "explicit pair --split train --split-role official_train; the safe "
-            "default is final-evaluation-only official_test."
+            "default is final-evaluation-only official_test. The development "
+            "role detector_diagnostic additionally requires --split-file and "
+            "--derived-split-manifest."
+        ),
+    )
+    parser.add_argument(
+        "--derived-split-manifest",
+        help=(
+            "Frozen v2 official-train-derived split manifest; required only "
+            "for --split-role detector_diagnostic."
+        ),
+    )
+    parser.add_argument(
+        "--derived-split-manifest-sha256",
+        help=(
+            "Pre-frozen SHA-256 of --derived-split-manifest; required for "
+            "--split-role detector_diagnostic."
         ),
     )
     parser.add_argument("--source-dataset")
@@ -709,6 +816,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         split=args.split,
         split_file=args.split_file,
         split_role=args.split_role,
+        derived_split_manifest=args.derived_split_manifest,
+        derived_split_manifest_sha256=args.derived_split_manifest_sha256,
         source_dataset=args.source_dataset,
         device=args.device,
         num_workers=args.num_workers,

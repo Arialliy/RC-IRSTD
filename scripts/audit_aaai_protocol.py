@@ -97,6 +97,15 @@ def audit_dataset(dataset_dir: str | Path) -> dict[str, object]:
     within_split_duplicate_count = sum(
         len(groups) for groups in within_split_content_duplicates.values()
     )
+    content_index = [
+        {
+            "image_sha256": digest,
+            "split": role,
+            "image_ids": ids,
+        }
+        for role in ("train", "test")
+        for digest, ids in sorted(image_hashes[role].items())
+    ]
     return {
         "dataset_name": root.name,
         "dataset_root": str(root),
@@ -114,6 +123,9 @@ def audit_dataset(dataset_dir: str | Path) -> dict[str, object]:
             within_split_duplicate_count
         ),
         "within_split_image_content_duplicates": within_split_content_duplicates,
+        # Private build_report input.  The final report retains only actual
+        # cross-dataset collision groups, not thousands of non-colliding rows.
+        "_image_content_sha256_index": content_index,
         "mask_alignment_aspect_tolerance": DEFAULT_ASPECT_TOLERANCE,
         "geometry_mismatch_count": len(geometry_mismatches),
         "geometry_mismatches": geometry_mismatches,
@@ -169,20 +181,95 @@ def build_report(
     *,
     outer_target: str | None = None,
     pseudo_target: str | None = None,
+    near_duplicate_audit: str | Path | None = None,
 ) -> dict[str, object]:
     datasets = [audit_dataset(path) for path in dataset_dirs]
+    cross_index: dict[str, list[dict[str, object]]] = {}
+    for dataset in datasets:
+        for item in dataset["_image_content_sha256_index"]:
+            cross_index.setdefault(str(item["image_sha256"]), []).append(
+                {
+                    "dataset_name": dataset["dataset_name"],
+                    "split": item["split"],
+                    "image_ids": item["image_ids"],
+                }
+            )
+    cross_dataset_exact_duplicates = [
+        {
+            "image_sha256": digest,
+            "occurrences": occurrences,
+        }
+        for digest, occurrences in sorted(cross_index.items())
+        if len({str(item["dataset_name"]) for item in occurrences}) > 1
+    ]
+    for dataset in datasets:
+        dataset.pop("_image_content_sha256_index", None)
     protocol = assess_nested_protocol(
         [str(item["dataset_name"]) for item in datasets],
         outer_target=outer_target,
         pseudo_target=pseudo_target,
     )
+    per_dataset_passed = all(
+        bool(item["split_contract_passed"]) for item in datasets
+    )
+    if near_duplicate_audit is None:
+        near_duplicate_record: dict[str, object] = {
+            "status": "not_run",
+            "claim_boundary": (
+                "a registered perceptual near-duplicate method is required before "
+                "admitting a fourth domain or claim-bearing outer evaluation"
+            ),
+        }
+        near_duplicate_passed = True
+    else:
+        near_path = Path(near_duplicate_audit).expanduser().resolve()
+        near_payload = json.loads(near_path.read_text(encoding="utf-8"))
+        if not isinstance(near_payload, Mapping):
+            raise TypeError("near-duplicate audit root must be an object")
+        near_duplicate_passed = (
+            near_payload.get("status") == "passed"
+            and near_payload.get("near_duplicate_contract_passed") is True
+            and int(near_payload.get("confirmed_near_duplicate_pair_count", -1)) == 0
+            and near_payload.get("image_only") is True
+            and near_payload.get("labels_scores_checkpoints_or_metrics_read") is False
+        )
+        input_names = {
+            str(item["dataset_name"])
+            for item in near_payload.get("inputs", [])
+            if isinstance(item, Mapping)
+        }
+        dataset_names = {str(item["dataset_name"]) for item in datasets}
+        if input_names != dataset_names:
+            raise ValueError(
+                "near-duplicate audit datasets differ from protocol audit datasets"
+            )
+        near_duplicate_record = {
+            "status": "passed" if near_duplicate_passed else "failed",
+            "path": str(near_path),
+            "sha256": sha256_file(near_path),
+            "confirmed_near_duplicate_pair_count": int(
+                near_payload.get("confirmed_near_duplicate_pair_count", -1)
+            ),
+            "image_only": near_payload.get("image_only"),
+            "claim_scope": "effective_development_train_vs_official_test",
+        }
     return {
         "artifact_type": "rc_irstd_aaai_protocol_audit",
         "schema_version": "1.0",
         "read_only_audit": True,
         "datasets": datasets,
-        "all_split_contracts_passed": all(
-            bool(item["split_contract_passed"]) for item in datasets
+        "cross_dataset_exact_image_duplicate_group_count": len(
+            cross_dataset_exact_duplicates
+        ),
+        "cross_dataset_exact_image_duplicates": cross_dataset_exact_duplicates,
+        "cross_dataset_exact_duplicate_contract_passed": not bool(
+            cross_dataset_exact_duplicates
+        ),
+        "near_duplicate_audit": near_duplicate_record,
+        "all_split_contracts_passed": (
+            per_dataset_passed
+            and not cross_dataset_exact_duplicates
+            and near_duplicate_passed
         ),
         "nested_protocol": protocol,
     }
@@ -207,6 +294,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-dirs", nargs="+", required=True)
     parser.add_argument("--outer-target", default=None)
     parser.add_argument("--pseudo-target", default=None)
+    parser.add_argument("--near-duplicate-audit", default=None)
     parser.add_argument("--output", default=None)
     return parser
 
@@ -217,6 +305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.dataset_dirs,
         outer_target=args.outer_target,
         pseudo_target=args.pseudo_target,
+        near_duplicate_audit=args.near_duplicate_audit,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True, allow_nan=False)
     if args.output:

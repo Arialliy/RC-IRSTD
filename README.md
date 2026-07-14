@@ -1,4 +1,43 @@
-# Infrared Small Target Detection with Scale and Location Sensitivity
+# RC-IRSTD: Two-Stage No-Reject Infrared Small-Target Detection
+
+The AAAI-oriented model in this repository is **Two-Stage No-Reject
+RC-IRSTD**, not MSHNet alone:
+
+```text
+Stage 1: MSHNet backbone + Domain Tail Separation detector objective
+                         ↓ freeze detector
+Stage 2: unlabeled target-prefix statistics
+                         ↓
+         monotone inverse pixel-risk curve calibrator (no Reject head)
+                         ↓
+         one fixed threshold τ(B) for each false-alarm budget B
+```
+
+MSHNet is an attributed Stage-1 backbone and is not claimed as the new model
+or contribution.
+
+## Implementation authority
+
+The only claim-bearing implementation path is the flat v5 stack:
+`data_ext/` + `model/` + `losses/` + `evaluation/` + `rc/` with
+`scripts.train_multisource_tail`.  It enforces label-free score export,
+schema-v5 provenance, complete budget-grid supervision and native-resolution
+exact replay.  The copied `rc_irstd/` package is retained only as an explicit
+compatibility implementation of `RC-IRSTD_AAAI27_TwoStage_NoReject` and for
+synthetic/engineering smoke tests.  Its YAML, NPZ and checkpoint contracts
+must not be mixed with the flat-v5 JSON/artifact contracts or reported as v5
+paper evidence.
+
+The default dispatcher follows the strict path.  Reference compatibility is
+always explicit:
+
+```bash
+./scripts/start_training.sh detector <strict Stage-1 options>
+./scripts/start_training.sh calibrator <strict Stage-2 options>
+./scripts/start_training.sh reference smoke /tmp/rc-irstd-reference-smoke
+```
+
+## Upstream MSHNet provenance
 
 > The result in the notice below is the original upstream MSHNet/IRSTD-1K
 > release result. It is not an RC-IRSTD result and is not evidence for the
@@ -65,10 +104,10 @@ and the local `img_idx/train_*.txt`/`img_idx/test_*.txt` layout. `val` and
 `test` are distinct roles: a missing validation split never falls back to the
 official test split.
 
-## RC-IRSTD research extension (experimental)
+## Two-Stage No-Reject RC-IRSTD main path
 
-This worktree also contains an experimental, budget-aware cross-domain
-deployment pipeline. It is not part of the original CVPR 2024 release. The
+This worktree contains a budget-aware cross-domain deployment pipeline built
+on, but distinct from, the original CVPR 2024 detector. The
 direct and reject-based calibrators remain baselines. The primary Stage-2 path
 is now `monotone_pixel_no_reject`: it predicts the complete inverse pixel-risk
 curve, trains against hash-bound query risk/Pd curves, and selects checkpoints
@@ -101,6 +140,11 @@ upper-tail statistics, then applies the separation hinge and normalized smooth
 worst-domain aggregation. GT dilation excludes ambiguous near-target
 background and deterministic plateau collapse prevents repeated equal-score
 peaks. `--risk-objective separate` remains the compatibility baseline.
+Every non-smoke run must provide a paired `--outer-fold-id` and
+`--outer-target`; a checkpoint lacking that identity cannot become
+`checkpoint_verified`.  `--engineering-smoke` is capped at two epochs and ten
+steps per epoch, requires zero risk warm-up/ramp, and is permanently marked
+`engineering_smoke_not_paper_evidence`.
 
 ```bash
 python -m scripts.train_multisource_tail \
@@ -110,8 +154,13 @@ python -m scripts.train_multisource_tail \
   --outer-target NUAA-SIRST \
   --held-out-domains NUAA-SIRST \
   --risk-objective margin \
-  --lambda-margin 0.1 \
+  --lambda-margin 0.2 \
   --target-background-margin 1.0 \
+  --tail-q 0.05 \
+  --miss-q 0.25 \
+  --object-pixel-q 0.25 \
+  --peak-kernel-size 5 \
+  --exclusion-radius 2 \
   --batch-per-domain 2 \
   --epochs 400 \
   --device cuda \

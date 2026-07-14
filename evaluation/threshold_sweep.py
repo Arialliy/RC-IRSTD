@@ -573,6 +573,20 @@ def write_curve_csv(
                 image_ids=image_ids,
             )
             label_payload = label_attachment.payload
+            score_role = label_attachment.score_manifest.split_role
+            score_partition_scope = label_attachment.score_manifest.payload.get(
+                "partition_scope"
+            )
+            manifest["score_split_role"] = score_role
+            manifest["score_partition_scope"] = score_partition_scope
+            manifest["official_test_artifact"] = score_role == "official_test"
+            manifest["final_evaluation_eligible"] = score_role == "official_test"
+            manifest["development_only"] = score_role != "official_test"
+            # An official-test role makes a curve eligible for later final
+            # reporting, but role alone cannot prove that method/seed/plan
+            # were frozen.  Claim-bearing status is therefore never inferred
+            # automatically here.
+            manifest["claim_bearing_final_evaluation"] = False
             manifest["label_manifest_file"] = Path(
                 os.path.relpath(label_source, start=path.parent.resolve())
             ).as_posix()

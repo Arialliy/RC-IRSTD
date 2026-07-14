@@ -119,6 +119,110 @@ def _add_disjoint_official_train_split(root: Path) -> None:
     )
 
 
+def _make_frozen_detector_diagnostic_partition(
+    repository_root: Path,
+) -> tuple[Path, Path, Path]:
+    """Create a small v2 partition with a non-guessed manifest subdirectory."""
+
+    dataset = repository_root / "datasets" / "NUAA-SIRST"
+    (dataset / "images").mkdir(parents=True)
+    (dataset / "masks").mkdir()
+    (dataset / "img_idx").mkdir()
+    image_ids = ("fit_a", "diagnostic_b", "quarantine_c", "test_d")
+    for index, image_id in enumerate(image_ids, start=1):
+        image = np.zeros((4, 8, 3), dtype=np.uint8)
+        image[0, index] = (index * 31, index * 17, index * 13)
+        mask = np.zeros((4, 8), dtype=np.uint8)
+        mask[2, index] = 255
+        Image.fromarray(image).save(dataset / "images" / f"{image_id}.png")
+        Image.fromarray(mask).save(dataset / "masks" / f"{image_id}.png")
+
+    train = dataset / "img_idx" / "train_NUAA-SIRST.txt"
+    test = dataset / "img_idx" / "test_NUAA-SIRST.txt"
+    train.write_text(
+        "fit_a\ndiagnostic_b\nquarantine_c\n", encoding="utf-8"
+    )
+    test.write_text("test_d\n", encoding="utf-8")
+
+    split_root = repository_root / "splits" / "aaai27_v2"
+    # Intentionally not the dataset slug: the exporter must use the manifest
+    # mapping and must not guess a directory from dataset_name.
+    role_root = split_root / "manifest-selected-directory"
+    role_root.mkdir(parents=True)
+    role_payloads = {
+        "effective_development_train.txt": "fit_a\ndiagnostic_b\n",
+        "detector_fit.txt": "fit_a\n",
+        "detector_diagnostic.txt": "diagnostic_b\n",
+        "quarantined_official_train_ids.txt": "quarantine_c\n",
+    }
+    for name, content in role_payloads.items():
+        (role_root / name).write_text(content, encoding="utf-8")
+
+    manifest_path = split_root / "manifest.json"
+    relative_role_root = role_root.relative_to(split_root)
+    manifest = {
+        "schema_version": "rc-irstd.aaai27-official-train-splits.v2",
+        "artifact_type": "official_train_derived_role_splits",
+        "role_contract": {
+            "official_test_emitted": False,
+            "official_test_labels_read_for_quarantine": False,
+            "detector_checkpoint_selection": "fixed_last",
+            "detector_diagnostic_used_for_checkpoint_selection": False,
+        },
+        "datasets": [
+            {
+                "dataset_name": "NUAA-SIRST",
+                "dataset_root": "datasets/NUAA-SIRST",
+                "official_train_split": (
+                    "datasets/NUAA-SIRST/img_idx/train_NUAA-SIRST.txt"
+                ),
+                "official_train_split_sha256": sha256_file(train),
+                "official_train_count": 3,
+                "official_test_split": (
+                    "datasets/NUAA-SIRST/img_idx/test_NUAA-SIRST.txt"
+                ),
+                "official_test_split_sha256": sha256_file(test),
+                "official_test_count": 1,
+                "official_train_test_id_overlap_count": 0,
+                "detector": {
+                    "fit_file": (
+                        relative_role_root / "detector_fit.txt"
+                    ).as_posix(),
+                    "fit_sha256": sha256_file(role_root / "detector_fit.txt"),
+                    "fit_count": 1,
+                    "diagnostic_file": (
+                        relative_role_root / "detector_diagnostic.txt"
+                    ).as_posix(),
+                    "diagnostic_sha256": sha256_file(
+                        role_root / "detector_diagnostic.txt"
+                    ),
+                    "diagnostic_count": 1,
+                },
+                "development_quarantine": {
+                    "effective_development_train_file": (
+                        relative_role_root / "effective_development_train.txt"
+                    ).as_posix(),
+                    "effective_development_train_sha256": sha256_file(
+                        role_root / "effective_development_train.txt"
+                    ),
+                    "effective_development_train_count": 2,
+                    "quarantined_file": (
+                        relative_role_root
+                        / "quarantined_official_train_ids.txt"
+                    ).as_posix(),
+                    "quarantined_sha256": sha256_file(
+                        role_root / "quarantined_official_train_ids.txt"
+                    ),
+                    "quarantined_count": 1,
+                    "partition_of_official_train": True,
+                },
+            }
+        ],
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return dataset, manifest_path, role_root / "detector_diagnostic.txt"
+
+
 def _fake_source_record(source_name: str, identity_hex: str) -> dict[str, object]:
     leaf = identity_hex * 64
     mask_sha = "d" * 64
@@ -376,6 +480,23 @@ def test_nuaa_mismatched_mask_is_aligned_to_image_canvas(tmp_path: Path) -> None
     assert tuple(dataset.load_original_mask(0).shape) == (1, 4, 8)
 
 
+def test_misc_111_alignment_exactly_matches_basicirstd_nearest_rule() -> None:
+    """Lock the published NUAA Misc_111 geometry to BasicIRSTD semantics."""
+
+    image = Image.new("RGB", (325, 220))
+    mask_array = np.zeros((400, 592), dtype=np.uint8)
+    mask_array[73:89, 301:319] = 255
+    mask_array[250, 120] = 255
+    mask = Image.fromarray(mask_array)
+    resampling = getattr(Image, "Resampling", Image).NEAREST
+
+    expected = mask.resize(image.size, resampling)
+    aligned = align_mask_to_image(mask, image, "Misc_111")
+
+    assert aligned.size == image.size
+    assert np.array_equal(np.asarray(aligned), np.asarray(expected))
+
+
 def test_mask_alignment_rejects_true_aspect_ratio_mismatch() -> None:
     image = Image.new("RGB", (8, 4))
     mask = Image.new("L", (8, 8))
@@ -422,6 +543,23 @@ def test_checkpoint_without_dataset_records_is_legacy_but_diagnostic() -> None:
     assert provenance["provenance_level"] == "legacy_unverified"
     assert provenance["legacy_reason"] == "missing_detector_source_records"
     assert provenance["detector_source_domains"] == ["A"]
+
+
+@requires_torch
+def test_checkpoint_verified_requires_outer_fold_identity() -> None:
+    checkpoint = {
+        "state_dict": {"unused": torch.zeros(1)},
+        "detector_source_domains": ["A", "B"],
+        "detector_source_records": [
+            _fake_source_record("A", "1"),
+            _fake_source_record("B", "2"),
+        ],
+        "held_out_domains": ["C"],
+        "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+        "protocol_scope": "multi_source_protocol_candidate",
+    }
+    with pytest.raises(ValueError, match="outer_fold_id"):
+        checkpoint_provenance(checkpoint)
 
 
 @pytest.mark.parametrize(
@@ -672,6 +810,9 @@ def test_export_manifest_binds_dataset_and_score_gray_content(
     assert curve_manifest["evaluation_scope"] == (
         "score_bound_label_attachment_verified"
     )
+    assert curve_manifest["score_split_role"] == "official_test"
+    assert curve_manifest["final_evaluation_eligible"] is True
+    assert curve_manifest["claim_bearing_final_evaluation"] is False
     assert curve_manifest["label_manifest_sha256"] == sha256_file(
         label_output / "label-manifest.json"
     )
@@ -730,6 +871,228 @@ def test_export_manifest_binds_dataset_and_score_gray_content(
         verify_score_manifest_artifacts(
             output / "manifest.json",
             required_split_role="official_test",
+        )
+
+
+@requires_torch
+def test_detector_diagnostic_export_label_and_sweep_remain_development_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    from data_ext.label_manifest_artifacts import verify_label_attachment
+    from evaluation.export_label_maps import export_label_maps
+
+    exporter_module = importlib.import_module("evaluation.export_score_maps")
+    dataset, split_manifest, diagnostic_split = (
+        _make_frozen_detector_diagnostic_partition(tmp_path / "repository")
+    )
+    split_manifest_sha = sha256_file(split_manifest)
+    checkpoint = tmp_path / "detector.pt"
+    torch.save({"state_dict": {"unused": torch.zeros(1)}}, checkpoint)
+    # Score export and diagnostic label attachment must never need masks from
+    # detector-fit, quarantine, or official-test roles.
+    for image_id in ("fit_a", "quarantine_c", "test_d"):
+        (dataset / "masks" / f"{image_id}.png").unlink()
+
+    class ZeroDetector(torch.nn.Module):
+        def forward(self, image: torch.Tensor, warm_flag: bool) -> torch.Tensor:
+            del warm_flag
+            return torch.zeros(
+                (image.shape[0], 1, image.shape[2], image.shape[3]),
+                dtype=image.dtype,
+                device=image.device,
+            )
+
+    monkeypatch.setattr(
+        exporter_module,
+        "load_model",
+        lambda *args, **kwargs: ZeroDetector(),
+    )
+    score_root = tmp_path / "diagnostic-scores"
+    # The deliberately misleading free-form assertion must not affect the
+    # verified partition role or final-evaluation eligibility.
+    manifest = export_score_maps(
+        dataset_dir=dataset,
+        weight_path=checkpoint,
+        output_dir=score_root,
+        base_size=16,
+        split_file=diagnostic_split,
+        split_role="detector_diagnostic",
+        derived_split_manifest=split_manifest,
+        derived_split_manifest_sha256=split_manifest_sha,
+        source_dataset="official_test",
+        device="cpu",
+    )
+    assert [item["image_id"] for item in manifest["items"]] == [
+        "diagnostic_b"
+    ]
+    assert manifest["items"][0]["original_hw"] == [4, 8]
+    assert manifest["split_contract"]["schema_version"] == 2
+    assert manifest["split_contract"]["role"] == "detector_diagnostic"
+    assert manifest["partition_scope"] == (
+        "official_train_derived_development_diagnostic"
+    )
+    assert manifest["official_test_artifact"] is False
+    assert manifest["final_evaluation_eligible"] is False
+    assert manifest["development_only"] is True
+    assert manifest["claim_bearing_final_evaluation"] is False
+    verified = verify_score_manifest_artifacts(
+        score_root / "manifest.json",
+        required_split_role="detector_diagnostic",
+    )
+    assert verified.split_role == "detector_diagnostic"
+    with pytest.raises(ValueError, match="cannot satisfy required role"):
+        verify_score_manifest_artifacts(
+            score_root / "manifest.json",
+            required_split_role="official_test",
+        )
+    with pytest.raises(ValueError, match="cannot satisfy required role"):
+        verify_score_manifest_artifacts(
+            score_root / "manifest.json",
+            required_split_role="official_train",
+        )
+    tampered_score_payload = json.loads(
+        (score_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    tampered_score_payload["official_test_artifact"] = True
+    tampered_score = score_root / "tampered-role-manifest.json"
+    tampered_score.write_text(json.dumps(tampered_score_payload), encoding="utf-8")
+    with pytest.raises(
+        ValueError, match="official_test_artifact must be exactly False"
+    ):
+        verify_score_manifest_artifacts(
+            tampered_score,
+            required_split_role="detector_diagnostic",
+        )
+
+    label_root = tmp_path / "diagnostic-labels"
+    label_manifest = export_label_maps(
+        dataset_dir=dataset,
+        score_manifest=score_root / "manifest.json",
+        output_dir=label_root,
+    )
+    assert label_manifest["score_split_role"] == "detector_diagnostic"
+    assert label_manifest["official_test_artifact"] is False
+    assert label_manifest["claim_bearing_final_evaluation"] is False
+    attachment = verify_label_attachment(
+        score_root / "manifest.json", label_root / "label-manifest.json"
+    )
+    assert attachment.selected_items[0].original_hw == (4, 8)
+    tampered_label_payload = json.loads(
+        (label_root / "label-manifest.json").read_text(encoding="utf-8")
+    )
+    tampered_label_payload["claim_bearing_final_evaluation"] = True
+    tampered_label = label_root / "tampered-label-manifest.json"
+    tampered_label.write_text(json.dumps(tampered_label_payload), encoding="utf-8")
+    with pytest.raises(
+        ValueError, match="claim_bearing_final_evaluation must be exactly False"
+    ):
+        verify_label_attachment(score_root / "manifest.json", tampered_label)
+
+    curve = tmp_path / "diagnostic-curve.csv"
+    assert threshold_sweep_main(
+        [
+            "--score-dir",
+            str(score_root),
+            "--label-manifest",
+            str(label_root / "label-manifest.json"),
+            "--output",
+            str(curve),
+        ]
+    ) == 0
+    curve_manifest = json.loads(
+        curve.with_suffix(".csv.manifest.json").read_text(encoding="utf-8")
+    )
+    assert curve_manifest["score_split_role"] == "detector_diagnostic"
+    assert curve_manifest["official_test_artifact"] is False
+    assert curve_manifest["final_evaluation_eligible"] is False
+    assert curve_manifest["development_only"] is True
+    assert curve_manifest["claim_bearing_final_evaluation"] is False
+    assert curve_manifest["oracle_only"] is True
+    assert curve_manifest["deployable"] is False
+
+
+@requires_torch
+def test_detector_diagnostic_contract_rejects_unfrozen_or_copied_split(
+    tmp_path: Path,
+) -> None:
+    from data_ext.inference_dataset import IRSTDInferenceDataset
+    from evaluation.export_score_maps import build_official_split_contract
+
+    dataset, split_manifest, diagnostic_split = (
+        _make_frozen_detector_diagnostic_partition(tmp_path / "repository")
+    )
+    copied_split = tmp_path / "copied-diagnostic.txt"
+    shutil.copyfile(diagnostic_split, copied_split)
+    inference = IRSTDInferenceDataset(
+        dataset,
+        base_size=16,
+        split_file=copied_split,
+    )
+    with pytest.raises(ValueError, match="requires the exact diagnostic path"):
+        build_official_split_contract(
+            inference,
+            split_role="detector_diagnostic",
+            manifest_root=tmp_path / "scores-copy",
+            derived_split_manifest=split_manifest,
+            derived_split_manifest_sha256=sha256_file(split_manifest),
+        )
+
+    exact_inference = IRSTDInferenceDataset(
+        dataset,
+        base_size=16,
+        split_file=diagnostic_split,
+    )
+    with pytest.raises(ValueError, match="requires derived_split_manifest"):
+        build_official_split_contract(
+            exact_inference,
+            split_role="detector_diagnostic",
+            manifest_root=tmp_path / "scores-no-manifest",
+        )
+    with pytest.raises(ValueError, match="frozen value"):
+        build_official_split_contract(
+            exact_inference,
+            split_role="detector_diagnostic",
+            manifest_root=tmp_path / "scores-wrong-sha",
+            derived_split_manifest=split_manifest,
+            derived_split_manifest_sha256="0" * 64,
+        )
+
+
+@requires_torch
+@pytest.mark.parametrize(
+    "contaminating_id", ("fit_a", "quarantine_c", "test_d")
+)
+def test_detector_diagnostic_contract_rejects_partition_contamination(
+    tmp_path: Path,
+    contaminating_id: str,
+) -> None:
+    from data_ext.inference_dataset import IRSTDInferenceDataset
+    from evaluation.export_score_maps import build_official_split_contract
+
+    dataset, split_manifest, diagnostic_split = (
+        _make_frozen_detector_diagnostic_partition(tmp_path / "repository")
+    )
+    payload = json.loads(split_manifest.read_text(encoding="utf-8"))
+    diagnostic_split.write_text(f"{contaminating_id}\n", encoding="utf-8")
+    payload["datasets"][0]["detector"]["diagnostic_sha256"] = sha256_file(
+        diagnostic_split
+    )
+    split_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    inference = IRSTDInferenceDataset(
+        dataset,
+        base_size=16,
+        split_file=diagnostic_split,
+    )
+    with pytest.raises(ValueError, match="exact disjoint partition"):
+        build_official_split_contract(
+            inference,
+            split_role="detector_diagnostic",
+            manifest_root=tmp_path / "scores-contaminated",
+            derived_split_manifest=split_manifest,
+            derived_split_manifest_sha256=sha256_file(split_manifest),
         )
 
 

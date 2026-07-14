@@ -5,12 +5,15 @@ engineering contract, not a claim that the method already beats baselines.
 
 ## Final method path
 
-Stage 1 uses `scripts.train_multisource_tail --risk-objective margin`. For
+Stage 1 uses the explicit D0–D3 identities in `scripts.train_multisource_tail`:
+`segmentation-only`, `margin-background-only`, `margin-target-only`, and
+`margin`. For
 each source domain it forms the target-object lower tail and the background
 local-peak upper tail after GT-neighbour exclusion and deterministic plateau
 collapse. The hinge is applied after domain aggregation, followed by a
-normalized smooth worst-domain reduction. `separate` remains the legacy
-ablation.
+normalized smooth worst-domain reduction. D1/D2 retain the same forward hinge
+as D3 and stop the target/background branch respectively. `separate` and
+`legacy-image-margin` remain compatibility baselines outside D0–D3.
 
 Stage 2 uses `rc.train_calibrator_risk_aligned`. One unlabeled context produces
 the complete `[J]` inverse pixel-risk threshold curve. The architecture is
@@ -36,7 +39,10 @@ and selects the checkpoint lexicographically by BSR, LogExcess, then Pd.
 
 ## Split discipline with train/test-only datasets
 
-The official test split is locked until final evaluation. Pseudo-target
+The v2 effective development split first removes every official-train image
+implicated by the frozen train/test near-duplicate audit. Raw data and official
+split files remain untouched. The official test split is locked until final
+evaluation. Pseudo-target
 calibrator optimisation and model selection both use causal windows built
 only inside each dataset's official training split. A pseudo-target held out
 from calibrator optimisation is therefore a training-split meta-validation
@@ -59,12 +65,18 @@ PYTHON_BIN=python ./scripts/train_rc_3gpu.sh \
   --outer-fold-id <FOLD> \
   --outer-target <TARGET> \
   --held-out-domains <TARGET> \
+  --source-split-files <SOURCE_1_DETECTOR_FIT> <SOURCE_2_DETECTOR_FIT> \
   --risk-objective margin \
   --exclusion-radius 2 \
-  --epochs 400 \
+  --epochs 30 \
   --save-dir outputs/detectors \
   --run-name <FOLD>
 ```
+
+For the paired D0 run, replace the objective with
+`--risk-objective segmentation-only --lambda-margin 0`. The Stage-1 pilot Gate
+uses only the frozen `detector_diagnostic` lists for evaluation; official test
+is not opened to decide whether to expand seeds or run D1/D2.
 
 The Stage-2 model is small. Run independent outer folds concurrently on GPUs
 0/1/2 by setting `RC_CALIBRATOR_GPU` per process:

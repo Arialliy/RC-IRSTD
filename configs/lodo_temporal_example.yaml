@@ -1,0 +1,95 @@
+# 视频/连续帧数据示例。每个数据集必须通过文件名或子目录提供 sequence_id。
+python: python
+working_directory: ..
+output_root: ../outputs/rc_irstd_temporal_lodo
+
+datasets:
+  Sensor-A:
+    path: /data/Sensor-A
+    train_split: train
+    eval_split: test
+    dataset_type: temporal
+  Sensor-B:
+    path: /data/Sensor-B
+    train_split: train
+    eval_split: test
+    dataset_type: temporal
+  Sensor-C:
+    path: /data/Sensor-C
+    train_split: train
+    eval_split: test
+    dataset_type: temporal
+
+outer_targets: [Sensor-A, Sensor-B, Sensor-C]
+
+detector:
+  name: mshnet
+  base_loss: auto
+  resize: [256, 256]
+  normalization: imagenet
+  dataset_type: temporal
+  per_domain_batch: 2
+  epochs: 400
+  warm_epoch: 5
+  optimizer: adagrad
+  lr: 0.05
+  lambda_tail: 0.10
+  lambda_miss: 0.10
+  tail_quantile: 0.95
+  miss_quantile: 0.80
+  peak_kernel: 5
+  exclusion_radius: 2
+  worst_gamma: 10.0
+  auxiliary_weight: 1.0
+  pixel_budget: 1.0e-5
+  peak_budget: 5.0
+  num_workers: 4
+  device: cuda
+  amp: true
+  deterministic: true
+  seed: 42
+  inference_mode: native_pad
+  stride_multiple: 32
+
+episodes:
+  protocol: temporal
+  context_size: 32
+  horizon: 16
+  train_stride: 16
+  eval_stride: 48
+  seed: 42
+  peak_min_distance: 2
+  peak_tolerance: 2.0
+  max_candidates: 0
+
+curve:
+  quantile: 0.90
+  hidden_dim: 256
+  dropout: 0.10
+  lambda_peak: 1.0
+  lambda_crossing: 0.25
+  crossing_temperature: 0.25
+  focus_base_weight: 1.0
+  focus_weight: 4.0
+  focus_log_scale: 1.0
+  empty_action_weight: 0.10
+  batch_size: 64
+  epochs: 300
+  lr: 0.001
+  weight_decay: 0.0001
+  val_fraction: 0.20
+  patience: 40
+  device: cuda
+  seed: 42
+
+budgets:
+  pixel: 1.0e-6
+  peak_per_mp: 1.0
+
+calibration:
+  # temporal image units仍按 sequence 阻断划分；也可改 episode 做 block CRC。
+  alpha: 0.10
+  unit: image
+  sizes: [10, 20, 50]
+  seeds: [0, 1, 2, 3, 4]
+  offset_step: 1

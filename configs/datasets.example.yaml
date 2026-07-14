@@ -1,0 +1,27 @@
+# Replace every path with an absolute local path. Keep at least four independent
+# meta-source domains before claiming strict nested LODO; reserve 2-3 additional
+# datasets as external unseen targets.
+meta_sources:
+  - name: NUAA-SIRST
+    path: /data/NUAA-SIRST
+    train_split: official_train_meta_train
+    val_split: official_train_meta_val
+  - name: NUDT-SIRST
+    path: /data/NUDT-SIRST
+    train_split: official_train_meta_train
+    val_split: official_train_meta_val
+  - name: IRSTD-1K
+    path: /data/IRSTD-1K
+    train_split: official_train_meta_train
+    val_split: official_train_meta_val
+  - name: FOURTH-INDEPENDENT-DOMAIN
+    path: /data/FOURTH-INDEPENDENT-DOMAIN
+    train_split: official_train_meta_train
+    val_split: official_train_meta_val
+external_unseen_targets:
+  - name: EXTERNAL-TARGET-1
+    path: /data/EXTERNAL-TARGET-1
+  - name: EXTERNAL-TARGET-2
+    path: /data/EXTERNAL-TARGET-2
+  - name: EXTERNAL-TARGET-3
+    path: /data/EXTERNAL-TARGET-3

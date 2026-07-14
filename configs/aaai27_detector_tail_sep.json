@@ -1,17 +1,59 @@
 {
-  "schema_version": "rc-irstd.aaai27-detector-config.v1",
+  "schema_version": "rc-irstd.aaai27-detector-config.v2-reference-aligned",
+  "reference_package": "RC-IRSTD_AAAI27_TwoStage_NoReject",
+  "reference_config": "configs/aaai27_detector_tail_sep.yaml",
+  "migration_policy": "scientific_hyperparameters_migrated_to_flat_v5_without_mixing_yaml_artifacts",
   "risk_objective": "margin",
   "objective": "domain_target_background_tail_separation",
-  "lambda_margin": 0.1,
+  "stage1_variant_registry": {
+    "D0": {
+      "risk_objective": "segmentation-only",
+      "trainable_tail": "none",
+      "stop_gradient_tail": "not_applicable",
+      "lambda_margin": 0.0
+    },
+    "D1": {
+      "risk_objective": "margin-background-only",
+      "trainable_tail": "background",
+      "stop_gradient_tail": "target",
+      "lambda_margin": 0.2
+    },
+    "D2": {
+      "risk_objective": "margin-target-only",
+      "trainable_tail": "target",
+      "stop_gradient_tail": "background",
+      "lambda_margin": 0.2
+    },
+    "D3": {
+      "risk_objective": "margin",
+      "trainable_tail": "both",
+      "stop_gradient_tail": "none",
+      "lambda_margin": 0.2
+    }
+  },
+  "single_tail_ablation_semantics": "same_forward_domain_hinge_with_one_tail_stop_gradient",
+  "lambda_margin": 0.2,
   "target_background_margin_logit": 1.0,
-  "background_tail_fraction": 0.01,
-  "hard_object_fraction": 0.2,
+  "background_tail_fraction": 0.05,
+  "hard_object_fraction": 0.25,
   "object_top_pixel_fraction": 0.25,
-  "peak_kernel_size": 3,
+  "peak_kernel_size": 5,
   "gt_exclusion_radius": 2,
   "plateau_atol": 0.0,
   "smooth_worst_domain_gamma": 10.0,
+  "training_schedule": {
+    "warm_epoch": 5,
+    "risk_warmup_epochs": 5,
+    "risk_ramp_epochs": 10,
+    "optimizer": "Adagrad",
+    "lr": 0.05
+  },
   "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+  "reference_protocol_deviations": {
+    "source_internal_validation": "not_used_until_an_internal_split_is_frozen_from_official_train",
+    "official_test_selection": false,
+    "flat_v5_provenance_and_exact_replay": true
+  },
   "gpu_contract": {
     "physical_devices": [0, 1, 2],
     "launcher": "scripts/train_rc_3gpu.sh",

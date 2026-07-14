@@ -33,6 +33,118 @@ def _check_fraction(value: float, name: str) -> None:
         raise ValueError(f"{name} must be in (0, 1], got {value}")
 
 
+@dataclass(frozen=True)
+class _LegacyImageMarginComponents:
+    image_background_tail: torch.Tensor
+    image_target_tail: torch.Tensor
+    image_raw_gap: torch.Tensor
+    image_violation: torch.Tensor
+    image_valid_mask: torch.Tensor
+    image_background_candidate_count: torch.Tensor
+    object_scores: torch.Tensor
+    object_image_indices: torch.Tensor
+
+
+def _legacy_image_margin_components(
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    *,
+    background_q: float,
+    target_q: float,
+    object_pixel_fraction: float,
+    margin: float,
+    kernel_size: int,
+    plateau_atol: float,
+) -> _LegacyImageMarginComponents:
+    """Form the historical image-paired tails without changing its semantics."""
+
+    _check_fraction(background_q, "background_q")
+    _check_fraction(target_q, "target_q")
+    _check_fraction(object_pixel_fraction, "object_pixel_fraction")
+    if margin < 0.0 or not math.isfinite(margin):
+        raise ValueError(f"margin must be finite and non-negative, got {margin}")
+
+    background_by_image = local_background_peak_logits(
+        logits,
+        masks,
+        kernel_size=kernel_size,
+        plateau_atol=plateau_atol,
+    )
+    targets_by_image = object_top_fraction_logits(
+        logits,
+        masks,
+        object_pixel_fraction=object_pixel_fraction,
+    )
+    graph_zero = logits.sum() * 0.0
+    background_rows: List[torch.Tensor] = []
+    target_rows: List[torch.Tensor] = []
+    raw_gap_rows: List[torch.Tensor] = []
+    violation_rows: List[torch.Tensor] = []
+    valid_rows: List[bool] = []
+    object_score_rows: List[torch.Tensor] = []
+    object_image_rows: List[torch.Tensor] = []
+    for image_index, (background, targets) in enumerate(
+        zip(background_by_image, targets_by_image)
+    ):
+        background_tail = (
+            top_fraction_mean(background, background_q)
+            if background.numel() > 0
+            else graph_zero
+        )
+        target_tail = (
+            -top_fraction_mean(-targets, target_q)
+            if targets.numel() > 0
+            else graph_zero
+        )
+        valid = background.numel() > 0 and targets.numel() > 0
+        if valid:
+            raw_gap = target_tail - background_tail
+            violation = F.relu(margin - raw_gap)
+        else:
+            raw_gap = graph_zero
+            violation = graph_zero
+        background_rows.append(background_tail)
+        target_rows.append(target_tail)
+        raw_gap_rows.append(raw_gap)
+        violation_rows.append(violation)
+        valid_rows.append(valid)
+        if targets.numel() > 0:
+            object_score_rows.append(targets)
+            object_image_rows.append(
+                torch.full(
+                    (targets.numel(),),
+                    image_index,
+                    device=logits.device,
+                    dtype=torch.long,
+                )
+            )
+
+    if object_score_rows:
+        object_scores = torch.cat(object_score_rows)
+        object_image_indices = torch.cat(object_image_rows)
+    else:
+        object_scores = logits.reshape(-1)[:0]
+        object_image_indices = torch.empty(
+            (0,), device=logits.device, dtype=torch.long
+        )
+    return _LegacyImageMarginComponents(
+        image_background_tail=torch.stack(background_rows),
+        image_target_tail=torch.stack(target_rows),
+        image_raw_gap=torch.stack(raw_gap_rows),
+        image_violation=torch.stack(violation_rows),
+        image_valid_mask=torch.tensor(
+            valid_rows, device=logits.device, dtype=torch.bool
+        ),
+        image_background_candidate_count=torch.tensor(
+            [values.numel() for values in background_by_image],
+            device=logits.device,
+            dtype=torch.long,
+        ),
+        object_scores=object_scores,
+        object_image_indices=object_image_indices,
+    )
+
+
 def image_target_background_margin_risks(
     logits: torch.Tensor,
     masks: torch.Tensor,
@@ -58,35 +170,17 @@ def image_target_background_margin_risks(
     a fabricated target/background score.
     """
 
-    _check_fraction(background_q, "background_q")
-    _check_fraction(target_q, "target_q")
-    _check_fraction(object_pixel_fraction, "object_pixel_fraction")
-    if margin < 0.0 or not math.isfinite(margin):
-        raise ValueError(f"margin must be finite and non-negative, got {margin}")
-
-    background_by_image = local_background_peak_logits(
+    components = _legacy_image_margin_components(
         logits,
         masks,
+        background_q=background_q,
+        target_q=target_q,
+        object_pixel_fraction=object_pixel_fraction,
+        margin=margin,
         kernel_size=kernel_size,
         plateau_atol=plateau_atol,
     )
-    targets_by_image = object_top_fraction_logits(
-        logits,
-        masks,
-        object_pixel_fraction=object_pixel_fraction,
-    )
-    image_risks = []
-    for image_index, (background, targets) in enumerate(
-        zip(background_by_image, targets_by_image)
-    ):
-        if background.numel() == 0 or targets.numel() == 0:
-            image_risks.append(logits[image_index].sum() * 0.0)
-            continue
-        background_tail = top_fraction_mean(background, background_q)
-        # Lowest target scores are the largest values after negation.
-        hard_target = -top_fraction_mean(-targets, target_q)
-        image_risks.append(F.relu(margin + background_tail - hard_target))
-    return torch.stack(image_risks)
+    return components.image_violation
 
 
 def domain_target_background_margin_risks(
@@ -276,11 +370,120 @@ class DomainTailSeparationOutput:
     loss: torch.Tensor
     domain_background_tail: torch.Tensor
     domain_target_tail: torch.Tensor
+    domain_raw_gap: torch.Tensor
+    domain_violation: torch.Tensor
+    # Backward-compatible alias for the historical, ambiguously named
+    # violation field. New code should use ``domain_violation``.
     domain_gap: torch.Tensor
     domain_ids: torch.Tensor
     valid_domain_mask: torch.Tensor
     image_background_tail: torch.Tensor
     object_scores: torch.Tensor
+    domain_background_candidate_mean: torch.Tensor
+    domain_object_count: torch.Tensor
+
+
+def legacy_image_margin_loss(
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    domain_ids: torch.Tensor,
+    *,
+    margin: float = 1.0,
+    background_tail_fraction: float = 0.01,
+    object_top_fraction: float = 0.25,
+    hard_object_fraction: float = 0.2,
+    peak_kernel_size: int = 3,
+    worst_gamma: float = 10.0,
+    plateau_atol: float = 0.0,
+) -> DomainTailSeparationOutput:
+    """Trainable legacy ablation: image hinge first, then domain mean.
+
+    Invalid image pairs (no object or no background candidate) retain the
+    established legacy zero-risk behavior and therefore remain in the domain
+    mean as zeros. Tail and raw-gap diagnostics, however, are averaged only
+    over valid image pairs so an absent target is never reported as a real
+    zero-valued target tail.
+    """
+
+    if worst_gamma <= 0.0 or not math.isfinite(worst_gamma):
+        raise ValueError(
+            f"worst_gamma must be finite and positive, got {worst_gamma}"
+        )
+    components = _legacy_image_margin_components(
+        logits,
+        masks,
+        background_q=background_tail_fraction,
+        target_q=hard_object_fraction,
+        object_pixel_fraction=object_top_fraction,
+        margin=margin,
+        kernel_size=peak_kernel_size,
+        plateau_atol=plateau_atol,
+    )
+    domain_ids = torch.as_tensor(domain_ids, device=logits.device).reshape(-1).long()
+    if domain_ids.numel() != logits.shape[0]:
+        raise ValueError(
+            "domain_ids must contain one entry per image, got "
+            f"{domain_ids.numel()} ids for {logits.shape[0]} images"
+        )
+    if domain_ids.numel() == 0:
+        raise ValueError("at least one image is required")
+
+    unique_domains = torch.unique(domain_ids, sorted=True)
+    graph_zero = logits.sum() * 0.0
+    background_rows: List[torch.Tensor] = []
+    target_rows: List[torch.Tensor] = []
+    raw_gap_rows: List[torch.Tensor] = []
+    violation_rows: List[torch.Tensor] = []
+    candidate_rows: List[torch.Tensor] = []
+    object_count_rows: List[torch.Tensor] = []
+    valid_rows: List[bool] = []
+    object_domains = domain_ids.index_select(
+        0, components.object_image_indices
+    )
+    for domain_id in unique_domains:
+        image_mask = domain_ids == domain_id
+        valid_mask = image_mask & components.image_valid_mask
+        valid = bool(valid_mask.any())
+        if valid:
+            background_tail = components.image_background_tail[valid_mask].mean()
+            target_tail = components.image_target_tail[valid_mask].mean()
+            raw_gap = components.image_raw_gap[valid_mask].mean()
+        else:
+            background_tail = graph_zero
+            target_tail = graph_zero
+            raw_gap = graph_zero
+        # This all-image mean exactly preserves
+        # ``domain_target_background_margin_risks`` semantics.
+        violation = components.image_violation[image_mask].mean()
+        background_rows.append(background_tail)
+        target_rows.append(target_tail)
+        raw_gap_rows.append(raw_gap)
+        violation_rows.append(violation)
+        candidate_rows.append(
+            components.image_background_candidate_count[image_mask]
+            .to(dtype=logits.dtype)
+            .mean()
+        )
+        object_count_rows.append((object_domains == domain_id).sum())
+        valid_rows.append(valid)
+
+    domain_violation = torch.stack(violation_rows)
+    return DomainTailSeparationOutput(
+        loss=smooth_worst_domain(domain_violation, gamma=worst_gamma),
+        domain_background_tail=torch.stack(background_rows),
+        domain_target_tail=torch.stack(target_rows),
+        domain_raw_gap=torch.stack(raw_gap_rows),
+        domain_violation=domain_violation,
+        domain_gap=domain_violation,
+        domain_ids=unique_domains,
+        valid_domain_mask=torch.tensor(
+            valid_rows, device=logits.device, dtype=torch.bool
+        ),
+        image_background_tail=components.image_background_tail,
+        object_scores=components.object_scores,
+        domain_background_candidate_mean=torch.stack(candidate_rows),
+        domain_object_count=torch.stack(object_count_rows),
+    )
 
 
 def domain_tail_separation_loss(
@@ -296,6 +499,7 @@ def domain_tail_separation_loss(
     exclusion_radius: int = 2,
     worst_gamma: float = 10.0,
     plateau_atol: float = 0.0,
+    trainable_tail: str = "both",
 ) -> DomainTailSeparationOutput:
     """Compute the final domain-level target/background two-tail hinge.
 
@@ -306,7 +510,14 @@ def domain_tail_separation_loss(
     logit score, whose lower domain tail forms :math:`R_d^+`.  Only then is the
     domain hinge evaluated::
 
-        gap_d = relu(margin + R_d^- - R_d^+)
+        raw_gap_d = R_d^+ - R_d^-
+        violation_d = relu(margin - raw_gap_d)
+
+    ``trainable_tail`` freezes the ablation gradient route without changing
+    the forward hinge value: ``background`` detaches :math:`R_d^+`, ``target``
+    detaches :math:`R_d^-`, and ``both`` is the full objective.  This makes the
+    D1/D2 single-tail ablations differ from D3 only in which branch is allowed
+    to update the detector.
 
     Domains without any target object have a defined background diagnostic but
     no fabricated positive tail, so they are excluded from the normalized
@@ -322,6 +533,11 @@ def domain_tail_separation_loss(
     if worst_gamma <= 0.0 or not math.isfinite(worst_gamma):
         raise ValueError(
             f"worst_gamma must be finite and positive, got {worst_gamma}"
+        )
+    if trainable_tail not in {"background", "target", "both"}:
+        raise ValueError(
+            "trainable_tail must be one of background, target, both; "
+            f"got {trainable_tail!r}"
         )
     if logits.shape[0] == 0:
         raise ValueError("at least one image is required")
@@ -354,6 +570,7 @@ def domain_tail_separation_loss(
                 top_fraction_mean(values, background_tail_fraction)
             )
     image_background_tail = torch.stack(image_background_rows)
+    image_background_candidate_count = peak_mask.flatten(1).sum(dim=1)
 
     scores_by_image = object_top_fraction_logits(
         logits,
@@ -384,14 +601,24 @@ def domain_tail_separation_loss(
     background_rows: List[torch.Tensor] = []
     target_rows: List[torch.Tensor] = []
     gap_rows: List[torch.Tensor] = []
+    raw_gap_rows: List[torch.Tensor] = []
+    candidate_rows: List[torch.Tensor] = []
+    object_count_rows: List[torch.Tensor] = []
     valid_rows: List[bool] = []
     graph_zero = logits.sum() * 0.0
     for domain_id in unique_domains:
         background_tail = image_background_tail[domain_ids == domain_id].mean()
         domain_object_scores = object_scores[object_domains == domain_id]
         background_rows.append(background_tail)
+        candidate_rows.append(
+            image_background_candidate_count[domain_ids == domain_id]
+            .to(dtype=logits.dtype)
+            .mean()
+        )
+        object_count_rows.append((object_domains == domain_id).sum())
         if domain_object_scores.numel() == 0:
             target_tail = graph_zero
+            raw_gap = graph_zero
             gap = graph_zero
             valid_rows.append(False)
         else:
@@ -399,13 +626,22 @@ def domain_tail_separation_loss(
                 domain_object_scores,
                 hard_object_fraction,
             )
-            gap = F.relu(margin + background_tail - target_tail)
+            raw_gap = target_tail - background_tail
+            if trainable_tail == "background":
+                hinge_gap = target_tail.detach() - background_tail
+            elif trainable_tail == "target":
+                hinge_gap = target_tail - background_tail.detach()
+            else:
+                hinge_gap = raw_gap
+            gap = F.relu(margin - hinge_gap)
             valid_rows.append(True)
         target_rows.append(target_tail)
+        raw_gap_rows.append(raw_gap)
         gap_rows.append(gap)
 
     domain_background_tail = torch.stack(background_rows)
     domain_target_tail = torch.stack(target_rows)
+    domain_raw_gap = torch.stack(raw_gap_rows)
     domain_gap = torch.stack(gap_rows)
     valid_domain_mask = torch.tensor(
         valid_rows,
@@ -424,9 +660,13 @@ def domain_tail_separation_loss(
         loss=loss,
         domain_background_tail=domain_background_tail,
         domain_target_tail=domain_target_tail,
+        domain_raw_gap=domain_raw_gap,
+        domain_violation=domain_gap,
         domain_gap=domain_gap,
         domain_ids=unique_domains,
         valid_domain_mask=valid_domain_mask,
         image_background_tail=image_background_tail,
         object_scores=object_scores,
+        domain_background_candidate_mean=torch.stack(candidate_rows),
+        domain_object_count=torch.stack(object_count_rows),
     )

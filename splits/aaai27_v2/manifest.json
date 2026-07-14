@@ -1,0 +1,171 @@
+{
+  "artifact_type": "official_train_derived_role_splits",
+  "base_seed": 42,
+  "datasets": [
+    {
+      "dataset_name": "NUAA-SIRST",
+      "dataset_root": "datasets/NUAA-SIRST",
+      "dataset_type": "iid_images",
+      "derived_seeds": {
+        "detector": 4086367046739404789,
+        "meta": 3579865539750169701
+      },
+      "detector": {
+        "diagnostic_count": 43,
+        "diagnostic_file": "nuaa-sirst/detector_diagnostic.txt",
+        "diagnostic_sha256": "0258a3e20fb7facdeb322c15f3107cc468f9b96af8f2a04a43d3b7e833b64575",
+        "fit_count": 170,
+        "fit_file": "nuaa-sirst/detector_fit.txt",
+        "fit_sha256": "1f22f592babff3e3ef061f2327546328ce2c744fda69930356834f6cf45fe597"
+      },
+      "development_quarantine": {
+        "effective_development_train_count": 213,
+        "effective_development_train_file": "nuaa-sirst/effective_development_train.txt",
+        "effective_development_train_sha256": "815dcca749f087f27f5dad4b447015aee70bd7ae7779d6fdd7d6efa6d5c6943f",
+        "partition_of_official_train": true,
+        "quarantined_count": 0,
+        "quarantined_file": "nuaa-sirst/quarantined_official_train_ids.txt",
+        "quarantined_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "meta": {
+        "context_size": 32,
+        "protocol": "iid_non_overlapping_blocks",
+        "query_size": 64,
+        "temporal_causality_claimed": false,
+        "train_file": "nuaa-sirst/meta_train_windows.json",
+        "train_sha256": "48f250f982b07f0bafcc98a46e546a5a375a035030c401d6badc9f16904d8c9a",
+        "train_window_count": 1,
+        "unused_file": "nuaa-sirst/meta_unused_ids.txt",
+        "unused_image_count": 21,
+        "unused_sha256": "13f04f864c06657e6671ef3e3145df4c6a1e5be4610899a24a17b24558c56cd8",
+        "validation_file": "nuaa-sirst/meta_validation_windows.json",
+        "validation_sha256": "0954642f3e227517a65b3da03972ceabdc83801d68e79d028eec38f8eee48a7b",
+        "validation_window_count": 1
+      },
+      "official_test_count": 214,
+      "official_test_split": "datasets/NUAA-SIRST/img_idx/test_NUAA-SIRST.txt",
+      "official_test_split_sha256": "e49023203a323c247306b314f23c8b3b917093a26984067792355adff7a8386e",
+      "official_train_count": 213,
+      "official_train_split": "datasets/NUAA-SIRST/img_idx/train_NUAA-SIRST.txt",
+      "official_train_split_sha256": "324e5dadcb6cc9fc2a99a5f5dedd06ad4de77b2ed826e4ceffda8b6a784da0b4",
+      "official_train_test_id_overlap_count": 0
+    },
+    {
+      "dataset_name": "NUDT-SIRST",
+      "dataset_root": "datasets/NUDT-SIRST",
+      "dataset_type": "iid_images",
+      "derived_seeds": {
+        "detector": 3254546002873685243,
+        "meta": 12071968262780782851
+      },
+      "detector": {
+        "diagnostic_count": 127,
+        "diagnostic_file": "nudt-sirst/detector_diagnostic.txt",
+        "diagnostic_sha256": "a06718f530ce5a569ec4112f1c0389bb699c1855ba8a551191985672f787cc9a",
+        "fit_count": 509,
+        "fit_file": "nudt-sirst/detector_fit.txt",
+        "fit_sha256": "b09e52abddfccb5687b6294a224feb4c877bc0f95c07ed80ce50630b810f9823"
+      },
+      "development_quarantine": {
+        "effective_development_train_count": 636,
+        "effective_development_train_file": "nudt-sirst/effective_development_train.txt",
+        "effective_development_train_sha256": "cbe8590a536f275314542fde4a0e777b02c3fc6a77a0cb9a8a857d5d1de0ef5f",
+        "partition_of_official_train": true,
+        "quarantined_count": 27,
+        "quarantined_file": "nudt-sirst/quarantined_official_train_ids.txt",
+        "quarantined_sha256": "48d1c07dd4456d4877ca48050a734a1d5ccf01ba6a515210e48a9f146e3c136d"
+      },
+      "meta": {
+        "context_size": 32,
+        "protocol": "iid_non_overlapping_blocks",
+        "query_size": 64,
+        "temporal_causality_claimed": false,
+        "train_file": "nudt-sirst/meta_train_windows.json",
+        "train_sha256": "d800f36df08245298c5e5832be5278e8ba79ae70cacea7078f70438db2901463",
+        "train_window_count": 5,
+        "unused_file": "nudt-sirst/meta_unused_ids.txt",
+        "unused_image_count": 60,
+        "unused_sha256": "3cc6da155a2df4fcd2f467616d404a7ae96113df0d735fc45bfc49fd2b64ca0d",
+        "validation_file": "nudt-sirst/meta_validation_windows.json",
+        "validation_sha256": "bfb6461f942bcdf44c0f793c96f499bce09b6e86ab1ad3fba20d8dfcbbd2f413",
+        "validation_window_count": 1
+      },
+      "official_test_count": 664,
+      "official_test_split": "datasets/NUDT-SIRST/img_idx/test_NUDT-SIRST.txt",
+      "official_test_split_sha256": "a463c52ee64b1c803c4a322fe090aaf6bc360844898e3943bb7c64a8e551b86e",
+      "official_train_count": 663,
+      "official_train_split": "datasets/NUDT-SIRST/img_idx/train_NUDT-SIRST.txt",
+      "official_train_split_sha256": "e0a79f7c3d42548ba7d7dad9d2d336012b63a6bc5081e89e286f0f45036f8ec3",
+      "official_train_test_id_overlap_count": 0
+    },
+    {
+      "dataset_name": "IRSTD-1K",
+      "dataset_root": "datasets/IRSTD-1K",
+      "dataset_type": "iid_images",
+      "derived_seeds": {
+        "detector": 3401587664662028774,
+        "meta": 11021699392522758631
+      },
+      "detector": {
+        "diagnostic_count": 159,
+        "diagnostic_file": "irstd-1k/detector_diagnostic.txt",
+        "diagnostic_sha256": "a7b378ad06b5a93d8c2a93e429640de82a2fcc59fc9f598cc15315a03ccdc20b",
+        "fit_count": 638,
+        "fit_file": "irstd-1k/detector_fit.txt",
+        "fit_sha256": "491948bea48ab17487bd413002029e151a1d03a8ee5a40f1870ff71ce52b423e"
+      },
+      "development_quarantine": {
+        "effective_development_train_count": 797,
+        "effective_development_train_file": "irstd-1k/effective_development_train.txt",
+        "effective_development_train_sha256": "9e1dfd69adad38155961306d578dfdc0a5f8342159445d0bc326c819d73a7e32",
+        "partition_of_official_train": true,
+        "quarantined_count": 3,
+        "quarantined_file": "irstd-1k/quarantined_official_train_ids.txt",
+        "quarantined_sha256": "77b5163f612b8290386e573d9b644a687425158b1a3400bdd9a454548794b511"
+      },
+      "meta": {
+        "context_size": 32,
+        "protocol": "iid_non_overlapping_blocks",
+        "query_size": 64,
+        "temporal_causality_claimed": false,
+        "train_file": "irstd-1k/meta_train_windows.json",
+        "train_sha256": "e81c5993501891fbec15ddc2fb0870d7a119c1bb4ef44ba72c8e08e511243cbb",
+        "train_window_count": 6,
+        "unused_file": "irstd-1k/meta_unused_ids.txt",
+        "unused_image_count": 29,
+        "unused_sha256": "f4662254ace34287b81b6878449a73631eb9fb4a86dd37523a7470c9b7637818",
+        "validation_file": "irstd-1k/meta_validation_windows.json",
+        "validation_sha256": "8b22cf3fd4d8620829aca7eb8771dbd3f35a4151dc93d90aa7b97f45b1f53648",
+        "validation_window_count": 2
+      },
+      "official_test_count": 201,
+      "official_test_split": "datasets/IRSTD-1K/img_idx/test_IRSTD-1K.txt",
+      "official_test_split_sha256": "8c71e474358acb84f2cbebfd1282ffea236f9cb852b7f7c04feb2fd99804c579",
+      "official_train_count": 800,
+      "official_train_split": "datasets/IRSTD-1K/img_idx/train_IRSTD-1K.txt",
+      "official_train_split_sha256": "689a5f30a394ad47315ebe0f6df2d7f12429aa314ffb2cdf86f7fbd7be4ee744",
+      "official_train_test_id_overlap_count": 0
+    }
+  ],
+  "detector_diagnostic_fraction": 0.2,
+  "development_quarantine": {
+    "config_path": "configs/aaai27_near_duplicate_quarantine.json",
+    "config_sha256": "ebc7eef69bac32a73fe8ff3c62e3ff5535c11e5aebfe19e6ff110c006bb76052",
+    "official_split_files_modified": false,
+    "raw_data_modified": false,
+    "source_audit_path": "audits/aaai27/near_duplicates_original_official_splits_v2.json",
+    "source_audit_sha256": "fbbde98eb1a3e883c6951d7bfc36644dbc01569ca80f6c3b6894cee7b24ca012",
+    "status": "applied_before_random_partitioning"
+  },
+  "meta_validation_fraction": 0.2,
+  "role_contract": {
+    "cross_fold_role_reuse": "allowed only because every nested fold trains a new detector and a domain is either detector_source or pseudo_target, never both",
+    "detector_checkpoint_selection": "fixed_last",
+    "detector_diagnostic_used_for_checkpoint_selection": false,
+    "official_test_emitted": false,
+    "official_test_labels_read_for_quarantine": false,
+    "outer_target_official_train_used": false,
+    "same_fold_domain_roles_are_mutually_exclusive": true
+  },
+  "schema_version": "rc-irstd.aaai27-official-train-splits.v2"
+}

@@ -1,0 +1,35 @@
+method: monotone_inverse_pixel_risk_curve
+reject_head: false
+budgets_descending: [1.0e-4, 1.0e-5, 1.0e-6]
+interpolation: linear_in_log10_budget
+extrapolation: forbidden
+support:
+  context_size: 32
+  labels_read: false
+  statistics:
+    - score_and_logit_histograms
+    - fixed_local_peak_statistics
+    - high_score_ratios
+    - compact_noise_statistics
+    - permutation_invariant_source_distances
+query:
+  size: 64
+  labels_role: meta_training_loss_and_exact_replay_only
+model:
+  hidden_dim: 192
+  dropout: 0.10
+  structural_monotonicity: true
+loss:
+  lambda_violation: 4.0
+  lambda_utility: 1.0
+  lambda_oracle: 0.10
+  lambda_smoothness: 0.01
+  pixel_temperature: 0.10
+  object_temperature: 0.20
+checkpoint_selection_order:
+  - BSR_max
+  - LogExcess_min
+  - Pd_max
+claim:
+  guaranteed_or_certified: false
+  wording: empirical_budget_aware_meta_calibration

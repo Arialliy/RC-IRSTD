@@ -2,11 +2,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+class DeterministicGlobalMaxPool2d(nn.Module):
+    """Adaptive max-pooling to 1x1 without CUDA's nondeterministic backward.
+
+    Flattening the spatial axes and reducing with ``torch.max`` has the same
+    forward values and first-maximum tie rule as ``AdaptiveMaxPool2d(1)``.  It
+    also keeps strict deterministic CUDA training available for MSHNet.
+    """
+
+    def forward(self, x):
+        return x.flatten(2).max(dim=-1, keepdim=True).values.unsqueeze(-1)
+
+
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        # AdaptiveMaxPool2d backward is nondeterministic on CUDA in the
+        # supported PyTorch stack.  This parameter-free equivalent preserves
+        # checkpoint compatibility while allowing strict deterministic runs.
+        self.max_pool = DeterministicGlobalMaxPool2d()
         self.fc1   = nn.Conv2d(in_planes, in_planes // 16, 1, bias=False)
         self.relu1 = nn.ReLU()
         self.fc2   = nn.Conv2d(in_planes // 16, in_planes, 1, bias=False)
@@ -125,10 +141,8 @@ class MSHNet(nn.Module):
             mask3 = self.output_3(x_d3)
             output = self.final(torch.cat([mask0, self.up(mask1), self.up_4(mask2), self.up_8(mask3)], dim=1))
             return [mask0, mask1, mask2, mask3], output
-    
+
         else:
             output = self.output_0(x_d0)
             return [], output
 
-       
-    

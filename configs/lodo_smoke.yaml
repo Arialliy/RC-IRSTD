@@ -1,0 +1,64 @@
+# Requires synthetic data created with:
+# python -m rc_irstd.pipelines.make_synthetic_data \
+#   --output-root ../outputs/smoke/data \
+#   --domains DomainA DomainB DomainC \
+#   --height 16 --width 16 --sequences 4 --frames-per-sequence 6
+python: python
+working_directory: ..
+output_root: ../outputs/lodo_smoke
+
+datasets:
+  DomainA: {path: ../outputs/smoke/data/DomainA, train_split: train, eval_split: test}
+  DomainB: {path: ../outputs/smoke/data/DomainB, train_split: train, eval_split: test}
+  DomainC: {path: ../outputs/smoke/data/DomainC, train_split: train, eval_split: test}
+outer_targets: [DomainC]
+
+detector:
+  name: tiny
+  base_loss: bce_dice
+  resize: [16, 16]
+  per_domain_batch: 12
+  epochs: 1
+  warm_epoch: 0
+  optimizer: adamw
+  lr: 0.001
+  lambda_tail: 0.05
+  lambda_miss: 0.05
+  auxiliary_weight: 1.0
+  num_workers: 0
+  device: cpu
+  amp: false
+  deterministic: true
+  seed: 42
+
+episodes:
+  # Training episodes may overlap to increase pseudo-target sample count.
+  # Evaluation/CRC episodes must be image-disjoint.
+  context_size: 2
+  horizon: 1
+  train_stride: 1
+  eval_stride: 3
+  peak_min_distance: 2
+  peak_min_score: 0.0
+  max_candidates: 1024
+
+curve:
+  quantile: 0.90
+  hidden_dim: 32
+  dropout: 0.0
+  batch_size: 4
+  epochs: 3
+  lr: 0.001
+  patience: 3
+  device: cpu
+  seed: 42
+
+budgets:
+  pixel: 1.0
+  peak_per_mp: 1000000000.0
+
+calibration:
+  alpha: 0.50
+  sizes: [2]
+  seeds: [0]
+  offset_step: 1

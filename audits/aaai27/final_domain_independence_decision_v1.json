@@ -1,0 +1,45 @@
+{
+  "artifact_type": "aaai27_domain_independence_decision",
+  "current_domains": [
+    "NUAA-SIRST",
+    "NUDT-SIRST",
+    "IRSTD-1K"
+  ],
+  "decision": "stage1_development_domains_only",
+  "evidence": {
+    "effective_split_audit": {
+      "confirmed_near_duplicate_pair_count": 0,
+      "path": "audits/aaai27/near_duplicates_effective_splits_v2.json",
+      "sha256": "15c3aa1a60da2558813e00faaedfaf28f28b9fc9e2f36abfeb81b0ac65406358"
+    },
+    "original_split_audit": {
+      "confirmed_cross_dataset_pair_count": 0,
+      "confirmed_train_test_pair_count": 31,
+      "path": "audits/aaai27/near_duplicates_original_official_splits_v2.json",
+      "sha256": "fbbde98eb1a3e883c6951d7bfc36644dbc01569ca80f6c3b6894cee7b24ca012"
+    },
+    "quarantine": {
+      "excluded_official_train_id_count": 30,
+      "path": "configs/aaai27_near_duplicate_quarantine.json",
+      "sha256": "ebc7eef69bac32a73fe8ff3c62e3ff5535c11e5aebfe19e6ff110c006bb76052"
+    },
+    "split_manifest": {
+      "path": "splits/aaai27_v2/manifest.json",
+      "sha256": "a0de05010dc2b0f1332f5b611ec88309e0c809f16e63a904d0a19b9b1964e7e8"
+    }
+  },
+  "limitations": {
+    "causal_or_temporal_independence_claimed": false,
+    "official_sequence_or_group_metadata_available": false,
+    "stage2_independent_outer_target_available": false,
+    "three_domain_nested_lodo_claim_authorized": false
+  },
+  "policy": {
+    "official_test_labels_read": false,
+    "official_test_model_outputs_read": false,
+    "official_split_files_modified": false,
+    "raw_data_modified": false
+  },
+  "schema_version": "rc-irstd.aaai27-domain-independence-decision.v1",
+  "status": "passed_for_stage1_development_only"
+}

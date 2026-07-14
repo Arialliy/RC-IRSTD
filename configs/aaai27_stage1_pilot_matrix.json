@@ -1,0 +1,482 @@
+{
+  "schema_version": "rc-irstd.aaai27-stage1-pilot-matrix.v1",
+  "contains_observed_results": false,
+  "analysis_plan_binding": {
+    "path": "configs/aaai27_analysis_plan.json",
+    "schema_version": "rc-irstd.aaai27-analysis-plan.v1",
+    "allowed_plan_statuses": [
+      "frozen_stage1_protocol_pending_release",
+      "frozen_stage1_pilot_authorized"
+    ],
+    "stage1_config": {
+      "path": "configs/aaai27_detector_tail_sep.json",
+      "sha256": "186d4ff30b16aecfff35eb682c8ecb897fcee98308a1bfa3f946748ef77b01af"
+    },
+    "split_manifest": {
+      "path": "splits/aaai27_v2/manifest.json",
+      "sha256": "a0de05010dc2b0f1332f5b611ec88309e0c809f16e63a904d0a19b9b1964e7e8"
+    }
+  },
+  "release_contract": {
+    "tag": "aaai27-rc-irstd-v5-rc1",
+    "source_archive": "outputs/release/RC-IRSTD_v5_rc1.zip",
+    "source_archive_sha256_file": "outputs/release/RC-IRSTD_v5_rc1.zip.sha256"
+  },
+  "protocol": {
+    "seed": 42,
+    "epochs": 30,
+    "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+    "diagnostics_select_checkpoint": false,
+    "deterministic": true,
+    "optimizer": "Adagrad",
+    "learning_rate": 0.05,
+    "warm_epoch": 5,
+    "risk_warmup_epochs": 5,
+    "risk_ramp_epochs": 10,
+    "base_size": 256,
+    "crop_size": 256,
+    "batch_per_domain": 3,
+    "num_workers": 4,
+    "epoch_steps_mode": "full_longest_domain",
+    "tail_mode": "local-peak",
+    "lambda_tail": 0.1,
+    "lambda_miss": 0.1,
+    "target_background_margin": 1.0,
+    "tail_q": 0.05,
+    "miss_q": 0.25,
+    "object_pixel_q": 0.25,
+    "tail_gamma": 10.0,
+    "peak_kernel_size": 5,
+    "peak_min_score": 0.05,
+    "plateau_atol": 0.0,
+    "grad_clip_norm": 0.0,
+    "variants": {
+      "D0": {
+        "risk_objective": "segmentation-only",
+        "lambda_margin": 0.0,
+        "exclusion_radius": 2
+      },
+      "D3": {
+        "risk_objective": "margin",
+        "lambda_margin": 0.2,
+        "exclusion_radius": 2
+      }
+    }
+  },
+  "scheduling": {
+    "physical_gpu_ids": [
+      0,
+      1,
+      2
+    ],
+    "all_three_and_lodo_overlap_allowed": false,
+    "phases": [
+      {
+        "phase_id": "P0_all-three_D0",
+        "after": [],
+        "concurrent_run_ids": [
+          "D0_all-three_s42"
+        ]
+      },
+      {
+        "phase_id": "P1_all-three_D3",
+        "after": [
+          "P0_all-three_D0"
+        ],
+        "concurrent_run_ids": [
+          "D3_all-three_s42"
+        ]
+      },
+      {
+        "phase_id": "P2_lodo_D0",
+        "after": [
+          "P1_all-three_D3"
+        ],
+        "concurrent_run_ids": [
+          "D0_leave-NUAA_s42",
+          "D0_leave-NUDT_s42",
+          "D0_leave-IRSTD1K_s42"
+        ]
+      },
+      {
+        "phase_id": "P3_lodo_D3",
+        "after": [
+          "P2_lodo_D0"
+        ],
+        "concurrent_run_ids": [
+          "D3_leave-NUAA_s42",
+          "D3_leave-NUDT_s42",
+          "D3_leave-IRSTD1K_s42"
+        ]
+      }
+    ]
+  },
+  "runs": [
+    {
+      "run_id": "D0_all-three_s42",
+      "phase": "P0_all-three_D0",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D0",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "source_dirs": [
+        "datasets/NUAA-SIRST",
+        "datasets/NUDT-SIRST",
+        "datasets/IRSTD-1K"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_fit.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_fit.txt",
+        "splits/aaai27_v2/irstd-1k/detector_fit.txt"
+      ],
+      "outer_fold_id": "development-all-three",
+      "outer_target": "DEVELOPMENT-ONLY-ALL-THREE-DIAGNOSTIC",
+      "held_out": [
+        "DEVELOPMENT-ONLY-ALL-THREE-DIAGNOSTIC"
+      ],
+      "primary_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        0,
+        1,
+        2
+      ],
+      "data_parallel": true,
+      "output_dir": "outputs/stage1_pilot_30ep/D0_all-three_s42"
+    },
+    {
+      "run_id": "D3_all-three_s42",
+      "phase": "P1_all-three_D3",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D3",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "source_dirs": [
+        "datasets/NUAA-SIRST",
+        "datasets/NUDT-SIRST",
+        "datasets/IRSTD-1K"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_fit.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_fit.txt",
+        "splits/aaai27_v2/irstd-1k/detector_fit.txt"
+      ],
+      "outer_fold_id": "development-all-three",
+      "outer_target": "DEVELOPMENT-ONLY-ALL-THREE-DIAGNOSTIC",
+      "held_out": [
+        "DEVELOPMENT-ONLY-ALL-THREE-DIAGNOSTIC"
+      ],
+      "primary_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        0,
+        1,
+        2
+      ],
+      "data_parallel": true,
+      "output_dir": "outputs/stage1_pilot_30ep/D3_all-three_s42"
+    },
+    {
+      "run_id": "D0_leave-NUAA_s42",
+      "phase": "P2_lodo_D0",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D0",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "source_dirs": [
+        "datasets/NUDT-SIRST",
+        "datasets/IRSTD-1K"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nudt-sirst/detector_fit.txt",
+        "splits/aaai27_v2/irstd-1k/detector_fit.txt"
+      ],
+      "outer_fold_id": "leave-NUAA",
+      "outer_target": "NUAA-SIRST",
+      "held_out": [
+        "NUAA-SIRST"
+      ],
+      "primary_diagnostic_domains": [
+        "NUAA-SIRST"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        0
+      ],
+      "data_parallel": false,
+      "output_dir": "outputs/stage1_pilot_30ep/D0_leave-NUAA_s42"
+    },
+    {
+      "run_id": "D0_leave-NUDT_s42",
+      "phase": "P2_lodo_D0",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D0",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUAA-SIRST",
+        "IRSTD-1K"
+      ],
+      "source_dirs": [
+        "datasets/NUAA-SIRST",
+        "datasets/IRSTD-1K"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_fit.txt",
+        "splits/aaai27_v2/irstd-1k/detector_fit.txt"
+      ],
+      "outer_fold_id": "leave-NUDT",
+      "outer_target": "NUDT-SIRST",
+      "held_out": [
+        "NUDT-SIRST"
+      ],
+      "primary_diagnostic_domains": [
+        "NUDT-SIRST"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        1
+      ],
+      "data_parallel": false,
+      "output_dir": "outputs/stage1_pilot_30ep/D0_leave-NUDT_s42"
+    },
+    {
+      "run_id": "D0_leave-IRSTD1K_s42",
+      "phase": "P2_lodo_D0",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D0",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUAA-SIRST",
+        "NUDT-SIRST"
+      ],
+      "source_dirs": [
+        "datasets/NUAA-SIRST",
+        "datasets/NUDT-SIRST"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_fit.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_fit.txt"
+      ],
+      "outer_fold_id": "leave-IRSTD1K",
+      "outer_target": "IRSTD-1K",
+      "held_out": [
+        "IRSTD-1K"
+      ],
+      "primary_diagnostic_domains": [
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        2
+      ],
+      "data_parallel": false,
+      "output_dir": "outputs/stage1_pilot_30ep/D0_leave-IRSTD1K_s42"
+    },
+    {
+      "run_id": "D3_leave-NUAA_s42",
+      "phase": "P3_lodo_D3",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D3",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "source_dirs": [
+        "datasets/NUDT-SIRST",
+        "datasets/IRSTD-1K"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nudt-sirst/detector_fit.txt",
+        "splits/aaai27_v2/irstd-1k/detector_fit.txt"
+      ],
+      "outer_fold_id": "leave-NUAA",
+      "outer_target": "NUAA-SIRST",
+      "held_out": [
+        "NUAA-SIRST"
+      ],
+      "primary_diagnostic_domains": [
+        "NUAA-SIRST"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        0
+      ],
+      "data_parallel": false,
+      "output_dir": "outputs/stage1_pilot_30ep/D3_leave-NUAA_s42"
+    },
+    {
+      "run_id": "D3_leave-NUDT_s42",
+      "phase": "P3_lodo_D3",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D3",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUAA-SIRST",
+        "IRSTD-1K"
+      ],
+      "source_dirs": [
+        "datasets/NUAA-SIRST",
+        "datasets/IRSTD-1K"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_fit.txt",
+        "splits/aaai27_v2/irstd-1k/detector_fit.txt"
+      ],
+      "outer_fold_id": "leave-NUDT",
+      "outer_target": "NUDT-SIRST",
+      "held_out": [
+        "NUDT-SIRST"
+      ],
+      "primary_diagnostic_domains": [
+        "NUDT-SIRST"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        1
+      ],
+      "data_parallel": false,
+      "output_dir": "outputs/stage1_pilot_30ep/D3_leave-NUDT_s42"
+    },
+    {
+      "run_id": "D3_leave-IRSTD1K_s42",
+      "phase": "P3_lodo_D3",
+      "experiment_scope": "single_seed_stage1_gate",
+      "variant": "D3",
+      "seed": 42,
+      "epochs": 30,
+      "fixed_last": true,
+      "sources": [
+        "NUAA-SIRST",
+        "NUDT-SIRST"
+      ],
+      "source_dirs": [
+        "datasets/NUAA-SIRST",
+        "datasets/NUDT-SIRST"
+      ],
+      "source_split_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_fit.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_fit.txt"
+      ],
+      "outer_fold_id": "leave-IRSTD1K",
+      "outer_target": "IRSTD-1K",
+      "held_out": [
+        "IRSTD-1K"
+      ],
+      "primary_diagnostic_domains": [
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_domains": [
+        "NUAA-SIRST",
+        "NUDT-SIRST",
+        "IRSTD-1K"
+      ],
+      "evaluation_diagnostic_files": [
+        "splits/aaai27_v2/nuaa-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/nudt-sirst/detector_diagnostic.txt",
+        "splits/aaai27_v2/irstd-1k/detector_diagnostic.txt"
+      ],
+      "gpu_visible_devices": [
+        2
+      ],
+      "data_parallel": false,
+      "output_dir": "outputs/stage1_pilot_30ep/D3_leave-IRSTD1K_s42"
+    }
+  ]
+}

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from scripts.audit_aaai_protocol import assess_nested_protocol, audit_dataset
+from scripts.audit_aaai_protocol import (
+    assess_nested_protocol,
+    audit_dataset,
+    build_report,
+)
 
 
 def _make_dataset(root: Path) -> Path:
@@ -45,3 +50,37 @@ def test_three_domains_with_two_holdouts_is_non_claim_bearing_smoke() -> None:
     assert result["detector_sources"] == ["IRSTD-1K"]
     assert result["claim_bearing_nested_lodo_eligible"] is False
     assert result["protocol_scope"] == "single_source_inner_smoke_not_main_result"
+
+
+def test_cross_dataset_exact_image_duplicates_fail_global_contract(
+    tmp_path: Path,
+) -> None:
+    first = _make_dataset(tmp_path / "domain-a")
+    second = _make_dataset(tmp_path / "domain-b")
+    report = build_report([first, second])
+    assert report["cross_dataset_exact_image_duplicate_group_count"] == 2
+    assert report["cross_dataset_exact_duplicate_contract_passed"] is False
+    assert report["all_split_contracts_passed"] is False
+    assert report["near_duplicate_audit"]["status"] == "not_run"
+
+
+def test_effective_near_duplicate_audit_is_hash_bound(tmp_path: Path) -> None:
+    dataset = _make_dataset(tmp_path / "domain-a")
+    audit = tmp_path / "near.json"
+    audit.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "near_duplicate_contract_passed": True,
+                "confirmed_near_duplicate_pair_count": 0,
+                "image_only": True,
+                "labels_scores_checkpoints_or_metrics_read": False,
+                "inputs": [{"dataset_name": "domain-a"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = build_report([dataset], near_duplicate_audit=audit)
+    assert report["near_duplicate_audit"]["status"] == "passed"
+    assert len(report["near_duplicate_audit"]["sha256"]) == 64
+    assert report["all_split_contracts_passed"] is True

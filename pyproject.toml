@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rc-irstd"
+version = "0.5.0"
+description = "Two-stage no-reject RC-IRSTD with domain-tail separation and query-risk-aligned monotone inverse calibration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "scikit-image>=0.20",
+  "pandas>=2.0",
+  "Pillow>=9.0",
+  "PyYAML>=6.0",
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "tqdm>=4.65",
+  "tabulate>=0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+# Claim-bearing flat-v5 path.  These commands share schema-v5 provenance,
+# label-free score export, complete budget-grid supervision and exact replay.
+rc-irstd-audit = "scripts.audit_aaai_protocol:main"
+rc-irstd-train-detector = "scripts.train_multisource_tail:main"
+rc-irstd-export-scores = "evaluation.export_score_maps:main"
+rc-irstd-export-labels = "evaluation.export_label_maps:main"
+rc-irstd-build-source-reference = "rc.build_source_reference:main"
+rc-irstd-build-meta = "rc.build_meta_episodes:main"
+rc-irstd-train-calibrator = "rc.train_calibrator_risk_aligned:main"
+rc-irstd-apply-calibrator = "rc.online_adapter:main"
+rc-irstd-evaluate-adapter = "evaluation.evaluate_adapter_output:main"
+rc-irstd-threshold-sweep = "evaluation.threshold_sweep:main"
+
+# Self-contained reference-package compatibility path.  The explicit prefix
+# prevents its NPZ/checkpoint contracts from being mixed with flat v5.
+rc-irstd-reference-train-detector = "rc_irstd.pipelines.train_detector:main"
+rc-irstd-reference-export-scores = "rc_irstd.pipelines.export_scores:main"
+rc-irstd-reference-evaluate-scores = "rc_irstd.pipelines.evaluate_scores:main"
+rc-irstd-reference-evaluate-baselines = "rc_irstd.pipelines.evaluate_baselines:main"
+rc-irstd-reference-build-episodes = "rc_irstd.pipelines.build_episodes:main"
+rc-irstd-reference-train-curve = "rc_irstd.pipelines.train_curve:main"
+rc-irstd-reference-build-source-reference = "rc_irstd.pipelines.build_source_reference:main"
+rc-irstd-reference-build-meta = "rc_irstd.pipelines.build_meta_dataset:main"
+rc-irstd-reference-train-calibrator = "rc_irstd.pipelines.train_calibrator:main"
+rc-irstd-reference-eval-calibrator = "rc_irstd.pipelines.evaluate_calibrator:main"
+rc-irstd-reference-apply-calibrator = "rc_irstd.pipelines.apply_calibrator:main"
+rc-irstd-reference-eval-zero = "rc_irstd.pipelines.evaluate_zero_label:main"
+rc-irstd-reference-predict-unlabeled = "rc_irstd.pipelines.predict_unlabeled:main"
+rc-irstd-reference-calibrate = "rc_irstd.pipelines.calibrate_and_evaluate:main"
+rc-irstd-reference-run-lodo = "rc_irstd.pipelines.run_lodo:main"
+rc-irstd-reference-aggregate = "rc_irstd.pipelines.aggregate_results:main"
+rc-irstd-reference-make-synthetic = "rc_irstd.pipelines.make_synthetic_data:main"
+rc-irstd-reference-smoke = "rc_irstd.pipelines.smoke:main"
+rc-irstd-reference-build-supplement = "rc_irstd.pipelines.build_supplement:main"
+rc-irstd-reference-apply-threshold = "rc_irstd.pipelines.apply_operating_point:main"
+rc-irstd-reference-deploy = "rc_irstd.pipelines.run_deployment:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "data_ext*",
+  "evaluation*",
+  "losses*",
+  "model*",
+  "rc*",
+  "scripts*",
+  "utils*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

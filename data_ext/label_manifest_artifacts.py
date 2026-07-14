@@ -127,6 +127,23 @@ def verify_label_attachment(
         raise ValueError("label manifest path_anchor must equal 'manifest_directory'")
     if payload.get("labels_embedded_in_scores") is not False:
         raise ValueError("label manifest must declare labels_embedded_in_scores=false")
+    if score.split_role == "detector_diagnostic":
+        expected_development_scope = {
+            "score_split_role": "detector_diagnostic",
+            "score_partition_scope": (
+                "official_train_derived_development_diagnostic"
+            ),
+            "official_test_artifact": False,
+            "final_evaluation_eligible": False,
+            "development_only": True,
+            "claim_bearing_final_evaluation": False,
+        }
+        for field, expected in expected_development_scope.items():
+            if payload.get(field) != expected:
+                raise ValueError(
+                    f"development label manifest {field} must be exactly "
+                    f"{expected!r}"
+                )
 
     raw_score_ref = _nonempty(
         payload.get("score_manifest_file"), "score_manifest_file"

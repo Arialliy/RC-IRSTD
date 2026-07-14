@@ -147,6 +147,12 @@ def export_label_maps(
         "score_manifest_sha256": score.manifest_sha256,
         "score_manifest_content_sha256": score.content_sha256,
         "target_dataset": declared_target,
+        "score_split_role": score.split_role,
+        "score_partition_scope": score.payload.get("partition_scope"),
+        "official_test_artifact": score.split_role == "official_test",
+        "final_evaluation_eligible": score.split_role == "official_test",
+        "development_only": score.split_role != "official_test",
+        "claim_bearing_final_evaluation": False,
         "labels_embedded_in_scores": False,
         "alignment_rule": (
             "binary mask; nearest-neighbor to score original_hw only when "

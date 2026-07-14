@@ -1,0 +1,66 @@
+{
+  "algorithm": {
+    "candidate": "grayscale_mean_std_normalized_phash64_DCT_32x32_low8x8_excluding_DC",
+    "confirmation": "64x64_grayscale_mean_centered_cosine",
+    "confirmation_cosine_min": 0.995,
+    "phash_hamming_distance_max": 4,
+    "pillow_version": "12.0.0",
+    "resize": "PIL_Lanczos",
+    "scipy_version": "1.16.3"
+  },
+  "artifact_type": "rc_irstd_image_only_near_duplicate_audit",
+  "confirmed_near_duplicate_pair_count": 0,
+  "confirmed_near_duplicate_pairs": [],
+  "image_index_sha256": "b9fbb80892ffae5af9529b200aa871b521898d4a28af1c0e76d9955afac1dc2d",
+  "image_only": true,
+  "inputs": [
+    {
+      "dataset_name": "IRSTD-1K",
+      "num_images": 797,
+      "split_file": "splits/aaai27_v2/irstd-1k/effective_development_train.txt",
+      "split_role": "development_train",
+      "split_sha256": "9e1dfd69adad38155961306d578dfdc0a5f8342159445d0bc326c819d73a7e32"
+    },
+    {
+      "dataset_name": "IRSTD-1K",
+      "num_images": 201,
+      "split_file": "datasets/IRSTD-1K/img_idx/test_IRSTD-1K.txt",
+      "split_role": "official_test",
+      "split_sha256": "8c71e474358acb84f2cbebfd1282ffea236f9cb852b7f7c04feb2fd99804c579"
+    },
+    {
+      "dataset_name": "NUAA-SIRST",
+      "num_images": 213,
+      "split_file": "splits/aaai27_v2/nuaa-sirst/effective_development_train.txt",
+      "split_role": "development_train",
+      "split_sha256": "815dcca749f087f27f5dad4b447015aee70bd7ae7779d6fdd7d6efa6d5c6943f"
+    },
+    {
+      "dataset_name": "NUAA-SIRST",
+      "num_images": 214,
+      "split_file": "datasets/NUAA-SIRST/img_idx/test_NUAA-SIRST.txt",
+      "split_role": "official_test",
+      "split_sha256": "e49023203a323c247306b314f23c8b3b917093a26984067792355adff7a8386e"
+    },
+    {
+      "dataset_name": "NUDT-SIRST",
+      "num_images": 636,
+      "split_file": "splits/aaai27_v2/nudt-sirst/effective_development_train.txt",
+      "split_role": "development_train",
+      "split_sha256": "cbe8590a536f275314542fde4a0e777b02c3fc6a77a0cb9a8a857d5d1de0ef5f"
+    },
+    {
+      "dataset_name": "NUDT-SIRST",
+      "num_images": 664,
+      "split_file": "datasets/NUDT-SIRST/img_idx/test_NUDT-SIRST.txt",
+      "split_role": "official_test",
+      "split_sha256": "a463c52ee64b1c803c4a322fe090aaf6bc360844898e3943bb7c64a8e551b86e"
+    }
+  ],
+  "labels_scores_checkpoints_or_metrics_read": false,
+  "near_duplicate_contract_passed": true,
+  "num_indexed_images": 2725,
+  "phash_candidate_pair_count": 28,
+  "schema_version": "rc-irstd.near-duplicate-audit.v1",
+  "status": "passed"
+}

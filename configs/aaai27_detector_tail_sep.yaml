@@ -1,0 +1,27 @@
+method: domain_tail_separation
+backbone: MSHNet
+main_risk: original_resolution_pixel_false_alarm_rate
+candidate_role: tail_loss_and_unlabeled_statistics_only
+component_fa_role: compatibility_evaluation_only
+checkpoint_selection: source_internal_validation
+training:
+  epochs: 400
+  warm_epoch: 5
+  risk_start_epoch: 5
+  risk_ramp_epochs: 10
+  optimizer: adagrad
+  lr: 0.05
+  per_domain_batch: 2
+loss:
+  lambda_sep: 0.20
+  margin_logit: 1.0
+  background_tail_fraction: 0.05
+  object_top_fraction: 0.25
+  hard_object_fraction: 0.25
+  peak_kernel: 5
+  gt_exclusion_radius: 2
+  worst_domain_gamma: 10.0
+validation:
+  pixel_budget: 1.0e-5
+  use_peak_constraint: false
+  outer_target_labels_allowed: false

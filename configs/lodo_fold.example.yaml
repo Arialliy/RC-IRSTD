@@ -1,0 +1,112 @@
+# RC-IRSTD nested leave-one-domain-out configuration.
+# Paths may be absolute or relative to this YAML file.
+# For MSHNet, working_directory must be the repository root containing
+# model/MSHNet.py and model/loss.py.
+python: python
+working_directory: /absolute/path/to/MSHNet
+output_root: ../outputs/rc_irstd_nested_lodo
+
+datasets:
+  NUAA-SIRST:
+    path: /data/NUAA-SIRST
+    train_split: train
+    eval_split: test
+  NUDT-SIRST:
+    path: /data/NUDT-SIRST
+    train_split: train
+    eval_split: test
+  IRSTD-1K:
+    path: /data/IRSTD-1K
+    train_split: train
+    eval_split: test
+  SIRST-UAVB:
+    path: /data/SIRST-UAVB
+    train_split: train
+    eval_split: test
+  RealScene-ISTD:
+    path: /data/RealScene-ISTD
+    train_split: train
+    eval_split: test
+  NUDT-SIRST-Sea:
+    path: /data/NUDT-SIRST-Sea
+    train_split: train
+    eval_split: test
+
+outer_targets:
+  - NUAA-SIRST
+  - NUDT-SIRST
+  - IRSTD-1K
+  - SIRST-UAVB
+  - RealScene-ISTD
+  - NUDT-SIRST-Sea
+
+detector:
+  name: mshnet
+  base_loss: auto
+  train_split: train
+  val_split: test
+  resize: [256, 256]
+  per_domain_batch: 2
+  epochs: 400
+  warm_epoch: 5
+  optimizer: adagrad
+  lr: 0.05
+  weight_decay: 0.0
+  lambda_tail: 0.10
+  lambda_miss: 0.10
+  auxiliary_weight: 1.0
+  tail_quantile: 0.95
+  miss_quantile: 0.80
+  peak_kernel: 5
+  exclusion_radius: 2
+  worst_gamma: 10.0
+  grad_clip: 5.0
+  val_every: 1
+  save_every: 20
+  num_workers: 4
+  device: cuda
+  amp: true
+  deterministic: true
+  seed: 42
+
+episodes:
+  # Pseudo-target training episodes may overlap; target evaluation and CRC
+  # episodes must use disjoint image blocks.
+  context_size: 32
+  horizon: 16
+  train_stride: 16
+  eval_stride: 48
+  peak_min_distance: 2
+  peak_min_score: 0.0
+  peak_border: 0
+  peak_tolerance: 2.0
+  # 0 means no candidate truncation. Keep this for formal risk-control runs.
+  max_candidates: 0
+
+curve:
+  quantile: 0.90
+  hidden_dim: 256
+  dropout: 0.10
+  lambda_peak: 1.0
+  batch_size: 64
+  epochs: 300
+  lr: 0.001
+  weight_decay: 0.0001
+  val_fraction: 0.20
+  patience: 40
+  num_workers: 0
+  device: cuda
+  seed: 42
+
+budgets:
+  pixel: 1.0e-6
+  peak_per_mp: 1.0
+
+calibration:
+  alpha: 0.10
+  # m=5 is impossible under the standard correction at alpha=.10 because
+  # 1/(m+1)=.1667. Treat m=10 as a severe small-sample diagnostic; use 20/50
+  # for the principal formally controlled results.
+  sizes: [10, 20, 50]
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  offset_step: 1

@@ -7,6 +7,49 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
+def test_deterministic_global_max_pool_matches_adaptive_pool_tie_rule() -> None:
+    from model.MSHNet import DeterministicGlobalMaxPool2d
+
+    adaptive_input = torch.tensor(
+        [[[[1.0, 2.0, 2.0], [0.0, 2.0, 1.0]]]],
+        requires_grad=True,
+    )
+    deterministic_input = adaptive_input.detach().clone().requires_grad_(True)
+    expected = torch.nn.functional.adaptive_max_pool2d(adaptive_input, 1)
+    actual = DeterministicGlobalMaxPool2d()(deterministic_input)
+
+    assert torch.equal(actual, expected)
+    expected.sum().backward()
+    actual.sum().backward()
+    assert torch.equal(deterministic_input.grad, adaptive_input.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_mshnet_strict_deterministic_cuda_backward() -> None:
+    from model.MSHNet import MSHNet
+
+    previous_enabled = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        model = MSHNet(3).to("cuda").train()
+        inputs = torch.randn(2, 3, 32, 32, device="cuda")
+        auxiliary, output = model(inputs, True)
+        loss = output.square().mean() + sum(
+            prediction.square().mean() for prediction in auxiliary
+        )
+        loss.backward()
+        assert all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+            for parameter in model.parameters()
+        )
+    finally:
+        torch.use_deterministic_algorithms(
+            previous_enabled,
+            warn_only=previous_warn_only,
+        )
+
+
 def test_validation_role_never_falls_back_to_official_test(tmp_path) -> None:
     from utils.data import IRSTD_Dataset
 

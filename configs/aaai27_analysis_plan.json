@@ -1,0 +1,507 @@
+{
+  "schema_version": "rc-irstd.aaai27-analysis-plan.v1",
+  "plan_status": "frozen_stage1_pilot_authorized",
+  "contains_observed_results": false,
+  "target_venue": "AAAI-27",
+  "method_identity": "Two-Stage No-Reject RC-IRSTD with an MSHNet Stage-1 backbone",
+  "claim_scope": "MSHNet-backbone setting only",
+  "authority": {
+    "implementation": "strict_flat_v5",
+    "strict_json_only": true,
+    "runtime_namespaces": [
+      "data_ext",
+      "evaluation",
+      "losses",
+      "model",
+      "rc",
+      "scripts"
+    ],
+    "forbidden_claim_runtime_namespace": "rc_irstd",
+    "reference_package": "RC-IRSTD_AAAI27_TwoStage_NoReject"
+  },
+  "authorization": {
+    "engineering_preflight": true,
+    "bounded_stage1_engineering_smoke": true,
+    "gate_minus_1": true,
+    "stage1_development_comparisons": true,
+    "stage2_real_data_training": false,
+    "official_test_model_evaluation": false,
+    "paper_performance_claims": false
+  },
+  "blocker_codes": [
+    "STAGE2_BASELINE_RUNNERS_INCOMPLETE",
+    "FOURTH_INDEPENDENT_DOMAIN_ABSENT",
+    "EXTERNAL_UNSEEN_TARGETS_ABSENT",
+    "NUAA_META_TRAIN_WINDOWS_BELOW_MINIMUM"
+  ],
+  "hash_contracts": {
+    "stage1_config": {
+      "path": "configs/aaai27_detector_tail_sep.json",
+      "sha256": "186d4ff30b16aecfff35eb682c8ecb897fcee98308a1bfa3f946748ef77b01af"
+    },
+    "stage1_pilot_matrix": {
+      "path": "configs/aaai27_stage1_pilot_matrix.json",
+      "sha256": "2207e66d40d1c96e9dfdabc3d38cd72b750d47fa90e34055e2cc2a1a3625103e"
+    },
+    "stage2_config": {
+      "path": "configs/aaai27_calibrator_risk_aligned.json",
+      "sha256": "c03bb3ca0574ef31b33c3701a6ca8e4baf414f3089201d3fa90a9ce076ed1258"
+    },
+    "official_train_split_manifest": {
+      "path": "splits/aaai27_v2/manifest.json",
+      "sha256": "a0de05010dc2b0f1332f5b611ec88309e0c809f16e63a904d0a19b9b1964e7e8"
+    },
+    "near_duplicate_source_audit": {
+      "path": "audits/aaai27/near_duplicates_original_official_splits_v2.json",
+      "sha256": "fbbde98eb1a3e883c6951d7bfc36644dbc01569ca80f6c3b6894cee7b24ca012"
+    },
+    "near_duplicate_quarantine": {
+      "path": "configs/aaai27_near_duplicate_quarantine.json",
+      "sha256": "ebc7eef69bac32a73fe8ff3c62e3ff5535c11e5aebfe19e6ff110c006bb76052"
+    },
+    "near_duplicate_effective_audit": {
+      "path": "audits/aaai27/near_duplicates_effective_splits_v2.json",
+      "sha256": "15c3aa1a60da2558813e00faaedfaf28f28b9fc9e2f36abfeb81b0ac65406358"
+    },
+    "dataset_contract": {
+      "path": "audits/aaai27/dataset_contract_v1.json",
+      "sha256": "480ad0ea938e2dbc238e339c8adfee0f1c9910790b05cfc101cf838d4c04ff70"
+    },
+    "domain_independence_decision": {
+      "path": "audits/aaai27/final_domain_independence_decision_v1.json",
+      "sha256": "ee1d78ec2cb484204f2b0b6ad4886e1fe34eb54e3a4257351528bbf12993b4f4"
+    }
+  },
+  "domains": {
+    "development": [
+      "NUAA-SIRST",
+      "NUDT-SIRST",
+      "IRSTD-1K"
+    ],
+    "confirmatory": [],
+    "confirmatory_assignment_policy": "assign and freeze a licensed fourth independent domain before labels or performance are inspected",
+    "minimum_independent_domains": 4,
+    "minimum_inner_detector_sources": 2,
+    "current_independent_domains": 3,
+    "dataset_type": "iid_images",
+    "temporal_or_causal_claim": false
+  },
+  "data_roles": {
+    "official_train_only_for_development": true,
+    "official_test_allowed_for_selection": false,
+    "official_test_static_integrity_audit_only_before_freeze": true,
+    "outer_target_official_train_allowed_in_same_outer_fold": false,
+    "same_fold_domain_roles_mutually_exclusive": true,
+    "detector_source_role": "detector_fit IDs only; detector_diagnostic is metrics-only and never selects a checkpoint",
+    "pseudo_target_role": "non-overlapping IID meta_train/meta_validation context-query windows",
+    "checkpoint_selection": "fixed_last_no_test_or_target_validation"
+  },
+  "internal_splits": {
+    "status": "frozen_v2_with_development_quarantine",
+    "generator": "scripts.freeze_official_train_splits",
+    "base_seed": 42,
+    "detector_diagnostic_fraction": 0.2,
+    "meta_validation_fraction": 0.2,
+    "iid_context_size": 32,
+    "iid_query_size": 64,
+    "iid_stride": 96,
+    "overlapping_meta_windows_allowed": false,
+    "quarantined_official_train_id_count": 30,
+    "minimum_meta_train_windows_per_pseudo_target": 3,
+    "observed_manifest_counts_are_data_inventory_not_model_results": true
+  },
+  "stage1_contract": {
+    "status": "implemented_release_candidate_frozen",
+    "backbone": "MSHNet",
+    "single_seed_pilot_epochs": 30,
+    "post_gate_full_training_epochs": 400,
+    "single_seed_pilot_seed": 42,
+    "seeds": [
+      42,
+      123,
+      3407
+    ],
+    "gpu_protocol": {
+      "physical_devices": [
+        0,
+        1,
+        2
+      ],
+      "all_three_mode": "DataParallel on physical GPUs 0,1,2 before any LODO process starts",
+      "lodo_mode": "three concurrent single-GPU folds on physical GPUs 0,1,2 after all-three completes",
+      "batch_per_domain": 3,
+      "paired_D0_D3_use_same_device_mode_within_each_fold": true,
+      "all_three_and_lodo_overlap_allowed": false
+    },
+    "common_training": {
+      "optimizer": "Adagrad",
+      "learning_rate": 0.05,
+      "warm_epoch": 5,
+      "risk_warmup_epochs": 5,
+      "risk_ramp_epochs": 10,
+      "base_size": 256,
+      "crop_size": 256,
+      "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+      "deterministic": true
+    },
+    "variants": {
+      "D0": {
+        "name": "segmentation_sls_only",
+        "risk_objective": "segmentation-only",
+        "lambda_margin": 0.0,
+        "exclusion_radius": 2,
+        "trainable_tail": "none",
+        "stop_gradient_tail": "not_applicable",
+        "mechanism": "backbone and segmentation-loss baseline with detached tail diagnostics",
+        "strict_variant_identity_implemented": true
+      },
+      "D1": {
+        "name": "background_upper_tail_trainable_only",
+        "risk_objective": "margin-background-only",
+        "lambda_margin": 0.2,
+        "exclusion_radius": 2,
+        "trainable_tail": "background",
+        "stop_gradient_tail": "target",
+        "mechanism": "same domain hinge as D3 with target lower tail stop-gradient",
+        "strict_variant_identity_implemented": true
+      },
+      "D2": {
+        "name": "target_lower_tail_trainable_only",
+        "risk_objective": "margin-target-only",
+        "lambda_margin": 0.2,
+        "exclusion_radius": 2,
+        "trainable_tail": "target",
+        "stop_gradient_tail": "background",
+        "mechanism": "same domain hinge as D3 with background upper tail stop-gradient",
+        "strict_variant_identity_implemented": true
+      },
+      "D3": {
+        "name": "full_domain_tail_separation",
+        "risk_objective": "margin",
+        "lambda_margin": 0.2,
+        "exclusion_radius": 2,
+        "trainable_tail": "both",
+        "stop_gradient_tail": "none",
+        "mechanism": "proposed Stage-1 objective",
+        "strict_variant_identity_implemented": true
+      }
+    },
+    "primary_analysis": {
+      "comparison": "D3_minus_D0",
+      "pixel_budget": 0.00001,
+      "endpoint": "macro_held_out_development_Pd_at_native_pixel_budget",
+      "direction": "higher",
+      "minimum_absolute_effect": 0.01,
+      "paired_confidence_interval_lower_bound_must_exceed": 0.0,
+      "source_diagnostic_IoU_noninferiority_margin": 0.01,
+      "mechanism_gap_improvement_logit": 0.1,
+      "minimum_domains_with_mechanism_improvement": 2,
+      "number_of_development_domains": 3
+    },
+    "evaluation_roles": {
+      "pilot_and_gate": "frozen official-train-derived detector_diagnostic IDs only",
+      "official_test": "sealed until method, D0-D3, budgets, seeds, and full Stage-1 expansion policy are frozen",
+      "official_test_selects_expansion_or_method": false,
+      "original_resolution_exact_replay": true
+    },
+    "single_seed_gate": {
+      "required_runs": [
+        "D0_all-three_s42",
+        "D3_all-three_s42",
+        "D0_leave-NUAA_s42",
+        "D3_leave-NUAA_s42",
+        "D0_leave-NUDT_s42",
+        "D3_leave-NUDT_s42",
+        "D0_leave-IRSTD1K_s42",
+        "D3_leave-IRSTD1K_s42"
+      ],
+      "minimum_held_out_domains_with_tail_or_Pd_improvement": 2,
+      "official_test_absent_from_gate": true,
+      "D1_D2_runs_before_gate_allowed": false
+    }
+  },
+  "stage2_contract": {
+    "status": "specified_not_authorized",
+    "method": "monotone_pixel_no_reject",
+    "reject_head": false,
+    "pixel_budget_grid_descending": [
+      0.0001,
+      0.00001,
+      0.000001
+    ],
+    "primary_pixel_budget": 0.00001,
+    "episode_protocol": {
+      "dataset_type": "iid_images",
+      "context_size": 32,
+      "query_size": 64,
+      "context_query_overlap": false,
+      "temporal_causality_claimed": false,
+      "query_labels_role": "meta_training_loss_and_exact_replay_only"
+    },
+    "threshold_semantics": "prediction = probability > threshold",
+    "matching": {
+      "connectivity": 8,
+      "rule": "overlap",
+      "centroid_distance": 0.0
+    },
+    "checkpoint_selection_order": [
+      "BSR_max",
+      "LogExcess_min",
+      "Pd_max",
+      "earlier_epoch_on_exact_tie"
+    ],
+    "primary_analysis": {
+      "comparison": "T8_proposed_minus_T4_rolling_quantile",
+      "baseline": "T4_rolling_context_quantile",
+      "endpoint": "macro_domain_BSR_at_primary_pixel_budget",
+      "direction": "higher",
+      "minimum_absolute_effect": 0.05,
+      "paired_confidence_interval_lower_bound_must_exceed": 0.0,
+      "Pd_noninferiority_margin": 0.02
+    },
+    "threshold_baselines": {
+      "T0": {
+        "name": "fixed_0.5",
+        "target_labels": false,
+        "reject_supported": false,
+        "strict_runner_validated": false
+      },
+      "T1": {
+        "name": "pooled_source_safe_threshold",
+        "target_labels": false,
+        "reject_supported": false,
+        "strict_runner_validated": false
+      },
+      "T2": {
+        "name": "worst_source_safe_threshold",
+        "target_labels": false,
+        "reject_supported": false,
+        "strict_runner_validated": false
+      },
+      "T3": {
+        "name": "nearest_source_threshold",
+        "target_labels": false,
+        "reject_supported": false,
+        "strict_runner_validated": false
+      },
+      "T4": {
+        "name": "rolling_context_quantile",
+        "target_labels": false,
+        "reject_supported": false,
+        "context_size": 32,
+        "quantile_rule": "one_minus_primary_pixel_budget_over_unlabeled_context_pixels",
+        "strict_runner_validated": false
+      },
+      "T5": {
+        "name": "EVT_GPD",
+        "target_labels": false,
+        "reject_supported": false,
+        "tail_quantile": 0.95,
+        "minimum_exceedances": 50,
+        "insufficient_tail_policy": "mark paired run missing and fail primary gate",
+        "strict_runner_validated": false
+      },
+      "T6": {
+        "name": "direct_threshold_MLP_no_reject",
+        "target_labels": false,
+        "reject_supported": false,
+        "same_features_and_budget_grid_as_T8": true,
+        "hidden_dim": 192,
+        "dropout": 0.1,
+        "strict_runner_validated": false
+      },
+      "T7": {
+        "name": "monotone_oracle_threshold_regression_no_reject",
+        "target_labels": false,
+        "reject_supported": false,
+        "same_features_and_budget_grid_as_T8": true,
+        "risk_aligned_terms_enabled": false,
+        "strict_runner_validated": false
+      },
+      "T8": {
+        "name": "flat_v5_no_reject_risk_aligned_calibrator",
+        "target_labels": false,
+        "reject_supported": false,
+        "strict_runner_validated": true,
+        "real_data_training_authorized": false
+      },
+      "T9": {
+        "name": "target_future_oracle_upper_bound",
+        "target_labels": true,
+        "selection_or_gate_input": false,
+        "diagnostic_only": true
+      }
+    },
+    "calibrator_ablations": {
+      "C0": {
+        "structural_monotonicity": false,
+        "query_risk_loss": false,
+        "oracle_auxiliary": true,
+        "support_statistics": "full",
+        "strict_runner_validated": false
+      },
+      "C1": {
+        "structural_monotonicity": true,
+        "query_risk_loss": false,
+        "oracle_auxiliary": true,
+        "support_statistics": "full",
+        "strict_runner_validated": false
+      },
+      "C2": {
+        "structural_monotonicity": true,
+        "query_risk_loss": true,
+        "oracle_auxiliary": false,
+        "support_statistics": "full",
+        "strict_runner_validated": false
+      },
+      "C3": {
+        "structural_monotonicity": true,
+        "query_risk_loss": true,
+        "oracle_auxiliary": true,
+        "support_statistics": "full",
+        "main_method": true,
+        "strict_runner_validated": true,
+        "real_data_training_authorized": false
+      },
+      "C4": {
+        "structural_monotonicity": true,
+        "query_risk_loss": true,
+        "oracle_auxiliary": true,
+        "support_statistics": "score_histogram_only",
+        "strict_runner_validated": false
+      },
+      "C5": {
+        "structural_monotonicity": true,
+        "query_risk_loss": true,
+        "oracle_auxiliary": true,
+        "support_statistics": "score_histogram_plus_local_peaks",
+        "strict_runner_validated": false
+      },
+      "C6": {
+        "structural_monotonicity": true,
+        "query_risk_loss": true,
+        "oracle_auxiliary": true,
+        "support_statistics": "score_histogram_plus_local_peaks_noise_and_source_distance",
+        "strict_runner_validated": false
+      }
+    }
+  },
+  "statistics": {
+    "training_seeds": [
+      42,
+      123,
+      3407
+    ],
+    "confidence_level": 0.95,
+    "primary_alpha": 0.05,
+    "bootstrap": {
+      "resamples": 10000,
+      "random_seed": 2027,
+      "iid_unit": "image_id",
+      "temporal_unit": "not_applicable_without_sequence_metadata",
+      "paired_blocks_and_seeds": true
+    },
+    "domain_aggregation": "unweighted_macro_mean_with_each_domain_also_reported",
+    "primary_comparison_count": 1,
+    "secondary_multiple_comparison": "Holm_familywise_alpha_0.05",
+    "missing_run_policy": "no_imputation; any missing primary paired run makes the corresponding gate false",
+    "rerun_policy": "rerun only documented implementation or infrastructure failures identified before inspecting performance metrics",
+    "low_false_alarm_estimability": {
+      "rule": "pixel_budget_times_total_background_pixels_at_least_20",
+      "inestimable_primary_budget_policy": "gate_false_and_report_descriptive_counts_only"
+    }
+  },
+  "near_duplicate_contract": {
+    "status": "passed_with_development_quarantine",
+    "images_only": true,
+    "labels_scores_checkpoints_or_metrics_read": false,
+    "candidate_method": "grayscale_phash64",
+    "resize": "32x32_Lanczos",
+    "candidate_hamming_distance_max": 4,
+    "confirmation_method": "64x64_grayscale_mean_centered_cosine",
+    "confirmation_cosine_min": 0.995,
+    "threshold_selected_before_audit": true,
+    "candidate_resolution": "all 31 confirmed same-dataset train-test candidates resolved as same_scene_related and every implicated train ID quarantined",
+    "unresolved_candidate_policy": "gate_false",
+    "source_confirmed_pair_count": 31,
+    "unique_quarantined_official_train_id_count": 30,
+    "effective_split_confirmed_pair_count": 0,
+    "cross_dataset_confirmed_pair_count": 0,
+    "raw_data_or_official_split_modified": false,
+    "human_signoff_claimed": false,
+    "conservative_quarantine_does_not_restore_visual_candidates": true
+  },
+  "gates": {
+    "G_minus_1": {
+      "current": true,
+      "requires": [
+        "clean_git_commit",
+        "analysis_plan_git_tracked_and_hash_frozen",
+        "all_hash_contracts_match",
+        "D0_D3_paired_runner_validated",
+        "dataset_and_quarantine_contracts_passed",
+        "near_duplicate_effective_audit_passed"
+      ]
+    },
+    "G1": {
+      "current": false,
+      "requires": [
+        "D0_D3_eight_single_seed_pilot_runs_complete_on_official_train_diagnostic_roles",
+        "D3_minus_D0_effect_at_least_0.01",
+        "source_IoU_drop_at_most_0.01",
+        "mechanism_gap_or_low_FA_Pd_improves_on_at_least_2_of_3_domains",
+        "official_test_absent_from_gate_decisions"
+      ]
+    },
+    "G2": {
+      "current": false,
+      "requires": [
+        "G1_single_seed_stage1_gate_true",
+        "D0_D3_all_three_training_seeds_complete",
+        "paired_image_level_bootstrap_complete",
+        "paired_95pct_CI_and_per_seed_results_reported"
+      ]
+    },
+    "G3": {
+      "current": false,
+      "requires": [
+        "threshold_drift_on_at_least_2_development_domains",
+        "oracle_Pd_gain_at_least_0.03_on_at_least_2_development_domains",
+        "target_oracle_is_diagnostic_only",
+        "official_test_absent_from_problem_validation_decisions",
+        "exact_hard_replay_passed"
+      ]
+    },
+    "G4": {
+      "current": false,
+      "requires": [
+        "at_least_4_independent_domains",
+        "at_least_2_inner_detector_sources_per_pseudo_target",
+        "fourth_domain_license_and_split_hashes_frozen",
+        "cross_domain_exact_and_near_duplicate_audits_passed"
+      ]
+    },
+    "G5": {
+      "current": false,
+      "requires": [
+        "G1_G2_G3_G4_true",
+        "T0_T9_threshold_baselines_and_C0_C6_calibrator_ablations_validated",
+        "T8_minus_T4_BSR_effect_at_least_0.05",
+        "T8_Pd_drop_not_more_than_0.02",
+        "zero_monotonicity_violations",
+        "confirmatory_outer_identity_frozen",
+        "outer_threshold_frozen_before_query_labels",
+        "final_refit_policy_frozen"
+      ]
+    },
+    "G6": {
+      "current": false,
+      "requires": [
+        "all_preregistered_outer_folds_seeds_baselines_and_ablations_complete",
+        "paired_statistics_complete",
+        "failure_and_missing_run_policy_applied",
+        "claim_support_integrity_audit_passed"
+      ]
+    }
+  }
+}

@@ -1,0 +1,36 @@
+stage_0_problem_diagnosis:
+  detectors: [MSHNet_baseline]
+  thresholds: [fixed_0.5, pooled_source, worst_source, target_oracle]
+  pass_if:
+    - at_least_2_of_3_targets_show_threshold_drift
+    - oracle_Pd_gain_ge_0.03_on_at_least_2_targets
+stage_1_detector_pair:
+  variants:
+    - baseline_segmentation_only
+    - domain_tail_separation
+  epochs: [1, 5, 20, 40]
+  seeds: [42]
+  pass_if:
+    - source_val_IoU_drop_le_0.01
+    - unseen_high_background_tail_improves_on_at_least_2_targets
+    - logit_scale_does_not_diverge
+stage_2_calibrator:
+  variants:
+    - fixed_0.5
+    - pooled_source_threshold
+    - worst_source_threshold
+    - rolling_quantile
+    - EVT_GPD
+    - direct_threshold_MLP
+    - monotone_oracle_regression
+    - monotone_query_risk_aligned
+    - target_oracle
+  checkpoint_order: [BSR, LogExcess, Pd]
+  pass_if:
+    - proposed_beats_rolling_and_direct_on_BSR_or_LogExcess
+    - Pd_does_not_collapse
+    - monotonicity_violations_equal_0
+stage_3_nested_lodo:
+  minimum_meta_source_domains: 4
+  first_run: {outer_targets: 1, seeds: 1, detector_epochs: 40}
+  expand_only_after_gate: true
