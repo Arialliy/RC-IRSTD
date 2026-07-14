@@ -10,6 +10,9 @@ import numpy as np
 import pytest
 from PIL import Image
 from data_ext.dataset_identity import (
+    DATASET_IDENTITY_ALGORITHM,
+    DATASET_IDENTITY_EXTENSIONS,
+    DATASET_RECORD_SCHEMA_VERSION,
     IMAGE_CONTENT_LEAF_ALGORITHM,
     IMAGE_CONTENT_LEAF_SET_ALGORITHM,
     TRAINING_ARTIFACT_ALGORITHM,
@@ -166,6 +169,9 @@ def _make_frozen_detector_diagnostic_partition(
         "role_contract": {
             "official_test_emitted": False,
             "official_test_labels_read_for_quarantine": False,
+            "outer_target_official_train_used_for_detector_fit": False,
+            "outer_target_detector_diagnostic_used_for_development_evaluation": True,
+            "outer_target_diagnostic_selects_checkpoint": False,
             "detector_checkpoint_selection": "fixed_last",
             "detector_diagnostic_used_for_checkpoint_selection": False,
         },
@@ -236,13 +242,14 @@ def _fake_source_record(source_name: str, identity_hex: str) -> dict[str, object
         return digest.hexdigest()
 
     return {
-        "record_schema_version": 2,
+        "record_schema_version": DATASET_RECORD_SCHEMA_VERSION,
         "source_name": source_name,
-        "dataset_identity_algorithm": "sha256-relative-path-content-v1",
+        "dataset_identity_algorithm": DATASET_IDENTITY_ALGORITHM,
         "dataset_identity_sha256": identity_hex * 64,
         "dataset_num_files": 1,
         "dataset_num_bytes": 10,
         "dataset_identity_folders": ["images"],
+        "dataset_identity_extensions": list(DATASET_IDENTITY_EXTENSIONS),
         "image_content_leaf_algorithm": IMAGE_CONTENT_LEAF_ALGORITHM,
         "image_content_sha256_leaves": [leaf],
         "image_content_leaf_set_algorithm": IMAGE_CONTENT_LEAF_SET_ALGORITHM,
@@ -299,6 +306,8 @@ def test_dataset_identity_survives_directory_copy_and_detects_content_change(
     tmp_path: Path,
 ) -> None:
     original = _make_nuaa_style_dataset(tmp_path / "logical-A")
+    (original / "images" / ".DS_Store").write_bytes(b"finder metadata")
+    (original / "images" / "notes.json").write_text("{}\n", encoding="utf-8")
     copied = tmp_path / "renamed-copy"
     shutil.copytree(original, copied)
 
@@ -309,6 +318,21 @@ def test_dataset_identity_survives_directory_copy_and_detects_content_change(
         == copied_identity["dataset_identity_sha256"]
     )
     assert original_identity["dataset_num_files"] == 1
+    assert original_identity["dataset_identity_algorithm"] == (
+        DATASET_IDENTITY_ALGORITHM
+    )
+    assert original_identity["dataset_identity_extensions"] == list(
+        DATASET_IDENTITY_EXTENSIONS
+    )
+
+    (copied / "images" / ".DS_Store").write_bytes(b"changed finder metadata")
+    (copied / "images" / "notes.json").write_text(
+        '{"changed": true}\n', encoding="utf-8"
+    )
+    assert (
+        dataset_identity(copied)["dataset_identity_sha256"]
+        == original_identity["dataset_identity_sha256"]
+    )
 
     changed_mask = np.zeros((4, 8), dtype=np.uint8)
     changed_mask[0, 0] = 255
@@ -317,6 +341,15 @@ def test_dataset_identity_survives_directory_copy_and_detects_content_change(
         dataset_identity(copied)["dataset_identity_sha256"]
         == original_identity["dataset_identity_sha256"]
     )
+
+    extra_raster = copied / "images" / "extra.PNG"
+    extra_raster.write_bytes((copied / "images" / "Misc_1.png").read_bytes())
+    assert dataset_identity(copied)["dataset_num_files"] == 2
+    assert (
+        dataset_identity(copied)["dataset_identity_sha256"]
+        != original_identity["dataset_identity_sha256"]
+    )
+    extra_raster.unlink()
 
     changed = np.zeros((4, 8, 3), dtype=np.uint8)
     changed[0, 0] = 255
@@ -543,6 +576,25 @@ def test_checkpoint_without_dataset_records_is_legacy_but_diagnostic() -> None:
     assert provenance["provenance_level"] == "legacy_unverified"
     assert provenance["legacy_reason"] == "missing_detector_source_records"
     assert provenance["detector_source_domains"] == ["A"]
+
+
+@requires_torch
+def test_checkpoint_with_pre_raster_filter_records_is_legacy() -> None:
+    old_record = _fake_source_record("A", "1")
+    old_record["record_schema_version"] = 2
+    old_record.pop("dataset_identity_extensions")
+    provenance = checkpoint_provenance(
+        {
+            "state_dict": {"unused": torch.zeros(1)},
+            "detector_source_domains": ["A"],
+            "detector_source_records": [old_record],
+            "held_out_domains": ["B"],
+        }
+    )
+    assert provenance["provenance_level"] == "legacy_unverified"
+    assert provenance["legacy_reason"] == (
+        "detector_source_records_precede_supported_raster_schema_v3"
+    )
 
 
 @requires_torch
@@ -1058,6 +1110,49 @@ def test_detector_diagnostic_contract_rejects_unfrozen_or_copied_split(
             manifest_root=tmp_path / "scores-wrong-sha",
             derived_split_manifest=split_manifest,
             derived_split_manifest_sha256="0" * 64,
+        )
+
+
+@requires_torch
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("outer_target_official_train_used_for_detector_fit", True),
+        (
+            "outer_target_detector_diagnostic_used_for_development_evaluation",
+            False,
+        ),
+        ("outer_target_diagnostic_selects_checkpoint", True),
+        ("outer_target_official_train_used", False),
+        ("outer_target_official_train_allowed_in_same_outer_fold", False),
+    ),
+)
+def test_detector_diagnostic_contract_rejects_outer_target_role_drift(
+    tmp_path: Path,
+    field: str,
+    invalid_value: bool,
+) -> None:
+    from data_ext.inference_dataset import IRSTDInferenceDataset
+    from evaluation.export_score_maps import build_official_split_contract
+
+    dataset, split_manifest, diagnostic_split = (
+        _make_frozen_detector_diagnostic_partition(tmp_path / "repository")
+    )
+    payload = json.loads(split_manifest.read_text(encoding="utf-8"))
+    payload["role_contract"][field] = invalid_value
+    split_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    inference = IRSTDInferenceDataset(
+        dataset,
+        base_size=16,
+        split_file=diagnostic_split,
+    )
+    with pytest.raises(ValueError, match=field):
+        build_official_split_contract(
+            inference,
+            split_role="detector_diagnostic",
+            manifest_root=tmp_path / "scores-role-drift",
+            derived_split_manifest=split_manifest,
+            derived_split_manifest_sha256=sha256_file(split_manifest),
         )
 
 

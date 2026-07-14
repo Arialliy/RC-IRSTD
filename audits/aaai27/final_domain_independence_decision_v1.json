@@ -25,7 +25,7 @@
     },
     "split_manifest": {
       "path": "splits/aaai27_v2/manifest.json",
-      "sha256": "a0de05010dc2b0f1332f5b611ec88309e0c809f16e63a904d0a19b9b1964e7e8"
+      "sha256": "0f378ed10ce98953fa66d9a05e0db3bf71f75351b302b9014a637de95c8d3bfa"
     }
   },
   "limitations": {

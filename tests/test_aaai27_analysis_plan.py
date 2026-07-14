@@ -20,6 +20,7 @@ PLAN = ROOT / "configs" / "aaai27_analysis_plan.json"
 
 def test_current_analysis_plan_is_valid_and_runtime_gated() -> None:
     report = validate_plan(PLAN, ROOT)
+    plan = json.loads(PLAN.read_text(encoding="utf-8"))
     assert report["status"] == "PASS"
     assert report["contains_observed_results"] is False
     assert report["gate_minus_1"] is (
@@ -41,7 +42,7 @@ def test_current_analysis_plan_is_valid_and_runtime_gated() -> None:
         "effective_confirmed_pair_count": 0,
     }
     assert report["stage1_pilot_matrix_summary"] == {
-        "sha256": "2207e66d40d1c96e9dfdabc3d38cd72b750d47fa90e34055e2cc2a1a3625103e",
+        "sha256": "587a53ba190416f3070f1ae3f46c312c5880da08537c9737557f11140f2b7ac1",
         "run_count": 8,
         "phase_count": 4,
     }
@@ -49,6 +50,18 @@ def test_current_analysis_plan_is_valid_and_runtime_gated() -> None:
     assert "NEAR_DUPLICATE_AUDIT_NOT_RUN" not in report["blocker_codes"]
     assert "STAGE2_BASELINE_RUNNERS_INCOMPLETE" in report[
         "scientific_blocker_codes"
+    ]
+    assert plan["data_roles"][
+        "outer_target_official_train_used_for_detector_fit"
+    ] is False
+    assert plan["data_roles"][
+        "outer_target_detector_diagnostic_used_for_development_evaluation"
+    ] is True
+    assert plan["data_roles"][
+        "outer_target_diagnostic_selects_checkpoint"
+    ] is False
+    assert "outer_target_official_train_allowed_in_same_outer_fold" not in plan[
+        "data_roles"
     ]
 
 
@@ -96,4 +109,47 @@ def test_analysis_plan_rejects_hash_drift(tmp_path: Path) -> None:
     path = tmp_path / "plan.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="hash contract drift"):
+        validate_plan(path, ROOT)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("outer_target_official_train_used_for_detector_fit", True),
+        (
+            "outer_target_detector_diagnostic_used_for_development_evaluation",
+            False,
+        ),
+        ("outer_target_diagnostic_selects_checkpoint", True),
+    ),
+)
+def test_analysis_plan_rejects_outer_target_role_drift(
+    tmp_path: Path,
+    field: str,
+    invalid_value: bool,
+) -> None:
+    payload = json.loads(PLAN.read_text(encoding="utf-8"))
+    payload["data_roles"][field] = invalid_value
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="outer-target"):
+        validate_plan(path, ROOT)
+
+
+@pytest.mark.parametrize(
+    "deprecated_field",
+    (
+        "outer_target_official_train_used",
+        "outer_target_official_train_allowed_in_same_outer_fold",
+    ),
+)
+def test_analysis_plan_rejects_deprecated_ambiguous_role_fields(
+    tmp_path: Path,
+    deprecated_field: str,
+) -> None:
+    payload = json.loads(PLAN.read_text(encoding="utf-8"))
+    payload["data_roles"][deprecated_field] = False
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="deprecated ambiguous role fields"):
         validate_plan(path, ROOT)

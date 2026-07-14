@@ -101,9 +101,22 @@ def verify_detector_diagnostic_partition(
     role_contract = payload.get("role_contract")
     if not isinstance(role_contract, Mapping):
         raise TypeError("derived split manifest role_contract must be a mapping")
+    deprecated_role_fields = {
+        "outer_target_official_train_used",
+        "outer_target_official_train_allowed_in_same_outer_fold",
+    }
+    present_deprecated_fields = deprecated_role_fields.intersection(role_contract)
+    if present_deprecated_fields:
+        raise ValueError(
+            "derived split manifest contains deprecated ambiguous role fields: "
+            f"{sorted(present_deprecated_fields)}"
+        )
     exact_role_fields = {
         "official_test_emitted": False,
         "official_test_labels_read_for_quarantine": False,
+        "outer_target_official_train_used_for_detector_fit": False,
+        "outer_target_detector_diagnostic_used_for_development_evaluation": True,
+        "outer_target_diagnostic_selects_checkpoint": False,
         "detector_checkpoint_selection": "fixed_last",
         "detector_diagnostic_used_for_checkpoint_selection": False,
     }

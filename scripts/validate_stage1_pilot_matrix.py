@@ -278,7 +278,7 @@ def _expected_run_specs() -> list[dict[str, Any]]:
                 "evaluation_diagnostic_files": diagnostics,
                 "gpu_visible_devices": [0, 1, 2],
                 "data_parallel": True,
-                "output_dir": f"outputs/stage1_pilot_30ep/{run_id}",
+                "output_dir": f"outputs/stage1_pilot_30ep_v5_rc2/{run_id}",
             }
         )
 
@@ -305,7 +305,7 @@ def _expected_run_specs() -> list[dict[str, Any]]:
                     "evaluation_diagnostic_files": diagnostics,
                     "gpu_visible_devices": [gpu],
                     "data_parallel": False,
-                    "output_dir": f"outputs/stage1_pilot_30ep/{run_id}",
+                    "output_dir": f"outputs/stage1_pilot_30ep_v5_rc2/{run_id}",
                 }
             )
     return result
@@ -376,10 +376,31 @@ def _validate_plan_and_frozen_inputs(
     authorization = _mapping(plan.get("authorization"), "analysis_plan.authorization")
     data_roles = _mapping(plan.get("data_roles"), "analysis_plan.data_roles")
     gate = _mapping(plan["stage1_contract"]["single_seed_gate"], "single_seed_gate")
+    deprecated_role_fields = {
+        "outer_target_official_train_used",
+        "outer_target_official_train_allowed_in_same_outer_fold",
+    }
+    present_deprecated_fields = deprecated_role_fields.intersection(data_roles)
+    if present_deprecated_fields:
+        raise ValueError(
+            "analysis plan contains deprecated ambiguous role fields: "
+            f"{sorted(present_deprecated_fields)}"
+        )
     if authorization.get("official_test_model_evaluation") is not False:
         raise ValueError("sealed evaluation role is unexpectedly authorized")
     if data_roles.get("official_test_allowed_for_selection") is not False:
         raise ValueError("sealed evaluation role is unexpectedly allowed for selection")
+    if data_roles.get("outer_target_official_train_used_for_detector_fit") is not False:
+        raise ValueError("outer-target official train is unexpectedly used for fitting")
+    if (
+        data_roles.get(
+            "outer_target_detector_diagnostic_used_for_development_evaluation"
+        )
+        is not True
+    ):
+        raise ValueError("outer-target development diagnostic role is not enabled")
+    if data_roles.get("outer_target_diagnostic_selects_checkpoint") is not False:
+        raise ValueError("outer-target diagnostics unexpectedly select checkpoints")
     if gate.get("official_test_absent_from_gate") is not True:
         raise ValueError("Stage-1 single-seed gate does not keep the sealed role absent")
     return plan, bound_inputs["stage1_config"], bound_inputs["split_manifest"]
@@ -661,11 +682,11 @@ def validate_matrix(
         {"tag", "source_archive", "source_archive_sha256_file"},
         "release_contract",
     )
-    if release["tag"] != "aaai27-rc-irstd-v5-rc1":
+    if release["tag"] != "aaai27-rc-irstd-v5-rc2":
         raise ValueError("release tag drift")
-    if release["source_archive"] != "outputs/release/RC-IRSTD_v5_rc1.zip":
+    if release["source_archive"] != "outputs/release/RC-IRSTD_v5_rc2.zip":
         raise ValueError("source archive path drift")
-    if release["source_archive_sha256_file"] != "outputs/release/RC-IRSTD_v5_rc1.zip.sha256":
+    if release["source_archive_sha256_file"] != "outputs/release/RC-IRSTD_v5_rc2.zip.sha256":
         raise ValueError("source archive checksum path drift")
     archive_path = _resolve_repo_path(root, release["source_archive"], "release.archive")
     checksum_path = _resolve_repo_path(

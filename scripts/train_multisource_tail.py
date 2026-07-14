@@ -50,7 +50,7 @@ from losses.target_background_margin import (
     legacy_image_margin_loss,
 )
 from model.MSHNet import MSHNet
-from model.loss import SLSIoULoss
+from losses.sls import SLSIoULoss
 from utils.data import IRSTD_Dataset
 
 
@@ -59,6 +59,7 @@ RESUME_CONTRACT_VERSION = 1
 AAAI27_PILOT_RUN_CONTRACT_VERSION = "rc-irstd.aaai27-stage1-run-contract.v1"
 AAAI27_ANALYSIS_PLAN_SCHEMA = "rc-irstd.aaai27-analysis-plan.v1"
 AAAI27_PILOT_MATRIX_SCHEMA = "rc-irstd.aaai27-stage1-pilot-matrix.v1"
+STAGE1_SLS_LOSS_EPS = 1e-8
 _RESUME_MUTABLE_ARGUMENTS = frozenset({"epochs", "resume"})
 DOMAIN_MARGIN_OBJECTIVES = frozenset(
     {"margin-background-only", "margin-target-only", "margin"}
@@ -66,6 +67,18 @@ DOMAIN_MARGIN_OBJECTIVES = frozenset(
 MARGIN_DIAGNOSTIC_OBJECTIVES = DOMAIN_MARGIN_OBJECTIVES | frozenset(
     {"segmentation-only", "legacy-image-margin"}
 )
+
+
+def stage1_segmentation_loss_implementation() -> Dict[str, object]:
+    """Return the shared, auditable SLS implementation identity for D0 and D3."""
+
+    return {
+        "qualified_name": f"{SLSIoULoss.__module__}.{SLSIoULoss.__qualname__}",
+        "implementation_revision": "empty-mask-safe-epsilon-v1",
+        "eps": STAGE1_SLS_LOSS_EPS,
+        "multiscale_reduction": "mean_final_plus_four_auxiliary_heads",
+        "paired_stage1_variants": ["D0", "D3"],
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -763,6 +776,9 @@ def risk_objective_contract(args: argparse.Namespace) -> Dict[str, object]:
 def detector_capability_contract(args: argparse.Namespace) -> Dict[str, object]:
     return {
         "risk_objective": risk_objective_contract(args),
+        "segmentation_loss_implementation": (
+            stage1_segmentation_loss_implementation()
+        ),
         "training_diagnostics": {
             "domain_tail_fields": [
                 "background_tail_logit",
@@ -1763,6 +1779,9 @@ def write_aaai27_pilot_run_artifacts(
             "epochs": args.epochs,
             "stage1_variant": risk_objective_contract(args).get("stage1_variant"),
             "risk_objective": args.risk_objective,
+            "segmentation_loss_implementation": (
+                stage1_segmentation_loss_implementation()
+            ),
             "source_names": names,
             "source_identities": source_identities,
             "outer_fold_id": args.outer_fold_id,
@@ -1859,6 +1878,9 @@ def resume_contract(args: argparse.Namespace) -> Dict[str, object]:
         "schema_version": RESUME_CONTRACT_VERSION,
         "immutable_training_args": values,
         "risk_objective_contract": risk_objective_contract(args),
+        "segmentation_loss_implementation": (
+            stage1_segmentation_loss_implementation()
+        ),
         "checkpoint_selection": "fixed_last_no_test_or_target_validation",
     }
 
@@ -1933,6 +1955,9 @@ def load_resume_checkpoint(
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
         raise TypeError("resume config.json must contain an object")
+    expected_segmentation_loss = stage1_segmentation_loss_implementation()
+    if config.get("segmentation_loss_implementation") != expected_segmentation_loss:
+        raise ValueError("resume config segmentation-loss implementation mismatch")
     run_config_sha256 = sha256_file(config_path)
     run_contract_sha256: str | None = None
     if pilot_mode:
@@ -1952,6 +1977,15 @@ def load_resume_checkpoint(
             raise ValueError("pilot run contract release binding mismatch")
         if run_contract.get("pilot_run_id") != getattr(args, "pilot_run_id"):
             raise ValueError("pilot run contract run_id mismatch")
+        run_contract_training = run_contract.get("training")
+        if (
+            not isinstance(run_contract_training, Mapping)
+            or run_contract_training.get("segmentation_loss_implementation")
+            != expected_segmentation_loss
+        ):
+            raise ValueError(
+                "pilot run contract segmentation-loss implementation mismatch"
+            )
         config_binding = run_contract.get("run_config")
         if (
             not isinstance(config_binding, Mapping)
@@ -1975,6 +2009,7 @@ def load_resume_checkpoint(
         "outer_target",
         "checkpoint_selection",
         "risk_objective_contract",
+        "segmentation_loss_implementation",
         "resume_contract",
         "run_config_sha256",
         "rng_state",
@@ -2004,6 +2039,8 @@ def load_resume_checkpoint(
         raise ValueError("resume outer-target contract mismatch")
     if checkpoint["risk_objective_contract"] != risk_objective_contract(args):
         raise ValueError("resume risk-objective capability contract mismatch")
+    if checkpoint["segmentation_loss_implementation"] != expected_segmentation_loss:
+        raise ValueError("resume checkpoint segmentation-loss implementation mismatch")
     if checkpoint["execution_fingerprint"] != execution_fingerprint():
         raise ValueError(
             "resume source-tree/runtime execution fingerprint mismatch"
@@ -2064,6 +2101,9 @@ def save_checkpoint(
         "checkpoint_selection": "fixed_last_no_test_or_target_validation",
         "head_training_schedule": "all_auxiliary_and_fused_heads_from_epoch_zero",
         "risk_objective": args.risk_objective,
+        "segmentation_loss_implementation": (
+            stage1_segmentation_loss_implementation()
+        ),
         "risk_objective_contract": risk_objective_contract(args),
         "detector_capability_contract": detector_capability_contract(args),
         "protocol_scope": protocol_scope(args, names),
@@ -2467,6 +2507,9 @@ def train_one_epoch(
             else current_learning_rates
         ),
         "risk_objective": args.risk_objective,
+        "segmentation_loss_implementation": (
+            stage1_segmentation_loss_implementation()
+        ),
         "stage1_variant": risk_objective_contract(args).get(
             "stage1_variant", "compatibility_baseline"
         ),
@@ -2609,7 +2652,7 @@ def main() -> None:
         (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=args.lr,
     )
-    sls_loss = SLSIoULoss()
+    sls_loss = SLSIoULoss(eps=STAGE1_SLS_LOSS_EPS)
 
     run_execution_fingerprint = execution_fingerprint()
     current_config = {
@@ -2627,6 +2670,9 @@ def main() -> None:
         "checkpoint_selection": "fixed_last_no_test_or_target_validation",
         "head_training_schedule": "all_auxiliary_and_fused_heads_from_epoch_zero",
         "risk_objective": args.risk_objective,
+        "segmentation_loss_implementation": (
+            stage1_segmentation_loss_implementation()
+        ),
         "risk_objective_contract": risk_objective_contract(args),
         "detector_capability_contract": detector_capability_contract(args),
         "protocol_scope": protocol_scope(args, names),

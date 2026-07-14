@@ -1,9 +1,9 @@
 # RC-IRSTD AAAI-27：当前状态、训练决策与下一步执行方案
 
 > **仓库**：`https://github.com/Arialliy/RC-IRSTD`
-> **日期**：2026-07-14
+> **日期**：2026-07-15
 > **方法版本**：Two-Stage / No-Reject / schema-v4 / v5 calibrator
-> **当前结论**：**Stage 1 性能训练在新 RC 提交、tag、归档和 sealed preflight 后 GO；Stage 2 仅 synthetic/engineering smoke GO；三域真实 Stage 2 训练、正式主实验与 AAAI 结论 NO-GO。**
+> **当前结论**：**RC1 D0 因旧 SLS 实现偏差已标记 implementation-invalid；RC2 修复已完成预发布 CPU 验证，Stage 1 仅在新 commit、tag、归档和 sealed preflight 通过后 GO。Stage 2 仅 synthetic/engineering smoke GO；三域真实 Stage 2 训练、正式主实验与 AAAI 结论 NO-GO。**
 
 ---
 
@@ -15,16 +15,17 @@
 - 三域同时训练和三个两源 LODO detector 路由均可完成前向、反向、保存、严格重载和有限性检查；
 - Stage 1 的域级目标下尾—背景上尾间隔、GT 邻域排除和确定性 plateau collapse 已接入；
 - Stage 2 的完整预算单调曲线、无 Reject v5 模型、query-risk-aligned loss、schema-v4 grouped episodes、checkpoint 审计和原分辨率 exact replay 已形成代码闭环；
-- 上一版预检报告为 `PASS`：189 tests、10 subtests、GPU 0/1/2、31 个正式入口及 9 个调度路由通过；本轮 D0–D3、quarantine 与 v2 split 修改后必须重新 sealed preflight；
+- RC1 sealed preflight 为 `PASS`：226 tests、10 subtests；但该测试集没有覆盖 strict Stage-1 入口误绑旧 SLS 的空目标语义，因此不能挽救已失效的 RC1 性能运行；
+- RC2 预发布 CPU 全量回归为 244 passed、10 subtests、1 个预期 CUDA skip；GPU 0/1/2 smoke 与 clean-release sealed preflight 仍须在 tag/archive 后重跑；
 - 历史 engineering smoke 的最小训练 → checkpoint → 重载 → 无标签前缀适配 → CPU 阈值复算 → 标签后读 exact replay 闭环通过；该 smoke 不参与本轮模型选择或性能 Gate。
 
-但当前真实运行仍只是：
+当前已有一次真实训练尝试：
 
 ```text
-1 epoch × 1 step engineering smoke
+RC1 D0 all-three：完整 epoch 0--5；epoch 6 中受控停止
 ```
 
-它证明的是**软件链路与机制可运行**，不证明：
+该运行因 strict 入口使用旧 `model.loss.SLSIoULoss`、影响 17.89% 的空目标 crop，已归档为 `implementation-invalid / diagnostic-aborted`，禁止 resume、禁止进入 Gate 或论文结果。它连同历史 smoke 只证明**软件链路可运行并帮助定位实现错误**，不证明：
 
 ```text
 性能提升；
@@ -34,12 +35,18 @@
 AAAI 主张成立。
 ```
 
-因此，下一步不应继续扩展模型或重写协议，而应按以下唯一顺序推进：
+RC1 失效证据和 RC2 修复合同见：
 
 ```text
-冻结工作树与实验契约
+docs/AAAI27_RC1_SLS_IMPLEMENTATION_INVALID.md
+```
+
+下一步按以下唯一顺序推进：
+
+```text
+完成 RC2 全量验证并冻结工作树与实验契约
 → 完成并冻结近重复隔离、数据契约与分析计划
-→ Stage 1 单 seed、20–40 epoch 性能 Gate
+→ RC2 Stage 1 从 epoch 0 单 seed、30 epoch 性能 Gate
 → Gate 通过后扩展 3 seeds
 → 新增至少第 4 个独立域
 → 启动合法的 Stage 2 outer-fold pilot
@@ -52,17 +59,17 @@ AAAI 主张成立。
 
 ### 1.1 已确认的工程证据
 
-上一版 sealed preflight（仅作历史工程证据，不能替代本轮最终冻结）：
+RC1 sealed preflight（仅作历史工程证据，不能替代 RC2 最终冻结）：
 
 ```text
-outputs/preflight/aaai27_20260714_final_sealed/
+outputs/preflight/aaai27_20260714_stage1_pilot_sealed_rc1_final/
 ```
 
 核心状态：
 
 ```text
 RUN_STATUS.txt = PASS
-189 tests passed
+226 tests passed
 10 subtests passed
 GPU 0/1/2 passed
 31 formal CLI entries passed
@@ -76,7 +83,7 @@ git diff --check passed
 三域数据审计：
 
 ```text
-outputs/preflight/aaai27_20260714_final_sealed/
+outputs/preflight/aaai27_20260714_stage1_pilot_sealed_rc1_final/
 └── data_audit_three_domains.json
 ```
 
@@ -277,7 +284,7 @@ git add .
 git diff --name-only
 git add <explicit-source-files> <explicit-config-files> <explicit-doc-files>
 git commit -m "freeze: AAAI27 two-stage no-reject experiment candidate"
-git tag aaai27-rc-irstd-v5-rc1
+git tag aaai27-rc-irstd-v5-rc2
 ```
 
 生成代码归档：
@@ -287,12 +294,12 @@ mkdir -p outputs/release
 
 git archive \
   --format=zip \
-  --output outputs/release/RC-IRSTD_v5_rc1.zip \
-  aaai27-rc-irstd-v5-rc1
+  --output outputs/release/RC-IRSTD_v5_rc2.zip \
+  aaai27-rc-irstd-v5-rc2
 
 sha256sum \
-  outputs/release/RC-IRSTD_v5_rc1.zip \
-  > outputs/release/RC-IRSTD_v5_rc1.zip.sha256
+  outputs/release/RC-IRSTD_v5_rc2.zip \
+  > outputs/release/RC-IRSTD_v5_rc2.zip.sha256
 ```
 
 正式运行必须满足：

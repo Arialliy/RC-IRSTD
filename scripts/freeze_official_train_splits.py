@@ -509,7 +509,9 @@ def build_files(
         "role_contract": {
             "official_test_emitted": False,
             "official_test_labels_read_for_quarantine": False,
-            "outer_target_official_train_used": False,
+            "outer_target_official_train_used_for_detector_fit": False,
+            "outer_target_detector_diagnostic_used_for_development_evaluation": True,
+            "outer_target_diagnostic_selects_checkpoint": False,
             "same_fold_domain_roles_are_mutually_exclusive": True,
             "cross_fold_role_reuse": (
                 "allowed only because every nested fold trains a new detector and a "

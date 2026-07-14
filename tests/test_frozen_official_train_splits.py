@@ -107,6 +107,27 @@ def test_frozen_splits_are_reproducible_and_official_train_only(
     assert summary["meta"]["validation_window_count"] == 2
     assert summary["meta"]["unused_image_count"] == 0
     assert manifest["role_contract"]["official_test_emitted"] is False
+    assert (
+        manifest["role_contract"][
+            "outer_target_official_train_used_for_detector_fit"
+        ]
+        is False
+    )
+    assert (
+        manifest["role_contract"][
+            "outer_target_detector_diagnostic_used_for_development_evaluation"
+        ]
+        is True
+    )
+    assert (
+        manifest["role_contract"]["outer_target_diagnostic_selects_checkpoint"]
+        is False
+    )
+    assert "outer_target_official_train_used" not in manifest["role_contract"]
+    assert (
+        "outer_target_official_train_allowed_in_same_outer_fold"
+        not in manifest["role_contract"]
+    )
 
     emitted = "\n".join(
         path.read_text(encoding="utf-8")

@@ -30,6 +30,7 @@ from losses.local_peak_cvar import (
     top_fraction_mean,
 )
 from losses.smooth_worst_domain import smooth_max, smooth_worst_domain
+from losses.sls import SLSIoULoss, location_loss
 from losses.target_background_margin import (
     DomainTailSeparationOutput,
     background_local_peak_mask,
@@ -46,6 +47,7 @@ __all__ = [
     "FULL_BACKGROUND",
     "WEIGHTED_STRATIFIED_BACKGROUND",
     "DomainTailSeparationOutput",
+    "SLSIoULoss",
     "aggregate_image_risks_by_domain",
     "background_local_peak_mask",
     "bottom_fraction_mean",
@@ -63,6 +65,7 @@ __all__ = [
     "image_target_background_margin_risks",
     "local_background_peak_logits",
     "local_background_peak_scores",
+    "location_loss",
     "log10_budget_curve_smoothness",
     "object_top_fraction_logits",
     "object_top_fraction_scores",

@@ -75,6 +75,10 @@ class Stage1PilotArtifactTests(unittest.TestCase):
             self.assertTrue((run_dir / "checkpoint_sha256.txt").is_file())
             payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
             self.assertEqual(payload["run_contract_sha256"], "c" * 64)
+            self.assertEqual(
+                payload["segmentation_loss_implementation"]["qualified_name"],
+                "losses.sls.SLSIoULoss",
+            )
 
             with checkpoint.open("ab") as handle:
                 handle.write(b"tampered")
@@ -201,6 +205,12 @@ class Stage1PilotArtifactTests(unittest.TestCase):
             self.assertEqual(contract["release"], release_binding)
             self.assertFalse(contract["claim_bearing"])
             self.assertEqual(contract["environment"], execution)
+            self.assertEqual(
+                contract["training"]["segmentation_loss_implementation"][
+                    "qualified_name"
+                ],
+                "losses.sls.SLSIoULoss",
+            )
             self.assertEqual(
                 (run_dir / "command.txt").read_text(encoding="utf-8").strip(),
                 contract["command"],

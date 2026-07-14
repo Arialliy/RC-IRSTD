@@ -41,7 +41,7 @@
     },
     "stage1_pilot_matrix": {
       "path": "configs/aaai27_stage1_pilot_matrix.json",
-      "sha256": "2207e66d40d1c96e9dfdabc3d38cd72b750d47fa90e34055e2cc2a1a3625103e"
+      "sha256": "587a53ba190416f3070f1ae3f46c312c5880da08537c9737557f11140f2b7ac1"
     },
     "stage2_config": {
       "path": "configs/aaai27_calibrator_risk_aligned.json",
@@ -49,7 +49,7 @@
     },
     "official_train_split_manifest": {
       "path": "splits/aaai27_v2/manifest.json",
-      "sha256": "a0de05010dc2b0f1332f5b611ec88309e0c809f16e63a904d0a19b9b1964e7e8"
+      "sha256": "0f378ed10ce98953fa66d9a05e0db3bf71f75351b302b9014a637de95c8d3bfa"
     },
     "near_duplicate_source_audit": {
       "path": "audits/aaai27/near_duplicates_original_official_splits_v2.json",
@@ -65,11 +65,11 @@
     },
     "dataset_contract": {
       "path": "audits/aaai27/dataset_contract_v1.json",
-      "sha256": "480ad0ea938e2dbc238e339c8adfee0f1c9910790b05cfc101cf838d4c04ff70"
+      "sha256": "0020e3a5bba6fbf9fb6171aae38d60cc70b8a7929005d28adab4dc0b8d384ce1"
     },
     "domain_independence_decision": {
       "path": "audits/aaai27/final_domain_independence_decision_v1.json",
-      "sha256": "ee1d78ec2cb484204f2b0b6ad4886e1fe34eb54e3a4257351528bbf12993b4f4"
+      "sha256": "7622ea7aeefa29a852e7bcc05f650a27dde18015f8b73848d5151d7e19239a70"
     }
   },
   "domains": {
@@ -90,7 +90,9 @@
     "official_train_only_for_development": true,
     "official_test_allowed_for_selection": false,
     "official_test_static_integrity_audit_only_before_freeze": true,
-    "outer_target_official_train_allowed_in_same_outer_fold": false,
+    "outer_target_official_train_used_for_detector_fit": false,
+    "outer_target_detector_diagnostic_used_for_development_evaluation": true,
+    "outer_target_diagnostic_selects_checkpoint": false,
     "same_fold_domain_roles_mutually_exclusive": true,
     "detector_source_role": "detector_fit IDs only; detector_diagnostic is metrics-only and never selects a checkpoint",
     "pseudo_target_role": "non-overlapping IID meta_train/meta_validation context-query windows",

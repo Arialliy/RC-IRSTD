@@ -164,7 +164,9 @@
     "detector_diagnostic_used_for_checkpoint_selection": false,
     "official_test_emitted": false,
     "official_test_labels_read_for_quarantine": false,
-    "outer_target_official_train_used": false,
+    "outer_target_official_train_used_for_detector_fit": false,
+    "outer_target_detector_diagnostic_used_for_development_evaluation": true,
+    "outer_target_diagnostic_selects_checkpoint": false,
     "same_fold_domain_roles_are_mutually_exclusive": true
   },
   "schema_version": "rc-irstd.aaai27-official-train-splits.v2"

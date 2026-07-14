@@ -137,12 +137,35 @@ def validate_split_manifest(
     if manifest.get("schema_version") != SPLIT_SCHEMA_VERSION:
         raise ValueError("unsupported frozen split manifest schema")
     role = _require_mapping(manifest.get("role_contract"), "split_manifest.role_contract")
+    deprecated_role_fields = {
+        "outer_target_official_train_used",
+        "outer_target_official_train_allowed_in_same_outer_fold",
+    }
+    present_deprecated_fields = deprecated_role_fields.intersection(role)
+    if present_deprecated_fields:
+        raise ValueError(
+            "split manifest contains deprecated ambiguous role fields: "
+            f"{sorted(present_deprecated_fields)}"
+        )
     if role.get("official_test_emitted") is not False:
         raise ValueError("frozen split manifest may not emit official test IDs")
     if role.get("same_fold_domain_roles_are_mutually_exclusive") is not True:
         raise ValueError("same-fold detector/pseudo-target roles must be exclusive")
     if role.get("official_test_labels_read_for_quarantine") is not False:
         raise ValueError("quarantine may not read official-test labels")
+    if role.get("outer_target_official_train_used_for_detector_fit") is not False:
+        raise ValueError("outer-target official train may not enter detector fitting")
+    if (
+        role.get(
+            "outer_target_detector_diagnostic_used_for_development_evaluation"
+        )
+        is not True
+    ):
+        raise ValueError(
+            "outer-target detector_diagnostic must be the development evaluation role"
+        )
+    if role.get("outer_target_diagnostic_selects_checkpoint") is not False:
+        raise ValueError("outer-target diagnostics may not select checkpoints")
     quarantine_manifest = _require_mapping(
         manifest.get("development_quarantine"),
         "split_manifest.development_quarantine",
@@ -594,6 +617,31 @@ def validate_plan(plan_path: Path, repository_root: Path) -> dict[str, Any]:
         raise ValueError("Stage-1 authorization differs from plan status")
     if authorization.get("gate_minus_1") is not authorized_plan:
         raise ValueError("Gate -1 authorization differs from plan status")
+
+    data_roles = _require_mapping(plan["data_roles"], "data_roles")
+    deprecated_role_fields = {
+        "outer_target_official_train_used",
+        "outer_target_official_train_allowed_in_same_outer_fold",
+    }
+    present_deprecated_fields = deprecated_role_fields.intersection(data_roles)
+    if present_deprecated_fields:
+        raise ValueError(
+            "analysis plan contains deprecated ambiguous role fields: "
+            f"{sorted(present_deprecated_fields)}"
+        )
+    if data_roles.get("outer_target_official_train_used_for_detector_fit") is not False:
+        raise ValueError("outer-target official train may not enter detector fitting")
+    if (
+        data_roles.get(
+            "outer_target_detector_diagnostic_used_for_development_evaluation"
+        )
+        is not True
+    ):
+        raise ValueError(
+            "outer-target detector_diagnostic must be enabled for development evaluation"
+        )
+    if data_roles.get("outer_target_diagnostic_selects_checkpoint") is not False:
+        raise ValueError("outer-target diagnostics may not select checkpoints")
 
     contracts = _require_mapping(plan["hash_contracts"], "hash_contracts")
     resolved_contracts: dict[str, Path] = {}

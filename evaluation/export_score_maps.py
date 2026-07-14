@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from data_ext.dataset_meta import (
     safe_output_stem,
 )
 from data_ext.dataset_identity import (
+    DATASET_RECORD_SCHEMA_VERSION,
     ORDERED_SAMPLE_IDS_ALGORITHM,
     SCORE_MANIFEST_CONTENT_ALGORITHM,
     SPLIT_IMAGE_ARTIFACT_ALGORITHM,
@@ -47,6 +49,17 @@ SCORE_MANIFEST_SCHEMA_VERSION = 3
 SPLIT_CONTRACT_SCHEMA_VERSION = 1
 OFFICIAL_SPLIT_ROLES = ("official_train", "official_test")
 SPLIT_ROLES = (*OFFICIAL_SPLIT_ROLES, DETECTOR_DIAGNOSTIC_ROLE)
+RAW_LOGIT_ARTIFACT_SCHEMA_VERSION = 1
+RAW_LOGIT_CONTENT_ALGORITHM = (
+    "sha256-length-prefixed-image-raw-logit-dtype-shape-v1"
+)
+RAW_LOGIT_DTYPE = "float64"
+RAW_LOGIT_SPACE = "native_original_hw_spatially_aligned_restored_model_logit"
+RAW_LOGIT_SCORE_RELATION = (
+    "score = restore(float64_sigmoid(model_grid_logit)); raw_logit = "
+    "restore(float64(model_grid_logit)); sigmoid(raw_logit) is "
+    "diagnostic_only_not_pointwise_equal"
+)
 
 
 def select_device(device: str) -> torch.device:
@@ -176,17 +189,20 @@ def checkpoint_provenance(checkpoint: object) -> dict[str, object]:
             "checkpoint detector_source_records must align one-to-one with "
             "detector_source_domains"
         )
-    # Schema-v1 records lack per-image content leaves and the ordered
-    # image+mask training artifact.  They may be exported diagnostically but
-    # can never establish main-protocol target exclusion.
+    # Records from before the current raster-filtered content schema lack its
+    # complete identity contract. They may be exported diagnostically but can
+    # never establish main-protocol target exclusion.
     if any(
         not isinstance(record, Mapping)
-        or int(record.get("record_schema_version", -1)) != 2
+        or int(record.get("record_schema_version", -1))
+        != DATASET_RECORD_SCHEMA_VERSION
         for record in raw_records
     ):
         return {
             "provenance_level": "legacy_unverified",
-            "legacy_reason": "detector_source_records_precede_content_leaf_schema_v2",
+            "legacy_reason": (
+                "detector_source_records_precede_supported_raster_schema_v3"
+            ),
             **common,
         }
     records = [
@@ -283,6 +299,186 @@ def high_precision_sigmoid(logits: torch.Tensor) -> torch.Tensor:
     if not bool(torch.isfinite(logits).all().item()):
         raise ValueError("logits contain NaN or infinity")
     return torch.sigmoid(logits.to(dtype=torch.float64))
+
+
+def raw_logit_manifest_content_sha256(
+    items: Sequence[Mapping[str, object]],
+) -> str:
+    """Bind every optional raw-logit artifact to its ordered sample ID."""
+
+    if not isinstance(items, (list, tuple)) or not items:
+        raise ValueError("raw-logit manifest items must be a non-empty ordered list")
+    digest = hashlib.sha256()
+    _update_hash_frame(digest, RAW_LOGIT_CONTENT_ALGORITHM)
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"raw-logit manifest item {index} must be a mapping")
+        image_id = str(item.get("image_id", "")).strip()
+        if not image_id:
+            raise ValueError(f"raw-logit manifest item {index} has an empty image_id")
+        if image_id in seen:
+            raise ValueError(f"duplicate raw-logit image_id: {image_id!r}")
+        seen.add(image_id)
+        file_value = str(item.get("raw_logit_file", "")).strip()
+        if not file_value or Path(file_value).expanduser().is_absolute():
+            raise ValueError(
+                f"items[{index}].raw_logit_file must be a relative path"
+            )
+        raw_sha = str(item.get("raw_logit_file_sha256", "")).strip().lower()
+        if len(raw_sha) != 64 or any(
+            character not in "0123456789abcdef" for character in raw_sha
+        ):
+            raise ValueError(
+                f"items[{index}].raw_logit_file_sha256 is not a SHA-256"
+            )
+        dtype = str(item.get("raw_logit_dtype", "")).strip()
+        if dtype != RAW_LOGIT_DTYPE:
+            raise ValueError(
+                f"items[{index}].raw_logit_dtype must equal {RAW_LOGIT_DTYPE!r}"
+            )
+        shape = item.get("raw_logit_shape")
+        if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+            raise ValueError(f"items[{index}].raw_logit_shape must be [height, width]")
+        dimensions: list[int] = []
+        for raw_value in shape:
+            if isinstance(raw_value, (bool, np.bool_)):
+                raise TypeError("raw-logit shape values must be positive integers")
+            value = int(raw_value)
+            if float(raw_value) != float(value) or value <= 0:
+                raise ValueError("raw-logit shape values must be positive integers")
+            dimensions.append(value)
+        for value in (
+            image_id,
+            file_value,
+            raw_sha,
+            dtype,
+            str(dimensions[0]),
+            str(dimensions[1]),
+        ):
+            _update_hash_frame(digest, value)
+    return digest.hexdigest()
+
+
+def _update_hash_frame(digest: "hashlib._Hash", value: str) -> None:
+    encoded = str(value).encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+
+
+def _stage1_raw_logit_provenance(
+    checkpoint: object,
+    detector_provenance: Mapping[str, object],
+    target_dataset_record: Mapping[str, object],
+    split_contract: Mapping[str, object],
+    *,
+    dataset_name: str,
+) -> dict[str, object]:
+    """Fail closed unless raw logits belong to a verified development split."""
+
+    if split_contract.get("role") != DETECTOR_DIAGNOSTIC_ROLE:
+        raise ValueError(
+            "raw-logit export is development-only and requires "
+            "split_role='detector_diagnostic'"
+        )
+    if detector_provenance.get("provenance_level") != "checkpoint_verified":
+        raise ValueError(
+            "raw-logit export requires checkpoint_verified detector provenance"
+        )
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("raw-logit export requires a metadata checkpoint mapping")
+    risk_contract = checkpoint.get("risk_objective_contract")
+    if not isinstance(risk_contract, Mapping):
+        raise ValueError(
+            "raw-logit export requires checkpoint risk_objective_contract"
+        )
+    stage1_variant = str(risk_contract.get("stage1_variant", "")).strip()
+    if stage1_variant not in {"D0", "D3"}:
+        raise ValueError("raw-logit export accepts only Stage-1 variants D0 or D3")
+    segmentation_loss = checkpoint.get("segmentation_loss_implementation")
+    if not isinstance(segmentation_loss, Mapping):
+        raise ValueError(
+            "raw-logit export requires checkpoint segmentation_loss_implementation"
+        )
+
+    sources = [
+        str(value) for value in detector_provenance.get("detector_source_domains", [])
+    ]
+    source_records = detector_provenance.get("detector_source_records")
+    if not sources or not isinstance(source_records, list):
+        raise ValueError("raw-logit export requires verified detector source records")
+
+    partition_audit: dict[str, object] | None = None
+    if dataset_name in sources:
+        matching_records = [
+            record
+            for record in source_records
+            if isinstance(record, Mapping)
+            and str(record.get("source_name")) == dataset_name
+        ]
+        if len(matching_records) != 1:
+            raise ValueError(
+                "raw-logit same-domain diagnostic requires exactly one matching "
+                "detector source record"
+            )
+        source_record = matching_records[0]
+        if (
+            source_record.get("dataset_identity_sha256")
+            != target_dataset_record.get("dataset_identity_sha256")
+        ):
+            raise ValueError(
+                "raw-logit same-domain diagnostic dataset identity mismatch"
+            )
+        training_items = source_record.get("training_artifact_items")
+        diagnostic_items = target_dataset_record.get("split_image_artifact_items")
+        if not isinstance(training_items, list) or not isinstance(
+            diagnostic_items, list
+        ):
+            raise ValueError(
+                "raw-logit partition audit requires training and diagnostic items"
+            )
+        training_ids = {str(item["sample_id"]) for item in training_items}
+        diagnostic_ids = {str(item["sample_id"]) for item in diagnostic_items}
+        training_hashes = {str(item["image_sha256"]) for item in training_items}
+        diagnostic_hashes = {str(item["image_sha256"]) for item in diagnostic_items}
+        id_overlap = sorted(training_ids & diagnostic_ids)
+        image_overlap = sorted(training_hashes & diagnostic_hashes)
+        if id_overlap or image_overlap:
+            raise ValueError(
+                "raw-logit detector-fit/diagnostic partition overlap: "
+                f"IDs={len(id_overlap)}, image hashes={len(image_overlap)}"
+            )
+        proof_mode = "verified_same_dataset_detector_fit_disjointness"
+        partition_audit = {
+            "source_name": dataset_name,
+            "detector_fit_count": len(training_items),
+            "detector_diagnostic_count": len(diagnostic_items),
+            "sample_id_overlap_count": 0,
+            "image_content_overlap_count": 0,
+            "disjointness_verified": True,
+        }
+    else:
+        if detector_provenance.get("target_exclusion_verified") is not True:
+            raise ValueError(
+                "raw-logit held-out-domain diagnostic requires verified target exclusion"
+            )
+        proof_mode = "verified_held_out_domain_exclusion"
+
+    return {
+        "schema_version": RAW_LOGIT_ARTIFACT_SCHEMA_VERSION,
+        "status": "verified",
+        "eligible": True,
+        "proof_mode": proof_mode,
+        "split_role": DETECTOR_DIAGNOSTIC_ROLE,
+        "development_only": True,
+        "official_test_scores_consumed": False,
+        "checkpoint_provenance_level": "checkpoint_verified",
+        "stage1_variant": stage1_variant,
+        "training_seed": detector_provenance.get("training_seed"),
+        "risk_objective_contract": dict(risk_contract),
+        "segmentation_loss_implementation": dict(segmentation_loss),
+        "same_dataset_partition_audit": partition_audit,
+    }
 
 
 def build_official_split_contract(
@@ -487,8 +683,18 @@ def export_score_maps(
     device: str = "auto",
     num_workers: int = 0,
     overwrite: bool = False,
+    save_raw_logits: bool = False,
 ) -> dict[str, object]:
-    """Run inference and write one native-resolution ``.npz`` per image."""
+    """Run inference and write one native-resolution ``.npz`` per image.
+
+    ``save_raw_logits`` is an opt-in, development-only diagnostic.  In that
+    mode logits are independently restored to the same native spatial frame
+    as the score. The score itself always retains the historical
+    sigmoid-then-restore path; enabling diagnostics therefore cannot change a
+    gate metric. Because interpolation and sigmoid do not commute,
+    ``sigmoid(raw_logit)`` is diagnostic-only and is not claimed to reproduce
+    the saved score pointwise.
+    """
 
     input_hw = (
         (int(base_size), int(base_size))
@@ -498,6 +704,11 @@ def export_score_maps(
     if len(input_hw) != 2 or any(value <= 0 or value % 16 != 0 for value in input_hw):
         raise ValueError(
             "MSHNet input height and width must be positive multiples of 16"
+        )
+    if save_raw_logits and split_role != DETECTOR_DIAGNOSTIC_ROLE:
+        raise ValueError(
+            "save_raw_logits is development-only and requires "
+            "split_role='detector_diagnostic'"
         )
 
     output_root = Path(output_dir).expanduser().resolve()
@@ -513,6 +724,16 @@ def export_score_maps(
         raise FileExistsError(
             f"Output directory already contains {len(existing)} score maps: "
             f"{output_root}. Pass overwrite=True to replace matching files."
+        )
+    raw_logit_root = output_root / "raw_logits"
+    existing_raw_logits = (
+        list(raw_logit_root.glob("*.npy")) if raw_logit_root.is_dir() else []
+    )
+    if save_raw_logits and existing_raw_logits and not overwrite:
+        raise FileExistsError(
+            f"Output directory already contains {len(existing_raw_logits)} raw "
+            f"logit maps: {raw_logit_root}. Pass overwrite=True to replace "
+            "matching files."
         )
     incomplete_marker.write_text(
         "Score-map export is in progress. Do not sweep this directory.\n",
@@ -587,6 +808,16 @@ def export_score_maps(
         detector_provenance["target_exclusion_verified"] = (
             logical_exclusion_verified and identity_exclusion_verified
         )
+    raw_logit_provenance = None
+    if save_raw_logits:
+        raw_logit_provenance = _stage1_raw_logit_provenance(
+            checkpoint,
+            detector_provenance,
+            target_dataset_record,
+            split_contract,
+            dataset_name=dataset.dataset_name,
+        )
+        raw_logit_root.mkdir(parents=True, exist_ok=True)
     model = load_model(weight_path, selected_device, checkpoint=checkpoint)
 
     items: list[dict[str, object]] = []
@@ -606,6 +837,21 @@ def export_score_maps(
                 metadata.transform,
                 mode="bilinear",
             )
+            raw_logit_array = None
+            if save_raw_logits:
+                raw_logit = restore_tensor_to_original(
+                    logits[0, 0].to(dtype=torch.float64),
+                    metadata.transform,
+                    mode="bilinear",
+                )
+                if not bool(torch.isfinite(raw_logit).all().item()):
+                    raise ValueError(
+                        f"Restored logits contain NaN/Inf for {metadata.image_id!r}"
+                    )
+                raw_logit_array = raw_logit.detach().cpu().numpy().astype(
+                    np.float64,
+                    copy=False,
+                )
             probability_array = (
                 probability.clamp_(0.0, 1.0).detach().cpu().numpy().astype(np.float64)
             )
@@ -613,6 +859,13 @@ def export_score_maps(
                 raise RuntimeError(
                     f"Restored score/image mismatch for {metadata.image_id!r}: "
                     f"{probability_array.shape} vs {metadata.transform.original_hw}"
+                )
+            if raw_logit_array is not None and (
+                raw_logit_array.shape != metadata.transform.original_hw
+            ):
+                raise RuntimeError(
+                    f"Restored raw-logit/image mismatch for {metadata.image_id!r}: "
+                    f"{raw_logit_array.shape} vs {metadata.transform.original_hw}"
                 )
 
             output_name = f"{safe_output_stem(metadata.image_id)}.npz"
@@ -638,16 +891,29 @@ def export_score_maps(
             )
             score_file_sha256 = sha256_file(output_path)
             gray_file_sha256 = sha256_file(metadata.image_path)
-            items.append(
-                {
-                    "image_id": metadata.image_id,
-                    "file": output_name,
-                    "score_file_sha256": score_file_sha256,
-                    "image_path": _portable_path(metadata.image_path, output_root),
-                    "gray_file_sha256": gray_file_sha256,
-                    "original_hw": list(metadata.transform.original_hw),
-                }
-            )
+            item: dict[str, object] = {
+                "image_id": metadata.image_id,
+                "file": output_name,
+                "score_file_sha256": score_file_sha256,
+                "image_path": _portable_path(metadata.image_path, output_root),
+                "gray_file_sha256": gray_file_sha256,
+                "original_hw": list(metadata.transform.original_hw),
+            }
+            if raw_logit_array is not None:
+                raw_logit_name = f"{safe_output_stem(metadata.image_id)}.npy"
+                raw_logit_path = raw_logit_root / raw_logit_name
+                _write_npy_atomic(raw_logit_path, raw_logit_array)
+                item.update(
+                    {
+                        "raw_logit_file": (
+                            Path("raw_logits") / raw_logit_name
+                        ).as_posix(),
+                        "raw_logit_file_sha256": sha256_file(raw_logit_path),
+                        "raw_logit_dtype": str(raw_logit_array.dtype),
+                        "raw_logit_shape": list(raw_logit_array.shape),
+                    }
+                )
+            items.append(item)
 
     verified_split_role = str(split_contract["role"])
     manifest: dict[str, object] = {
@@ -698,6 +964,27 @@ def export_score_maps(
         "content_sha256": score_manifest_content_sha256(items),
         "items": items,
     }
+    if save_raw_logits:
+        if raw_logit_provenance is None:
+            raise RuntimeError("raw-logit provenance was not constructed")
+        manifest.update(
+            {
+                "raw_logits_exported": True,
+                "raw_logit_artifact_schema_version": (
+                    RAW_LOGIT_ARTIFACT_SCHEMA_VERSION
+                ),
+                "raw_logit_space": RAW_LOGIT_SPACE,
+                "raw_logit_dtype": RAW_LOGIT_DTYPE,
+                "raw_logit_score_relation": RAW_LOGIT_SCORE_RELATION,
+                "raw_logit_content_sha256_algorithm": (
+                    RAW_LOGIT_CONTENT_ALGORITHM
+                ),
+                "raw_logit_content_sha256": (
+                    raw_logit_manifest_content_sha256(items)
+                ),
+                "raw_logit_provenance": raw_logit_provenance,
+            }
+        )
     # Duplicate the protocol-critical fields at the top level so every
     # downstream stage can hard-validate them without interpreting a free-form
     # nested provenance payload.  The full payload remains for audit detail.
@@ -728,6 +1015,17 @@ def _write_npz_atomic(path: Path, **arrays: np.ndarray) -> None:
     try:
         with temporary.open("wb") as stream:
             np.savez_compressed(stream, **arrays)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _write_npy_atomic(path: Path, array: np.ndarray) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            np.save(stream, array, allow_pickle=False)
         os.replace(temporary, path)
     finally:
         if temporary.exists():
@@ -801,6 +1099,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--save-raw-logits",
+        action="store_true",
+        help=(
+            "Development-only: save native-resolution float64 raw logits and "
+            "bind them into the manifest. Requires --split-role "
+            "detector_diagnostic and verified Stage-1 D0/D3 provenance."
+        ),
+    )
     return parser
 
 
@@ -822,6 +1129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         num_workers=args.num_workers,
         overwrite=args.overwrite,
+        save_raw_logits=args.save_raw_logits,
     )
     print(
         f"Exported {manifest['num_images']} native-resolution score maps to "

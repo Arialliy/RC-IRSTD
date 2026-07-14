@@ -169,7 +169,7 @@ class RiskLossTests(unittest.TestCase):
         self.assertEqual(linear_risk_weight(5, 5, 0), 1.0)
 
     def test_warmup_supervises_fused_and_all_auxiliary_heads(self):
-        from model.loss import SLSIoULoss
+        from losses.sls import SLSIoULoss
         from scripts.train_multisource_tail import multiscale_sls_loss
 
         masks = torch.zeros((2, 1, 8, 8))
@@ -753,13 +753,20 @@ class RiskLossTests(unittest.TestCase):
             append_jsonl,
             load_resume_checkpoint,
             save_checkpoint,
+            stage1_segmentation_loss_implementation,
             write_json,
         )
         from data_ext.dataset_identity import sha256_file
 
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
-            write_json(run_dir / "config.json", {"frozen": True})
+            frozen_config = {
+                "frozen": True,
+                "segmentation_loss_implementation": (
+                    stage1_segmentation_loss_implementation()
+                ),
+            }
+            write_json(run_dir / "config.json", frozen_config)
             config_sha = sha256_file(run_dir / "config.json")
             args = self._detector_training_args()
             model = torch.nn.Linear(2, 1)
@@ -801,7 +808,7 @@ class RiskLossTests(unittest.TestCase):
             self.assertEqual(loaded_dir, run_dir.resolve())
             self.assertEqual(start_epoch, 1)
             self.assertEqual(loaded_sha, config_sha)
-            self.assertEqual(loaded_config, {"frozen": True})
+            self.assertEqual(loaded_config, frozen_config)
             for expected, actual in zip(model.parameters(), resumed_model.parameters()):
                 self.assertTrue(torch.equal(expected, actual))
             self.assertTrue(resumed_optimizer.state_dict()["state"])
@@ -826,7 +833,7 @@ class RiskLossTests(unittest.TestCase):
                 )
 
     def test_legacy_training_logs_tail_logit_and_gradient_diagnostics(self):
-        from model.loss import SLSIoULoss
+        from losses.sls import SLSIoULoss
         from scripts.train_multisource_tail import train_one_epoch
 
         class TinyDetector(torch.nn.Module):
@@ -922,7 +929,7 @@ class RiskLossTests(unittest.TestCase):
         )
 
     def test_D0_training_is_segmentation_only_with_zero_effective_risk(self):
-        from model.loss import SLSIoULoss
+        from losses.sls import SLSIoULoss
         from scripts.train_multisource_tail import train_one_epoch
 
         class TinyDetector(torch.nn.Module):
@@ -970,6 +977,10 @@ class RiskLossTests(unittest.TestCase):
             epoch=0,
         )
         self.assertEqual(metrics["stage1_variant"], "D0")
+        self.assertEqual(
+            metrics["segmentation_loss_implementation"]["qualified_name"],
+            "losses.sls.SLSIoULoss",
+        )
         self.assertAlmostEqual(metrics["loss_total"], metrics["loss_seg"])
         self.assertEqual(metrics["loss_tail_sep"], 0.0)
         self.assertEqual(metrics["effective_lambda_margin"], 0.0)

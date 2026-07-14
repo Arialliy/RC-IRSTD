@@ -20,10 +20,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from .split_utils import read_split_entries, sample_id_from_entry
+from .split_utils import IMAGE_EXTENSIONS, read_split_entries, sample_id_from_entry
 
 
-DATASET_IDENTITY_ALGORITHM = "sha256-relative-path-content-v1"
+DATASET_IDENTITY_ALGORITHM = (
+    "sha256-supported-raster-relative-path-content-v2"
+)
 IMAGE_CONTENT_LEAF_ALGORITHM = "sha256-image-file-bytes-leaf-multiset-v1"
 IMAGE_CONTENT_LEAF_SET_ALGORITHM = (
     "sha256-length-prefixed-sorted-image-content-leaves-v1"
@@ -38,8 +40,9 @@ SPLIT_IMAGE_ARTIFACT_ALGORITHM = (
 SCORE_MANIFEST_CONTENT_ALGORITHM = (
     "sha256-length-prefixed-image-score-gray-v1"
 )
-DATASET_RECORD_SCHEMA_VERSION = 2
+DATASET_RECORD_SCHEMA_VERSION = 3
 DATASET_IDENTITY_FOLDERS = ("images",)
+DATASET_IDENTITY_EXTENSIONS = IMAGE_EXTENSIONS
 _HASH_BUFFER_BYTES = 1024 * 1024
 
 
@@ -71,25 +74,33 @@ def dataset_identity(
 ) -> dict[str, object]:
     """Fingerprint dataset image content independently of its root path.
 
-    Every regular file below the requested folders contributes its folder-
-    relative POSIX path, byte count and content SHA-256.  Files are streamed
-    once in sorted relative-path order.  A second directory/stat snapshot
-    catches additions, removals and in-place changes during the scan rather
-    than emitting a mixed, non-atomic identity.
+    Every supported raster file below the requested folders contributes its
+    folder-relative POSIX path, byte count and content SHA-256.  Metadata and
+    filesystem sidecars such as ``.DS_Store`` are excluded.  Files are
+    streamed once in sorted relative-path order.  A second directory/stat
+    snapshot catches additions, removals and in-place changes during the scan
+    rather than emitting a mixed, non-atomic identity.
     """
 
     root = Path(dataset_dir).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Dataset directory does not exist: {root}")
     normalised_folders = _normalise_folders(folders)
-    files_before = _dataset_file_snapshot(root, normalised_folders)
+    files_before = _dataset_file_snapshot(
+        root,
+        normalised_folders,
+        DATASET_IDENTITY_EXTENSIONS,
+    )
     if not files_before:
         raise ValueError(
-            f"No regular files found under dataset folders {normalised_folders}: {root}"
+            "No supported raster files found under dataset folders "
+            f"{normalised_folders}: {root}"
         )
 
     digest = hashlib.sha256()
     _update_frame(digest, DATASET_IDENTITY_ALGORITHM)
+    for extension in DATASET_IDENTITY_EXTENSIONS:
+        _update_frame(digest, extension)
     total_bytes = 0
     image_content_leaves: list[str] = []
     for relative_path, (path, stat_signature) in files_before.items():
@@ -105,7 +116,11 @@ def dataset_identity(
         total_bytes += size
         image_content_leaves.append(content_sha256)
 
-    files_after = _dataset_file_snapshot(root, normalised_folders)
+    files_after = _dataset_file_snapshot(
+        root,
+        normalised_folders,
+        DATASET_IDENTITY_EXTENSIONS,
+    )
     before_signatures = {
         relative: signature for relative, (_, signature) in files_before.items()
     }
@@ -127,6 +142,7 @@ def dataset_identity(
         "dataset_num_files": len(files_before),
         "dataset_num_bytes": total_bytes,
         "dataset_identity_folders": list(normalised_folders),
+        "dataset_identity_extensions": list(DATASET_IDENTITY_EXTENSIONS),
         # The dataset identity above intentionally includes relative paths.
         # This second, path-independent multiset is the contamination guard:
         # copying/renaming a file cannot hide shared image bytes.
@@ -291,6 +307,7 @@ def validate_dataset_record(
         "dataset_num_files",
         "dataset_num_bytes",
         "dataset_identity_folders",
+        "dataset_identity_extensions",
         "image_content_leaf_algorithm",
         "image_content_sha256_leaves",
         "image_content_leaf_set_algorithm",
@@ -353,6 +370,15 @@ def validate_dataset_record(
         raise ValueError(
             "dataset identity record folders must be exactly ['images'] for "
             "this schema"
+        )
+    extensions = raw_record["dataset_identity_extensions"]
+    if not isinstance(extensions, (list, tuple)):
+        raise TypeError("dataset_identity_extensions must be an ordered list")
+    normalised_extensions = [str(value).lower() for value in extensions]
+    if tuple(normalised_extensions) != DATASET_IDENTITY_EXTENSIONS:
+        raise ValueError(
+            "dataset identity record extensions do not match the supported "
+            "raster extension contract"
         )
     raw_leaves = raw_record["image_content_sha256_leaves"]
     if not isinstance(raw_leaves, (list, tuple)) or not raw_leaves:
@@ -437,6 +463,7 @@ def validate_dataset_record(
         "dataset_num_files": num_files,
         "dataset_num_bytes": num_bytes,
         "dataset_identity_folders": normalised_folders,
+        "dataset_identity_extensions": normalised_extensions,
         "image_content_leaf_algorithm": IMAGE_CONTENT_LEAF_ALGORITHM,
         "image_content_sha256_leaves": leaves,
         "image_content_leaf_set_algorithm": IMAGE_CONTENT_LEAF_SET_ALGORITHM,
@@ -608,14 +635,18 @@ def _normalise_folders(folders: Sequence[str]) -> tuple[str, ...]:
 def _dataset_file_snapshot(
     root: Path,
     folders: Sequence[str],
+    extensions: Sequence[str],
 ) -> dict[str, tuple[Path, tuple[int, int, int, int, int]]]:
+    supported_extensions = {str(value).lower() for value in extensions}
+    if not supported_extensions:
+        raise ValueError("dataset identity extensions must not be empty")
     snapshot: dict[str, tuple[Path, tuple[int, int, int, int, int]]] = {}
     for folder in folders:
         folder_root = root / folder
         if not folder_root.is_dir():
             raise FileNotFoundError(f"Missing dataset folder: {folder_root}")
         for path in folder_root.rglob("*"):
-            if not path.is_file():
+            if not path.is_file() or path.suffix.lower() not in supported_extensions:
                 continue
             relative = path.relative_to(root).as_posix()
             if relative in snapshot:
