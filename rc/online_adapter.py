@@ -20,7 +20,7 @@ from .domain_statistics import (
     load_source_reference,
 )
 from .meta_dataset import FeatureStandardizer
-from .schema import BudgetSpec, SCHEMA_VERSION
+from .schema import BudgetSpec, FoldContract, SCHEMA_VERSION
 from .schema import SourceReference, StatisticsConfig
 
 
@@ -139,6 +139,39 @@ def _torch_load(path: str | Path, device: torch.device) -> Mapping[str, Any]:
     return payload
 
 
+def _manifest_contract_value(payload: Mapping[str, Any], key: str) -> Any:
+    nested = payload.get("detector_provenance")
+    nested_present = isinstance(nested, Mapping) and key in nested
+    top_present = key in payload
+    if top_present and nested_present and payload[key] != nested[key]:
+        raise ValueError(f"score manifest has conflicting top-level/nested {key}")
+    if top_present:
+        return payload[key]
+    return nested[key] if nested_present else None
+
+
+def _deployment_contract(
+    checkpoint: Mapping[str, Any],
+) -> tuple[FoldContract, SourceReference]:
+    reference = SourceReference.from_dict(checkpoint["deployment_source_reference"])
+    fold = FoldContract(
+        outer_fold_id=str(checkpoint["outer_fold_id"]),
+        outer_target=str(checkpoint["outer_target"]),
+        detector_source_domains=tuple(
+            str(value) for value in checkpoint["deployment_detector_source_domains"]
+        ),
+        detector_checkpoint_sha=str(checkpoint["deployment_detector_checkpoint_sha"]),
+        held_out_domains=tuple(
+            str(value) for value in checkpoint["deployment_held_out_domains"]
+        ),
+        protocol_scope=str(checkpoint["deployment_protocol_scope"]),
+    )
+    fold.assert_matches_source_reference(reference)
+    if fold.protocol_scope != "multi_source_protocol_candidate":
+        raise ValueError("calibrator deployment contract is not main-protocol eligible")
+    return fold, reference
+
+
 def load_calibrator_bundle(
     checkpoint_path: str | Path,
     *,
@@ -160,6 +193,8 @@ def load_calibrator_bundle(
         "calibration_pseudo_targets",
         "deployment_detector_source_domains",
         "deployment_detector_checkpoint_sha",
+        "deployment_held_out_domains",
+        "deployment_protocol_scope",
         "deployment_source_reference",
     }
     missing = required.difference(checkpoint)
@@ -175,6 +210,7 @@ def load_calibrator_bundle(
     standardizer = FeatureStandardizer.from_dict(checkpoint["standardizer"])
     if tuple(checkpoint["input_feature_names"]) != standardizer.feature_names:
         raise ValueError("checkpoint input feature names disagree with standardizer")
+    _deployment_contract(checkpoint)
     return model, standardizer, checkpoint
 
 
@@ -205,6 +241,7 @@ def adapt_context_to_query(
     outer_target = str(checkpoint_metadata["outer_target"])
     if target_domain != outer_target:
         raise ValueError("online target_domain must equal checkpoint outer_target")
+    deployment_fold, embedded_reference = _deployment_contract(checkpoint_metadata)
     calibration_targets = tuple(
         str(value) for value in checkpoint_metadata["calibration_pseudo_targets"]
     )
@@ -213,31 +250,31 @@ def adapt_context_to_query(
     manifest_target = str(score_manifest.get("target_dataset", ""))
     if manifest_target != target_domain:
         raise ValueError("score manifest target_dataset must equal online target")
-    if str(score_manifest.get("outer_fold_id", "")) != str(
+    if str(_manifest_contract_value(score_manifest, "outer_fold_id") or "") != str(
         checkpoint_metadata["outer_fold_id"]
     ):
         raise ValueError("score manifest outer_fold_id differs from calibrator contract")
-    if str(score_manifest.get("outer_target", "")) != outer_target:
+    if str(_manifest_contract_value(score_manifest, "outer_target") or "") != outer_target:
         raise ValueError("score manifest outer_target differs from calibrator contract")
-    if score_manifest.get("protocol_scope") != "multi_source_protocol_candidate":
+    manifest_protocol_scope = _manifest_contract_value(score_manifest, "protocol_scope")
+    if manifest_protocol_scope != deployment_fold.protocol_scope:
+        raise ValueError("score manifest protocol_scope differs from calibrator contract")
+    if manifest_protocol_scope != "multi_source_protocol_candidate":
         raise ValueError("online main protocol requires a multi-source detector checkpoint")
-    if score_manifest.get("target_exclusion_verified") is not True:
+    if _manifest_contract_value(score_manifest, "target_exclusion_verified") is not True:
         raise ValueError("score manifest does not verify target-domain exclusion")
-    if str(score_manifest.get("outer_fold_id", "")) != str(
-        checkpoint_metadata["outer_fold_id"]
-    ):
-        raise ValueError("score manifest outer_fold_id differs from calibrator checkpoint")
-    if str(score_manifest.get("outer_target", "")) != outer_target:
-        raise ValueError("score manifest outer_target differs from calibrator checkpoint")
     manifest_checkpoint_sha = str(score_manifest.get("weight_sha256", "")).lower()
     expected_checkpoint_sha = str(
         checkpoint_metadata["deployment_detector_checkpoint_sha"]
     ).lower()
     if manifest_checkpoint_sha != expected_checkpoint_sha:
         raise ValueError("score manifest detector checkpoint differs from calibrator contract")
-    if "detector_source_domains" not in score_manifest:
+    manifest_source_value = _manifest_contract_value(
+        score_manifest, "detector_source_domains"
+    )
+    if manifest_source_value is None:
         raise ValueError("score manifest must record detector_source_domains")
-    manifest_sources = tuple(str(value) for value in score_manifest["detector_source_domains"])
+    manifest_sources = tuple(str(value) for value in manifest_source_value)
     expected_sources = tuple(
         str(value) for value in checkpoint_metadata["deployment_detector_source_domains"]
     )
@@ -245,6 +282,16 @@ def adapt_context_to_query(
         raise ValueError("score manifest detector_source_domains differ from checkpoint")
     if target_domain in manifest_sources:
         raise ValueError("online target must not be a detector source domain")
+    manifest_held_out = tuple(
+        str(value)
+        for value in (
+            _manifest_contract_value(score_manifest, "held_out_domains") or ()
+        )
+    )
+    if manifest_held_out != deployment_fold.held_out_domains:
+        raise ValueError("score manifest held_out_domains differ from checkpoint")
+    if target_domain not in manifest_held_out:
+        raise ValueError("online target must occur in detector held_out_domains")
     manifest_items = score_manifest.get("items", score_manifest.get("records"))
     if not isinstance(manifest_items, list):
         raise ValueError("score manifest requires ordered items/records")
@@ -252,9 +299,6 @@ def adapt_context_to_query(
     expected_prefix = context_ids + query_ids
     if manifest_ids[: len(expected_prefix)] != expected_prefix:
         raise ValueError("context+query IDs must exactly equal the score manifest prefix")
-    embedded_reference = SourceReference.from_dict(
-        checkpoint_metadata["deployment_source_reference"]
-    )
     if source_reference != embedded_reference:
         raise ValueError("online source reference differs from checkpoint deployment reference")
     statistics_config = StatisticsConfig.from_dict(
@@ -306,6 +350,8 @@ def adapt_context_to_query(
         "outer_target": outer_target,
         "detector_source_domains": list(expected_sources),
         "detector_checkpoint_sha": expected_checkpoint_sha,
+        "held_out_domains": list(deployment_fold.held_out_domains),
+        "protocol_scope": deployment_fold.protocol_scope,
         "score_manifest_sha256": score_manifest_sha256,
         "score_manifest_target_dataset": manifest_target,
         "score_manifest_detector_checkpoint_sha": manifest_checkpoint_sha,
@@ -387,7 +433,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.calibrator_checkpoint, device=device
     )
     statistics_config = StatisticsConfig.from_dict(checkpoint["statistics_config"])
-    embedded_reference = SourceReference.from_dict(checkpoint["deployment_source_reference"])
+    _, embedded_reference = _deployment_contract(checkpoint)
     if args.source_reference is None:
         source_reference = embedded_reference
     else:
