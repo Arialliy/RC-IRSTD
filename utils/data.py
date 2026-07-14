@@ -9,6 +9,7 @@ import os.path as osp
 import sys
 import random
 import shutil
+from glob import glob
 
 
 class IRSTD_Dataset(Data.Dataset):
@@ -16,19 +17,17 @@ class IRSTD_Dataset(Data.Dataset):
         
         dataset_dir = args.dataset_dir
 
-        if mode == 'train':
-            txtfile = 'trainval.txt'
-        elif mode == 'val':
-            txtfile = 'test.txt'
-
-        self.list_dir = osp.join(dataset_dir, txtfile)
+        self.list_dir = self._find_split_file(
+            dataset_dir,
+            mode,
+            getattr(args, 'split_file', None),
+        )
         self.imgs_dir = osp.join(dataset_dir, 'images')
         self.label_dir = osp.join(dataset_dir, 'masks')
 
         self.names = []
         with open(self.list_dir, 'r') as f:
-            self.names += [line.strip() for line in f.readlines()]
-
+            self.names += [line.strip() for line in f.readlines() if line.strip()]
 
         self.mode = mode
         self.crop_size = args.crop_size
@@ -39,9 +38,9 @@ class IRSTD_Dataset(Data.Dataset):
         ])
 
     def __getitem__(self, i):
-        name = self.names[i]
-        img_path = osp.join(self.imgs_dir, name+'.png')
-        label_path = osp.join(self.label_dir, name+'.png')
+        name = osp.splitext(self.names[i])[0]
+        img_path = self._resolve_image_path(self.imgs_dir, name)
+        label_path = self._resolve_mask_path(self.label_dir, name)
 
         img = Image.open(img_path).convert('RGB')
         mask = Image.open(label_path)
@@ -59,6 +58,70 @@ class IRSTD_Dataset(Data.Dataset):
 
     def __len__(self):
         return len(self.names)
+
+    @staticmethod
+    def _find_split_file(dataset_dir, mode, split_file=None):
+        if split_file:
+            path = osp.expanduser(split_file)
+            if not osp.isabs(path):
+                path = osp.join(dataset_dir, path)
+            path = osp.realpath(path)
+            if not osp.isfile(path):
+                raise FileNotFoundError('Explicit split file does not exist: {}'.format(path))
+            return path
+
+        if mode == 'train':
+            candidates = [
+                osp.join(dataset_dir, 'trainval.txt'),
+                osp.join(dataset_dir, 'train.txt'),
+            ]
+            pattern = osp.join(dataset_dir, 'img_idx', 'train*.txt')
+        elif mode == 'val':
+            candidates = [osp.join(dataset_dir, 'test.txt')]
+            pattern = osp.join(dataset_dir, 'img_idx', 'test*.txt')
+        else:
+            raise ValueError("Unkown self.mode")
+
+        for path in candidates:
+            if osp.exists(path):
+                return path
+
+        matches = sorted({osp.realpath(path) for path in glob(pattern) if osp.isfile(path)})
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(
+                'Multiple split files match mode "{}" under {}: {}. '
+                'Pass an explicit split_file.'.format(mode, dataset_dir, ', '.join(matches))
+            )
+
+        raise FileNotFoundError(
+            'Cannot find split file for mode "{}" under {}. Expected one of {} or {}'.format(
+                mode, dataset_dir, ', '.join(candidates), pattern
+            )
+        )
+
+    @staticmethod
+    def _resolve_image_path(root, name):
+        for extension in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'):
+            path = osp.join(root, name + extension)
+            if osp.isfile(path):
+                return path
+
+        raise FileNotFoundError('Cannot find image/mask for "{}" under {}'.format(name, root))
+
+    @staticmethod
+    def _resolve_mask_path(root, name):
+        # NUAA-SIRST uses ``<image_id>_pixels0.png`` while IRSTD-1K and
+        # NUDT-SIRST use the image id directly.  Explicit candidates avoid
+        # accidentally opening the NUAA XML annotation as an image.
+        for suffix in ('', '_pixels0'):
+            try:
+                return IRSTD_Dataset._resolve_image_path(root, name + suffix)
+            except FileNotFoundError:
+                continue
+
+        raise FileNotFoundError('Cannot find mask for "{}" under {}'.format(name, root))
 
     def _sync_transform(self, img, mask):
         # random mirror

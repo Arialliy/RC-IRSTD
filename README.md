@@ -22,8 +22,9 @@ In this paper, we first propose a novel Scale and Location Sensitive (SLS) loss 
 
 ## Training
 The training command is very simple like this:
+
 ```
-python main --dataset-dir --batch-size --epochs --lr --mode 'train'
+python main.py --dataset-dir <DATASET> --batch-size 4 --epochs 400 --lr 0.05 --mode train
 ```
 
 For example:
@@ -31,11 +32,91 @@ For example:
 python main.py --dataset-dir '/dataset/IRSTD-1k' --batch-size 4 --epochs 400 --lr 0.05 --mode 'train'
 ```
 
+This repo also provides separate entrypoints:
+```
+python3 train.py --dataset-dir datasets/IRSTD-1K --batch-size 4 --epochs 400 --lr 0.05
+python3 train.py --dataset-dir datasets/NUDT-SIRST --batch-size 4 --epochs 400 --lr 0.05
+```
+
+Training checkpoints and best weights are saved under `repro_runs/` by default.
+
 ## Testing
 You can test the model with the following command:
 ```
 python main.py --dataset-dir '/dataset/IRSTD-1k' --batch-size 4 --mode 'test' --weight-path '/weight/MSHNet_weight.tar'
 ```
+
+Or use the separate testing entrypoint:
+```
+python3 test.py --dataset-dir datasets/IRSTD-1K --weight-path repro_runs/MSHNet-YYYY-MM-DD-HH-MM-SS/weight.pkl
+```
+
+The dataset loader supports both the original `trainval.txt`/`test.txt` layout and the local `img_idx/train_*.txt`/`img_idx/test_*.txt` layout.
+
+## RC-IRSTD research extension (experimental)
+
+This worktree also contains an experimental, budget-aware cross-domain deployment pipeline. It is not part of the original CVPR 2024 release, and the current direct threshold calibrator is a baseline rather than the proposed monotone inverse-risk upgrade discussed in the AAAI review notes.
+
+Install the local requirements and run the regression suite:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pytest -q tests
+```
+
+Train a balanced multi-source detector without constructing any target/test loader or selecting a checkpoint on target labels:
+
+```bash
+python -m scripts.train_multisource_tail \
+  --source-dirs datasets/IRSTD-1K datasets/NUDT-SIRST \
+  --source-names IRSTD-1K NUDT-SIRST \
+  --outer-fold-id outer-nuaa \
+  --outer-target NUAA-SIRST \
+  --held-out-domains NUAA-SIRST \
+  --batch-per-domain 2 \
+  --epochs 400 \
+  --device cuda \
+  --save-dir outputs/detectors \
+  --run-name outer-nuaa
+```
+
+Export native-resolution continuous score maps and build a query-only, adaptive high-tail curve:
+
+```bash
+python -m evaluation.export_score_maps \
+  --dataset-dir datasets/NUAA-SIRST \
+  --weight-path outputs/detectors/outer-nuaa/checkpoint_last.pt \
+  --output-dir outputs/scores/outer-nuaa \
+  --device cuda
+
+python -m evaluation.threshold_sweep \
+  --score-dir outputs/scores/outer-nuaa \
+  --image-id-file outputs/splits/outer-nuaa-query.txt \
+  --threshold-mode adaptive \
+  --output outputs/curves/outer-nuaa-query.csv
+```
+
+The curve sidecar records the score-manifest hash, query IDs, detector hash, event-threshold coverage, and whether the sweep is globally exact. RC meta-training rejects hand-asserted or mismatched provenance.
+
+Online adaptation consumes only a manifest prefix. Label-using metrics are produced afterward by a separate, hash-bound query replay:
+
+```bash
+python -m rc.online_adapter \
+  --manifest outputs/scores/outer-nuaa/manifest.json \
+  --calibrator-checkpoint outputs/rc/outer-nuaa/calibrator.pt \
+  --target-domain NUAA-SIRST \
+  --context-size 32 \
+  --pixel-budget 1e-6 \
+  --component-budget 1.0 \
+  --output outputs/rc/outer-nuaa/online.json
+
+python -m evaluation.evaluate_adapter_output \
+  --adapter-output outputs/rc/outer-nuaa/online.json \
+  --score-manifest outputs/scores/outer-nuaa/manifest.json \
+  --output outputs/rc/outer-nuaa/evaluation.json
+```
+
+The complete nested-LODO artifact contract and episode JSON example are in [02_RC-IRSTD_方案_代码_步骤.md](02_RC-IRSTD_方案_代码_步骤.md). Engineering-only smoke results and unresolved evidence gaps are recorded in [baseline_results.md](baseline_results.md).
 
 ## Visual Results
 ![](assert/visual_result.png)

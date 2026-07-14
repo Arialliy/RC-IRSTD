@@ -1,0 +1,27 @@
+# Local datasets and generated experiment artifacts
+datasets/
+outputs/
+repro_runs/
+
+# Model checkpoints and array/table exports
+*.ckpt
+*.pth
+*.pt
+*.pkl
+*.tar
+*.npy
+*.npz
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
