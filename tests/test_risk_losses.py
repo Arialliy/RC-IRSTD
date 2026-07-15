@@ -919,6 +919,11 @@ class RiskLossTests(unittest.TestCase):
         self.assertTrue(
             math.isfinite(metrics["risk_gradient_norm_first_active_step"])
         )
+        self.assertEqual(metrics["risk_gradient_probe_count"], 1)
+        self.assertEqual(
+            metrics["risk_gradient_positive_found"],
+            metrics["risk_gradient_norm_first_positive_step"] > 0.0,
+        )
         self.assertGreater(metrics["gradient_norm_mean"], 0.0)
         self.assertGreaterEqual(
             metrics["gradient_norm_max"], metrics["gradient_norm_mean"]
@@ -927,6 +932,69 @@ class RiskLossTests(unittest.TestCase):
             metrics["margin_diagnostics_contract"]["aggregation"],
             "image_hinge_before_domain_mean",
         )
+
+    def test_risk_gradient_probe_continues_after_zero_first_active_step(self):
+        from losses.sls import SLSIoULoss
+        from scripts.train_multisource_tail import train_one_epoch
+
+        class TinyDetector(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = torch.nn.Conv2d(3, 1, kernel_size=1)
+
+            def forward(self, images, multiscale_forward):
+                logits = self.head(images)
+                return [logits], logits
+
+        class TwoBatchLoader:
+            domain_ids = {"A": 0, "B": 1}
+            domain_names = ["A", "B"]
+            last_cycle_counts = {"A": 0, "B": 0}
+
+            def set_epoch(self, epoch):
+                self.epoch = epoch
+
+            def __len__(self):
+                return 2
+
+            def __iter__(self):
+                for _ in range(2):
+                    masks = torch.zeros((2, 1, 8, 8))
+                    masks[0, 0, 2, 2] = 1.0
+                    masks[1, 0, 5, 5] = 1.0
+                    yield {
+                        "image": torch.zeros((2, 3, 8, 8)),
+                        "mask": masks,
+                        "domain_id": torch.tensor([0, 1]),
+                    }
+
+        probe_calls = 0
+
+        def controlled_isolated_grad(outputs, inputs, **kwargs):
+            nonlocal probe_calls
+            probe_calls += 1
+            fill = 0.0 if probe_calls == 1 else 1.0
+            return tuple(torch.full_like(parameter, fill) for parameter in inputs)
+
+        model = TinyDetector()
+        args = self._detector_training_args(epoch_steps=2)
+        with patch.object(torch.autograd, "grad", side_effect=controlled_isolated_grad):
+            metrics = train_one_epoch(
+                model,
+                torch.optim.Adagrad(model.parameters(), lr=0.01),
+                SLSIoULoss(),
+                TwoBatchLoader(),
+                torch.device("cpu"),
+                args,
+                epoch=0,
+            )
+
+        self.assertTrue(metrics["risk_gradient_checked"])
+        self.assertEqual(metrics["risk_gradient_norm_first_active_step"], 0.0)
+        self.assertEqual(metrics["risk_gradient_probe_count"], 2)
+        self.assertTrue(metrics["risk_gradient_positive_found"])
+        self.assertEqual(metrics["risk_gradient_first_positive_step"], 1)
+        self.assertGreater(metrics["risk_gradient_norm_first_positive_step"], 0.0)
 
     def test_D0_training_is_segmentation_only_with_zero_effective_risk(self):
         from losses.sls import SLSIoULoss
@@ -985,6 +1053,10 @@ class RiskLossTests(unittest.TestCase):
         self.assertEqual(metrics["loss_tail_sep"], 0.0)
         self.assertEqual(metrics["effective_lambda_margin"], 0.0)
         self.assertFalse(metrics["risk_gradient_checked"])
+        self.assertEqual(metrics["risk_gradient_probe_count"], 0)
+        self.assertFalse(metrics["risk_gradient_positive_found"])
+        self.assertEqual(metrics["risk_gradient_norm_first_positive_step"], 0.0)
+        self.assertIsNone(metrics["risk_gradient_first_positive_step"])
 
     @staticmethod
     def _toy_dataset(length: int, offset: int) -> TensorDataset:

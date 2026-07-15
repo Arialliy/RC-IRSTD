@@ -42,7 +42,7 @@ def test_current_analysis_plan_is_valid_and_runtime_gated() -> None:
         "effective_confirmed_pair_count": 0,
     }
     assert report["stage1_pilot_matrix_summary"] == {
-        "sha256": "b395471efdf1ca1acab4b4001185259af9aa70e92eb80845ca40fa00d7b72335",
+        "sha256": "cb0763c99691057f061806c1680e115bbda39fade0fbe8400f76583bf7ba91b9",
         "run_count": 8,
         "phase_count": 4,
     }

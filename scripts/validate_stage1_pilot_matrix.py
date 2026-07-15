@@ -278,7 +278,7 @@ def _expected_run_specs() -> list[dict[str, Any]]:
                 "evaluation_diagnostic_files": diagnostics,
                 "gpu_visible_devices": [0, 1, 2],
                 "data_parallel": True,
-                "output_dir": f"outputs/stage1_pilot_30ep_v5_rc3/{run_id}",
+                "output_dir": f"outputs/stage1_pilot_30ep_v5_rc4/{run_id}",
             }
         )
 
@@ -305,7 +305,7 @@ def _expected_run_specs() -> list[dict[str, Any]]:
                     "evaluation_diagnostic_files": diagnostics,
                     "gpu_visible_devices": [gpu],
                     "data_parallel": False,
-                    "output_dir": f"outputs/stage1_pilot_30ep_v5_rc3/{run_id}",
+                    "output_dir": f"outputs/stage1_pilot_30ep_v5_rc4/{run_id}",
                 }
             )
     return result
@@ -682,11 +682,11 @@ def validate_matrix(
         {"tag", "source_archive", "source_archive_sha256_file"},
         "release_contract",
     )
-    if release["tag"] != "aaai27-rc-irstd-v5-rc3":
+    if release["tag"] != "aaai27-rc-irstd-v5-rc4":
         raise ValueError("release tag drift")
-    if release["source_archive"] != "outputs/release/RC-IRSTD_v5_rc3.zip":
+    if release["source_archive"] != "outputs/release/RC-IRSTD_v5_rc4.zip":
         raise ValueError("source archive path drift")
-    if release["source_archive_sha256_file"] != "outputs/release/RC-IRSTD_v5_rc3.zip.sha256":
+    if release["source_archive_sha256_file"] != "outputs/release/RC-IRSTD_v5_rc4.zip.sha256":
         raise ValueError("source archive checksum path drift")
     archive_path = _resolve_repo_path(root, release["source_archive"], "release.archive")
     checksum_path = _resolve_repo_path(

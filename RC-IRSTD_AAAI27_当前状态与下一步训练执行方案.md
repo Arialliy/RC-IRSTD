@@ -1,5 +1,7 @@
 # RC-IRSTD AAAI-27：当前状态、训练决策与下一步执行方案
 
+> **2026-07-15 RC4 覆盖更新**：RC3 已完成 P0、P1、P2，但 P3 首个风险 epoch 暴露出“只记录首 batch 隔离梯度”的证据缺陷；official test 与 G1 性能端点均未开启。RC3 全部运行现仅保留为工程/诊断证据。RC4 已完成记录器与 P0-P3 审计语义修正，并通过项目全量 CPU、独立审计器和 GPU 0/1/2 smoke；当前正在冻结 RC4 clean release，随后从 epoch 0 重跑完整八项 Stage-1 矩阵。权威修正与重跑合同见 [RC-IRSTD_AAAI27_RC4风险梯度证据修正与重跑决定.md](RC-IRSTD_AAAI27_RC4风险梯度证据修正与重跑决定.md)。本文件后续 RC3 段落保留为当时决策记录，不再代表最新状态。
+
 > **仓库**：`https://github.com/Arialliy/RC-IRSTD`
 > **日期**：2026-07-15
 > **方法版本**：Two-Stage / No-Reject / schema-v4 / v5 calibrator

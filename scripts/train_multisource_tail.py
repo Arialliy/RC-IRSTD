@@ -2239,6 +2239,10 @@ def train_one_epoch(
     risk_gradient_checked = False
     risk_gradient_norm = 0.0
     risk_gradients_finite = True
+    risk_gradient_probe_count = 0
+    risk_gradient_positive_found = False
+    risk_gradient_norm_first_positive_step = 0.0
+    risk_gradient_first_positive_step: int | None = None
 
     progress = tqdm(loader, total=len(loader), desc=f"epoch {epoch:04d}")
     for step, batch in enumerate(progress):
@@ -2371,11 +2375,25 @@ def train_one_epoch(
             raise FloatingPointError(f"non-finite loss at epoch={epoch}, step={step}")
 
         optimizer.zero_grad(set_to_none=True)
-        if (
-            not risk_gradient_checked
-            and risk_weight > 0.0
+        risk_gradient_enabled = (
+            risk_weight > 0.0
             and args.risk_objective != "segmentation-only"
-        ):
+        )
+        # Preserve the historical first-active-step diagnostic, but do not
+        # mistake a hinge-satisfied first batch for evidence that the D3 path
+        # has no gradient.  After a zero first probe, inspect only subsequent
+        # batches with a strictly positive auxiliary objective until the first
+        # strictly positive isolated risk gradient is observed.  autograd.grad
+        # does not populate parameter .grad buffers and therefore cannot alter
+        # the optimizer update performed below.
+        should_probe_risk_gradient = risk_gradient_enabled and (
+            not risk_gradient_checked
+            or (
+                not risk_gradient_positive_found
+                and float(risk_auxiliary_loss.detach()) > 0.0
+            )
+        )
+        if should_probe_risk_gradient:
             trainable = [
                 parameter for parameter in model.parameters() if parameter.requires_grad
             ]
@@ -2395,8 +2413,15 @@ def train_one_epoch(
                 raise FloatingPointError(
                     f"non-finite auxiliary-risk gradient at epoch={epoch}, step={step}"
                 )
-            risk_gradient_norm = float(risk_gradient_norm_tensor)
-            risk_gradient_checked = True
+            probed_norm = float(risk_gradient_norm_tensor)
+            risk_gradient_probe_count += 1
+            if not risk_gradient_checked:
+                risk_gradient_norm = probed_norm
+                risk_gradient_checked = True
+            if not risk_gradient_positive_found and probed_norm > 0.0:
+                risk_gradient_positive_found = True
+                risk_gradient_norm_first_positive_step = probed_norm
+                risk_gradient_first_positive_step = step
         loss.backward()
         gradient_norm, gradient_finite = gradient_norm_and_finite(model)
         gradients_finite = gradients_finite and gradient_finite
@@ -2534,6 +2559,12 @@ def train_one_epoch(
         "gradient_norm_stage": "pre_clip_global_l2",
         "risk_gradient_checked": risk_gradient_checked,
         "risk_gradient_norm_first_active_step": risk_gradient_norm,
+        "risk_gradient_probe_count": risk_gradient_probe_count,
+        "risk_gradient_positive_found": risk_gradient_positive_found,
+        "risk_gradient_norm_first_positive_step": (
+            risk_gradient_norm_first_positive_step
+        ),
+        "risk_gradient_first_positive_step": risk_gradient_first_positive_step,
         "risk_gradients_finite": risk_gradients_finite,
         "risk_weight": risk_weight,
         "effective_lambda_tail": (
@@ -2559,7 +2590,9 @@ def train_one_epoch(
     }
     if bool(getattr(args, "engineering_smoke", False)):
         if args.risk_objective != "segmentation-only" and (
-            not risk_gradient_checked or risk_gradient_norm <= 0.0
+            not risk_gradient_checked
+            or not risk_gradient_positive_found
+            or risk_gradient_norm_first_positive_step <= 0.0
         ):
             raise RuntimeError(
                 "engineering smoke did not exercise a non-zero auxiliary-risk gradient"
