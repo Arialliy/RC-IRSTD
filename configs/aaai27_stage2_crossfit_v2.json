@@ -1,0 +1,137 @@
+{
+  "schema_version": "rc-irstd.aaai27-stage2-crossfit-config.v2",
+  "artifact_status": "RESULT_FREE_FROZEN_CONFIGURATION",
+  "contains_observed_results": false,
+  "context_feature_dim": 93,
+  "development_geometry": {
+    "context_size": 14,
+    "query_size": 28,
+    "construction": "ordered_non_overlapping_contiguous_blocks_context_first_query_second"
+  },
+  "pixel_budget_grid": [
+    0.0001,
+    0.00001,
+    0.000001
+  ],
+  "primary_pixel_budget": 0.00001,
+  "threshold_semantics": "prediction = probability > threshold",
+  "model": {
+    "hidden_dims": [
+      32
+    ],
+    "activation": "GELU",
+    "dropout": 0.1,
+    "min_logit": -10.0,
+    "max_logit": 18.0,
+    "minimum_logit_gap": 0.001,
+    "reject_head": false,
+    "missing_episode_fallback": false,
+    "methods": {
+      "T6": {
+        "class": "DirectNoRejectPixelCalibrator",
+        "objective": "oracle_logit_huber_only",
+        "structural_monotonicity": false,
+        "expected_trainable_parameters": 3107
+      },
+      "T7": {
+        "class": "MonotoneNoRejectPixelRiskCalibrator",
+        "objective": "oracle_logit_huber_only",
+        "structural_monotonicity": true,
+        "expected_trainable_parameters": 3140
+      },
+      "T8": {
+        "class": "MonotoneNoRejectPixelRiskCalibrator",
+        "objective": "query_risk_aligned_exact_curve",
+        "structural_monotonicity": true,
+        "expected_trainable_parameters": 3140
+      }
+    }
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "epsilon": 1e-08,
+    "amsgrad": false,
+    "scheduler": "none",
+    "batch_size": 16,
+    "max_epochs": 100,
+    "early_stopping_patience": 20,
+    "gradient_clip_norm": 5.0,
+    "num_workers": 0,
+    "deterministic_algorithms": true,
+    "amp": false,
+    "shuffle_training": true,
+    "drop_last": false
+  },
+  "loss": {
+    "oracle_huber_delta": 1.0,
+    "lambda_violation": 4.0,
+    "lambda_utility": 1.0,
+    "lambda_oracle": 0.1,
+    "lambda_smoothness": 0.01,
+    "lambda_coverage": 4.0,
+    "risk_epsilon": 1e-12
+  },
+  "checkpoint_selection": {
+    "source_domain_weighting": "equal_one_half",
+    "within_domain_bsr": "equal_mandatory_window_mean",
+    "within_domain_log_excess": "equal_mandatory_window_mean",
+    "within_domain_pd": "pooled_tp_divided_by_pooled_gt",
+    "rank": [
+      "macro_source_BSR_max",
+      "macro_source_LogExcess_min",
+      "macro_source_Pd_max",
+      "earlier_epoch_on_exact_tie"
+    ],
+    "outer_target_accessed": false
+  },
+  "collection_contract": {
+    "schema_version": "rc-irstd.meta-episode-collection.v5",
+    "commit_schema_version": "rc-irstd.meta-episode-collection-commit.v1",
+    "required_bundle_members": [
+      "jsonl",
+      "manifest",
+      "commit"
+    ],
+    "external_sha256_required_for_every_member": true,
+    "statistics_config_external_sha256_required": true,
+    "statistics_config_shared_object_train_validation": true,
+    "train_role": "stage2_oof_fit_detector_oof_only",
+    "validation_role": "source_diagnostic_validation_detector_full_fit_only",
+    "both_source_domains_required": true,
+    "outer_target_absent": true,
+    "standardizer_fit_scope": "training_contexts_only",
+    "standardizer_dtype": "float64",
+    "standardizer_scale_floor": 1e-08
+  },
+  "checkpoint_contract": {
+    "schema_version": "rc-irstd.calibrator.v6",
+    "serialization": "torch_tensors_and_primitives_weights_only",
+    "immutable_epoch_generations": true,
+    "commit_published_last": true,
+    "resume_requires_external_generation_commit_sha256": true,
+    "reject_head": false,
+    "official_test_accessed": false
+  },
+  "seed_contract": {
+    "manifest_schema_version": "rc-irstd.stage2-seed-derivation-manifest.v1",
+    "algorithm_id": "sha256_domain_separated_seed_v1",
+    "base_seeds": [
+      42,
+      123,
+      3407
+    ],
+    "method_roles": {
+      "T6": "baseline_t6_direct_mlp::not_applicable",
+      "T7": "baseline_t7_monotone_oracle::not_applicable",
+      "T8": "stage2_calibrator_t8::not_applicable"
+    },
+    "python_builtin_hash_forbidden": true,
+    "manual_seed_override_forbidden": true
+  }
+}

@@ -18,11 +18,12 @@ import os
 import random
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Mapping, Tuple
 
@@ -39,6 +40,11 @@ from data_ext.split_utils import (
     read_split_entries,
     resolve_split_file,
     sample_id_from_entry,
+)
+from data_ext.stage2_role_contract import (
+    REPOSITORY_ROOT as STAGE2_REPOSITORY_ROOT,
+    load_stage2_selection,
+    verify_stage2_run_contract_sidecar,
 )
 from losses.hard_target_loss import hard_target_miss_loss
 from losses.local_peak_cvar import domain_pixel_tail_risks, domain_tail_risks
@@ -59,6 +65,50 @@ RESUME_CONTRACT_VERSION = 1
 AAAI27_PILOT_RUN_CONTRACT_VERSION = "rc-irstd.aaai27-stage1-run-contract.v1"
 AAAI27_ANALYSIS_PLAN_SCHEMA = "rc-irstd.aaai27-analysis-plan.v1"
 AAAI27_PILOT_MATRIX_SCHEMA = "rc-irstd.aaai27-stage1-pilot-matrix.v1"
+STAGE2_RUNTIME_CONTRACT_SCHEMA = "rc-irstd.stage2-detector-runtime-contract.v1"
+STAGE2_RUNTIME_ARTIFACT_TYPE = "rc_irstd_stage2_detector_runtime_contract"
+STAGE2_FIXED_LAST_POLICY = "fixed_last_no_test_or_target_validation"
+STAGE2_RUNTIME_CONTRACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "artifact_type",
+        "development_only",
+        "official_test_accessed",
+        "observed_results",
+        "run_id",
+        "outer_fold_id",
+        "outer_target_domain",
+        "detector_role",
+        "oof_fold_index",
+        "base_seed",
+        "derived_seed",
+        "checkpoint_selection",
+        "input_run_contract",
+        "run_config",
+        "environment_artifact",
+        "release_artifact",
+        "expected_artifacts",
+    }
+)
+STAGE2_RUNTIME_ARTIFACT_KEYS = frozenset(
+    {
+        "input_run_contract",
+        "run_config",
+        "environment_artifact",
+        "runtime_contract",
+        "release_artifact",
+    }
+)
+STAGE2_EXPECTED_ARTIFACTS = {
+    "training_checkpoint": "checkpoint_last.pt",
+    "training_checkpoint_sha256": "checkpoint_sha256.txt",
+    "restricted_inference_checkpoint": "stage2_inference_checkpoint.pt",
+    "restricted_inference_checkpoint_sha256": (
+        "stage2_inference_checkpoint.pt.sha256"
+    ),
+    "metrics": "metrics.jsonl",
+    "metrics_sha256": "metrics.jsonl.sha256",
+}
 STAGE1_SLS_LOSS_EPS = 1e-8
 _RESUME_MUTABLE_ARGUMENTS = frozenset({"epochs", "resume"})
 DOMAIN_MARGIN_OBJECTIVES = frozenset(
@@ -82,10 +132,18 @@ def stage1_segmentation_loss_implementation() -> Dict[str, object]:
 
 
 def parse_args() -> argparse.Namespace:
+    stage2_requested = any(
+        argument == "--stage2-run-contract"
+        or argument.startswith("--stage2-run-contract=")
+        for argument in sys.argv[1:]
+    )
     parser = argparse.ArgumentParser(
         description="Balanced multi-source MSHNet training with tail-risk losses"
     )
-    parser.add_argument("--source-dirs", nargs="+", required=True)
+    # Keep the legacy argparse contract byte-semantically unchanged unless the
+    # new explicit Stage2 switch is present.  Stage2 obtains sources solely
+    # from its verified run contract.
+    parser.add_argument("--source-dirs", nargs="+", required=not stage2_requested)
     parser.add_argument(
         "--allow-single-source-inner-smoke",
         action="store_true",
@@ -227,6 +285,16 @@ def parse_args() -> argparse.Namespace:
             "Enable the fail-closed AAAI-27 Stage-1 development-pilot contract. "
             "This requires a clean tagged Git release, an exact source archive, "
             "an authorized analysis plan, and a matching frozen pilot-matrix run."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-run-contract",
+        default=None,
+        metavar="JSON",
+        help=(
+            "Enable the additive Stage2 two-source detector mode. The exact "
+            "contract and adjacent SHA sidecar determine every source record, "
+            "outer identity, detector role, and runtime seed."
         ),
     )
     parser.add_argument(
@@ -427,6 +495,8 @@ def protocol_scope(args: argparse.Namespace, names: Iterable[str]) -> str:
     """Return the explicit evidence scope persisted in every run artifact."""
 
     names = list(names)
+    if getattr(args, "stage2_run_contract", None):
+        return "stage2_development_detector_official_test_sealed"
     if bool(getattr(args, "engineering_smoke", False)):
         return "engineering_smoke_not_paper_evidence"
     if len(names) == 1:
@@ -466,6 +536,263 @@ def build_source_datasets(
         # no target-domain data can influence checkpoint selection.
         datasets[name] = IRSTD_Dataset(dataset_args, mode="train")
     return datasets
+
+
+def bind_stage2_run_contract_to_args(
+    args: argparse.Namespace,
+    verified_contract: Mapping[str, object],
+    *,
+    repository_root: str | Path | None = None,
+) -> None:
+    """Make a verified Stage2 run contract the sole source-role authority.
+
+    User-supplied source/fold arguments are rejected rather than reconciled.
+    This prevents a valid contract from being paired with a different runtime
+    data role.  The runtime seed must be supplied explicitly/effectively as the
+    already-derived value; it is never silently replaced.
+    """
+
+    if not getattr(args, "stage2_run_contract", None):
+        raise ValueError("Stage2 argument binding requires --stage2-run-contract")
+    incompatible = {
+        "--source-dirs": getattr(args, "source_dirs", None),
+        "--source-split-files": getattr(args, "source_split_files", None),
+        "--source-names": getattr(args, "source_names", None),
+        "--outer-fold-id": getattr(args, "outer_fold_id", None),
+        "--outer-target": getattr(args, "outer_target", None),
+        "--held-out-domains": getattr(args, "held_out_domains", None),
+    }
+    supplied = [name for name, value in incompatible.items() if value is not None]
+    if supplied:
+        raise ValueError(
+            "Stage2 run contract is the sole source/fold authority; remove: "
+            + ", ".join(supplied)
+        )
+    if bool(getattr(args, "allow_single_source_inner_smoke", False)):
+        raise ValueError("Stage2 mode forbids single-source smoke semantics")
+    if bool(getattr(args, "engineering_smoke", False)):
+        raise ValueError("Stage2 contract mode cannot be relabeled engineering smoke")
+    if bool(getattr(args, "aaai27_pilot", False)):
+        raise ValueError("Stage2 contract mode cannot be combined with Stage1 pilot mode")
+    for name in (
+        "analysis_plan",
+        "pilot_matrix",
+        "pilot_run_id",
+        "release_tag",
+        "source_archive",
+        "source_archive_sha256_file",
+    ):
+        if getattr(args, name, None) is not None:
+            raise ValueError(f"Stage1 pilot argument --{name.replace('_', '-')} is forbidden in Stage2 mode")
+
+    derived_seed = verified_contract.get("derived_seed")
+    if type(derived_seed) is not int or args.seed != derived_seed:
+        raise ValueError(
+            "runtime --seed must equal the contract-derived frozen seed "
+            f"{derived_seed!r}; got {args.seed!r}"
+        )
+    training = verified_contract.get("training")
+    if not isinstance(training, Mapping):
+        raise ValueError("verified Stage2 contract lacks training identity")
+    argument_map = {
+        "risk_objective": "risk_objective",
+        "tail_mode": "tail_mode",
+        "lambda_margin": "lambda_margin",
+        "target_background_margin": "target_background_margin",
+        "tail_q": "tail_q",
+        "miss_q": "miss_q",
+        "object_pixel_q": "object_pixel_q",
+        "tail_gamma": "tail_gamma",
+        "peak_kernel_size": "peak_kernel_size",
+        "exclusion_radius": "exclusion_radius",
+        "peak_min_score": "peak_min_score",
+        "plateau_atol": "plateau_atol",
+        "warm_epoch": "warm_epoch",
+        "risk_warmup_epochs": "risk_warmup_epochs",
+        "risk_ramp_epochs": "risk_ramp_epochs",
+        "lr": "lr",
+    }
+    for contract_name, argument_name in argument_map.items():
+        if getattr(args, argument_name) != training.get(contract_name):
+            raise ValueError(
+                f"Stage2 runtime --{argument_name.replace('_', '-')} differs "
+                f"from the frozen D3 contract"
+            )
+
+    root = (
+        STAGE2_REPOSITORY_ROOT
+        if repository_root is None
+        else Path(repository_root).expanduser().resolve()
+    )
+    expected_role = (
+        "detector_oof_train"
+        if verified_contract.get("detector_role") == "detector_oof"
+        else "detector_full_fit_train"
+    )
+    selections: list[dict[str, object]] = []
+    for binding in verified_contract["selection_contracts"]:
+        selection = load_stage2_selection(
+            root / str(binding["path"]),
+            str(binding["sha256"]),
+            expected_role,
+            repository_root=root,
+        )
+        selections.append(selection)
+    args.source_dirs = [
+        str((root / str(selection["dataset_root"])).resolve())
+        for selection in selections
+    ]
+    args.source_split_files = [
+        str((root / str(selection["id_list"]["path"])).resolve())
+        for selection in selections
+    ]
+    args.source_names = list(verified_contract["source_domains"])
+    args.outer_fold_id = str(verified_contract["outer_fold_id"])
+    args.outer_target = str(verified_contract["outer_target_domain"])
+    args.held_out_domains = [args.outer_target]
+    args.stage2_detector_role = str(verified_contract["detector_role"])
+    args.stage2_oof_fold_index = verified_contract["oof_fold_index"]
+
+
+def build_source_datasets_from_stage2_contract(
+    args: argparse.Namespace,
+    verified_contract: Mapping[str, object],
+    *,
+    repository_root: str | Path | None = None,
+) -> Dict[str, IRSTD_Dataset]:
+    """Construct exactly two selected datasets without opening a test split.
+
+    Unlike the legacy path, this function never calls
+    :func:`audited_source_train_split`.  It passes the SHA-verified selection ID
+    file directly to ``IRSTD_Dataset``; no train/test split discovery occurs.
+    """
+
+    root = (
+        STAGE2_REPOSITORY_ROOT
+        if repository_root is None
+        else Path(repository_root).expanduser().resolve()
+    )
+    expected_role = (
+        "detector_oof_train"
+        if verified_contract.get("detector_role") == "detector_oof"
+        else "detector_full_fit_train"
+    )
+    raw_bindings = verified_contract.get("selection_contracts")
+    if not isinstance(raw_bindings, list) or len(raw_bindings) != 2:
+        raise ValueError("Stage2 dataset construction requires exactly two selections")
+    datasets: Dict[str, IRSTD_Dataset] = {}
+    for binding in raw_bindings:
+        selection = load_stage2_selection(
+            root / str(binding["path"]),
+            str(binding["sha256"]),
+            expected_role,
+            repository_root=root,
+        )
+        name = str(selection["source_domain"])
+        dataset_root = (root / str(selection["dataset_root"])).resolve()
+        try:
+            dataset_root.relative_to(root)
+        except ValueError as error:
+            raise ValueError("Stage2 dataset root escapes repository") from error
+        if not dataset_root.is_dir() or dataset_root.is_symlink():
+            raise FileNotFoundError(f"Stage2 dataset root does not exist: {dataset_root}")
+        id_path = (root / str(selection["id_list"]["path"])).resolve()
+        dataset_args = SimpleNamespace(
+            dataset_dir=str(dataset_root),
+            base_size=args.base_size,
+            crop_size=args.crop_size,
+            split_file=str(id_path),
+        )
+        dataset = IRSTD_Dataset(dataset_args, mode="train")
+        expected_ids = [str(record["image_id"]) for record in selection["records"]]
+        actual_ids = [sample_id_from_entry(value) for value in dataset.names]
+        if actual_ids != expected_ids or len(dataset) != selection["record_count"]:
+            raise ValueError("Stage2 dataset order/count differs from selection contract")
+        if name in datasets:
+            raise ValueError(f"duplicate Stage2 source domain: {name}")
+        datasets[name] = dataset
+    if list(datasets) != list(verified_contract["source_domains"]):
+        raise ValueError("Stage2 dataset order differs from source_domains")
+    return datasets
+
+
+def build_stage2_detector_source_records(
+    names: Iterable[str],
+    datasets: Dict[str, IRSTD_Dataset],
+    verified_contract: Mapping[str, object],
+    *,
+    repository_root: str | Path | None = None,
+) -> List[Dict[str, object]]:
+    """Build source provenance solely from selected manifest identities.
+
+    The legacy builder fingerprints every image in a dataset, which would read
+    official-test images.  Stage2 instead binds the exact assignment-derived
+    records and selection hashes and touches no image or mask here.
+    """
+
+    root = (
+        STAGE2_REPOSITORY_ROOT
+        if repository_root is None
+        else Path(repository_root).expanduser().resolve()
+    )
+    expected_role = (
+        "detector_oof_train"
+        if verified_contract.get("detector_role") == "detector_oof"
+        else "detector_full_fit_train"
+    )
+    by_domain: dict[str, Mapping[str, object]] = {}
+    for binding in verified_contract["selection_contracts"]:
+        selection = load_stage2_selection(
+            root / str(binding["path"]),
+            str(binding["sha256"]),
+            expected_role,
+            repository_root=root,
+        )
+        by_domain[str(selection["source_domain"])] = selection
+    records: List[Dict[str, object]] = []
+    all_image_hashes: set[str] = set()
+    for name in names:
+        if name not in by_domain or name not in datasets:
+            raise ValueError("Stage2 source provenance/domain mismatch")
+        selection = by_domain[name]
+        selected_ids = [str(item["image_id"]) for item in selection["records"]]
+        dataset_ids = [sample_id_from_entry(value) for value in datasets[name].names]
+        if selected_ids != dataset_ids:
+            raise ValueError("Stage2 source dataset order changed after construction")
+        image_hashes = [
+            str(item["original_image_sha256"]) for item in selection["records"]
+        ]
+        overlap = all_image_hashes.intersection(image_hashes)
+        if overlap:
+            raise ValueError(
+                "Stage2 detector sources share original image SHA-256 values: "
+                f"collision_count={len(overlap)}"
+            )
+        all_image_hashes.update(image_hashes)
+        binding = next(
+            item
+            for item in verified_contract["selection_contracts"]
+            if item["source_domain"] == name
+        )
+        records.append(
+            {
+                "record_schema_version": "rc-irstd.stage2-detector-source-record.v1",
+                "source_name": name,
+                "dataset_root": selection["dataset_root"],
+                "selection_contract": {
+                    "path": binding["path"],
+                    "sha256": binding["sha256"],
+                    "selection_role": binding["selection_role"],
+                },
+                "id_list": dict(selection["id_list"]),
+                "records_content_sha256": selection["records_content_sha256"],
+                "ordered_sample_ids": selected_ids,
+                "ordered_original_image_sha256": image_hashes,
+                "num_samples": len(selected_ids),
+                "official_test_accessed": False,
+            }
+        )
+    return records
 
 
 def audited_source_train_split(
@@ -1017,6 +1344,443 @@ def write_text(path: Path, payload: str) -> None:
     os.replace(temporary, path)
 
 
+def write_artifact_sha256(path: Path) -> Dict[str, str]:
+    """Write an adjacent sha256sum-format sidecar for a regular artifact."""
+
+    digest = sha256_file(path)
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    write_text(sidecar, f"{digest}  {path.name}\n")
+    return {"path": path.name, "sha256": digest, "sidecar": sidecar.name}
+
+
+def _stage2_sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _stage2_relative_path(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"{label} must be a canonical POSIX relative path")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValueError(f"{label} must be a canonical POSIX relative path")
+    return value
+
+
+def _stage2_reject_symlink_components(path: Path, label: str) -> None:
+    absolute = path.absolute()
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError(f"{label} contains a symlink component: {cursor}")
+
+
+def _stage2_run_directory(value: str | Path) -> Path:
+    raw = Path(value).expanduser()
+    _stage2_reject_symlink_components(raw, "Stage2 run directory")
+    if not raw.exists() or not stat.S_ISDIR(raw.lstat().st_mode):
+        raise FileNotFoundError(f"Stage2 run directory is not a real directory: {raw}")
+    return raw.resolve(strict=True)
+
+
+def _stage2_regular_file(path: Path, label: str) -> Path:
+    _stage2_reject_symlink_components(path, label)
+    if not path.exists() or not stat.S_ISREG(path.lstat().st_mode):
+        raise FileNotFoundError(f"{label} is not a regular file: {path}")
+    return path.resolve(strict=True)
+
+
+def _stage2_run_file(
+    run_dir: str | Path,
+    declared_path: object,
+    expected_name: str,
+    label: str,
+) -> Path:
+    root = _stage2_run_directory(run_dir)
+    relative = _stage2_relative_path(declared_path, f"{label}.path")
+    if PurePosixPath(relative).parts != (expected_name,):
+        raise ValueError(f"{label}.path must be exactly {expected_name!r}")
+    resolved = _stage2_regular_file(root / expected_name, label)
+    if resolved.parent != root:
+        raise ValueError(f"{label} escapes the canonical Stage2 run directory")
+    return resolved
+
+
+def _stage2_repository_file(value: object, label: str) -> tuple[Path, str]:
+    relative = _stage2_relative_path(value, f"{label}.path")
+    root = STAGE2_REPOSITORY_ROOT.resolve(strict=True)
+    candidate = root.joinpath(*PurePosixPath(relative).parts)
+    resolved = _stage2_regular_file(candidate, label)
+    try:
+        replay = resolved.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError(f"{label} escapes the repository") from error
+    if replay != relative:
+        raise ValueError(f"{label}.path is not canonical after resolution")
+    return resolved, relative
+
+
+def _stage2_stable_text(path: Path, label: str) -> str:
+    before = sha256_file(path)
+    payload = path.read_text(encoding="utf-8")
+    after = sha256_file(path)
+    if before != after:
+        raise RuntimeError(f"{label} changed while read: {path}")
+    return payload
+
+
+def _verify_stage2_sha256sum_sidecar(
+    artifact: Path,
+    sidecar: Path,
+    label: str,
+) -> str:
+    artifact = _stage2_regular_file(artifact, label)
+    sidecar = _stage2_regular_file(sidecar, f"{label} SHA-256 sidecar")
+    before = sha256_file(artifact)
+    sidecar_text = _stage2_stable_text(sidecar, f"{label} SHA-256 sidecar")
+    after = sha256_file(artifact)
+    if before != after:
+        raise RuntimeError(f"{label} changed while its sidecar was read")
+    if sidecar_text != f"{before}  {artifact.name}\n":
+        raise ValueError(f"{label} SHA-256 sidecar mismatch")
+    return before
+
+
+def _verify_stage2_adjacent_sidecar(
+    run_dir: str | Path,
+    artifact_name: str,
+    label: str,
+) -> Dict[str, str]:
+    artifact = _stage2_run_file(run_dir, artifact_name, artifact_name, label)
+    sidecar_name = artifact_name + ".sha256"
+    sidecar = _stage2_run_file(
+        run_dir,
+        sidecar_name,
+        sidecar_name,
+        f"{label} SHA-256 sidecar",
+    )
+    digest = _verify_stage2_sha256sum_sidecar(artifact, sidecar, label)
+    return {"path": artifact_name, "sha256": digest, "sidecar": sidecar_name}
+
+
+def _stage2_exact_binding(
+    value: object,
+    label: str,
+    *,
+    expected_path: str,
+    expected_sidecar: str | None,
+) -> Dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be an object")
+    expected_keys = {"path", "sha256"}
+    if expected_sidecar is not None:
+        expected_keys.add("sidecar")
+    if set(value) != expected_keys:
+        raise ValueError(f"{label} keys mismatch")
+    if value.get("path") != expected_path:
+        raise ValueError(f"{label}.path mismatch")
+    if expected_sidecar is not None and value.get("sidecar") != expected_sidecar:
+        raise ValueError(f"{label}.sidecar mismatch")
+    return {
+        "path": expected_path,
+        "sha256": _stage2_sha256(value.get("sha256"), f"{label}.sha256"),
+        **({"sidecar": expected_sidecar} if expected_sidecar is not None else {}),
+    }
+
+
+def _stage2_input_binding(
+    input_run_contract_path: str | Path,
+    input_run_contract_sha256: str,
+) -> Dict[str, str]:
+    raw = Path(input_run_contract_path).expanduser()
+    resolved = _stage2_regular_file(raw, "Stage2 input run contract")
+    root = STAGE2_REPOSITORY_ROOT.resolve(strict=True)
+    try:
+        relative = resolved.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("Stage2 input run contract is outside repository") from error
+    declared_sha = _stage2_sha256(
+        input_run_contract_sha256, "Stage2 input run-contract SHA-256"
+    )
+    sidecar = resolved.with_suffix(resolved.suffix + ".sha256")
+    actual_sha = _verify_stage2_sha256sum_sidecar(
+        resolved, sidecar, "Stage2 input run contract"
+    )
+    if actual_sha != declared_sha:
+        raise ValueError("Stage2 input run-contract SHA-256 mismatch")
+    return {"path": relative, "sha256": declared_sha}
+
+
+def _verify_stage2_release_binding(
+    value: object,
+    expected: object,
+) -> Dict[str, object]:
+    if not isinstance(value, Mapping) or not isinstance(expected, Mapping):
+        raise TypeError("Stage2 release_artifact must be an object")
+    if dict(value) != dict(expected):
+        raise ValueError("Stage2 runtime release_artifact binding mismatch")
+    release_path, _ = _stage2_repository_file(value.get("path"), "release artifact")
+    if sha256_file(release_path) != _stage2_sha256(
+        value.get("sha256"), "release_artifact.sha256"
+    ):
+        raise ValueError("Stage2 release artifact SHA-256 mismatch")
+    archive = value.get("source_archive")
+    if not isinstance(archive, Mapping) or set(archive) != {"path", "sha256"}:
+        raise ValueError("Stage2 release source_archive binding mismatch")
+    archive_path, _ = _stage2_repository_file(
+        archive.get("path"), "release source archive"
+    )
+    if sha256_file(archive_path) != _stage2_sha256(
+        archive.get("sha256"), "release source_archive.sha256"
+    ):
+        raise ValueError("Stage2 release source archive SHA-256 mismatch")
+    return dict(value)
+
+
+def write_stage2_runtime_artifacts(
+    run_dir: Path,
+    args: argparse.Namespace,
+    verified_contract: Mapping[str, object],
+    input_run_contract_sha256: str,
+    run_config_sha256: str,
+    execution_fingerprint_payload: Mapping[str, object],
+) -> Dict[str, object]:
+    """Persist W02 runtime/environment bindings without circular hashes."""
+
+    if not getattr(args, "stage2_run_contract", None):
+        raise ValueError("Stage2 runtime artifacts require --stage2-run-contract")
+    root = _stage2_run_directory(run_dir)
+    input_binding = _stage2_input_binding(
+        str(args.stage2_run_contract), input_run_contract_sha256
+    )
+    config_binding = _verify_stage2_adjacent_sidecar(
+        root, "config.json", "Stage2 run config"
+    )
+    if config_binding["sha256"] != _stage2_sha256(
+        run_config_sha256, "Stage2 run-config SHA-256"
+    ):
+        raise ValueError("Stage2 run-config SHA-256 mismatch")
+    environment_path = root / "environment.json"
+    write_json(environment_path, dict(execution_fingerprint_payload))
+    environment_artifact = write_artifact_sha256(environment_path)
+    release_artifact = verified_contract.get("bindings", {}).get("release_artifact")
+    if not isinstance(release_artifact, Mapping):
+        raise ValueError("Stage2 run contract lacks release_artifact binding")
+    runtime_contract: Dict[str, object] = {
+        "schema_version": STAGE2_RUNTIME_CONTRACT_SCHEMA,
+        "artifact_type": STAGE2_RUNTIME_ARTIFACT_TYPE,
+        "development_only": True,
+        "official_test_accessed": False,
+        "observed_results": None,
+        "run_id": verified_contract["run_id"],
+        "outer_fold_id": verified_contract["outer_fold_id"],
+        "outer_target_domain": verified_contract["outer_target_domain"],
+        "detector_role": verified_contract["detector_role"],
+        "oof_fold_index": verified_contract["oof_fold_index"],
+        "base_seed": verified_contract["base_seed"],
+        "derived_seed": verified_contract["derived_seed"],
+        "checkpoint_selection": STAGE2_FIXED_LAST_POLICY,
+        "input_run_contract": input_binding,
+        "run_config": config_binding,
+        "environment_artifact": environment_artifact,
+        "release_artifact": dict(release_artifact),
+        "expected_artifacts": dict(STAGE2_EXPECTED_ARTIFACTS),
+    }
+    runtime_path = root / "stage2_runtime_contract.json"
+    write_json(runtime_path, runtime_contract)
+    write_artifact_sha256(runtime_path)
+    return verify_stage2_runtime_artifacts(
+        root,
+        verified_contract,
+        input_run_contract_sha256,
+        run_config_sha256,
+        execution_fingerprint_payload,
+        input_run_contract_path=str(args.stage2_run_contract),
+    )
+
+
+def verify_stage2_runtime_artifacts(
+    run_dir: Path,
+    verified_contract: Mapping[str, object],
+    input_run_contract_sha256: str,
+    run_config_sha256: str,
+    execution_fingerprint_payload: Mapping[str, object],
+    *,
+    input_run_contract_path: str | Path,
+) -> Dict[str, object]:
+    """Replay existing runtime artifacts before a Stage2 fixed-last resume."""
+
+    root = _stage2_run_directory(run_dir)
+    input_binding = _stage2_input_binding(
+        input_run_contract_path, input_run_contract_sha256
+    )
+    config_binding = _verify_stage2_adjacent_sidecar(
+        root, "config.json", "Stage2 run config"
+    )
+    if config_binding["sha256"] != _stage2_sha256(
+        run_config_sha256, "Stage2 run-config SHA-256"
+    ):
+        raise ValueError("Stage2 run-config SHA-256 mismatch")
+    runtime_binding = _verify_stage2_adjacent_sidecar(
+        root, "stage2_runtime_contract.json", "Stage2 runtime contract"
+    )
+    runtime_path = _stage2_run_file(
+        root,
+        runtime_binding["path"],
+        "stage2_runtime_contract.json",
+        "Stage2 runtime contract",
+    )
+    runtime = _load_json_object(runtime_path, "Stage2 runtime contract")
+    if set(runtime) != STAGE2_RUNTIME_CONTRACT_KEYS:
+        raise ValueError("Stage2 runtime-contract keys mismatch")
+    if runtime["schema_version"] != STAGE2_RUNTIME_CONTRACT_SCHEMA:
+        raise ValueError("Stage2 runtime-contract schema mismatch")
+    if runtime["artifact_type"] != STAGE2_RUNTIME_ARTIFACT_TYPE:
+        raise ValueError("Stage2 runtime-contract artifact_type mismatch")
+    for key, expected_bool in (
+        ("development_only", True),
+        ("official_test_accessed", False),
+    ):
+        if type(runtime[key]) is not bool or runtime[key] is not expected_bool:
+            raise TypeError(f"Stage2 runtime-contract {key} must be exact {expected_bool}")
+    if runtime["observed_results"] is not None:
+        raise ValueError("Stage2 runtime-contract observed_results must be null")
+    if runtime["checkpoint_selection"] != STAGE2_FIXED_LAST_POLICY:
+        raise ValueError("Stage2 runtime contract is not fixed-last")
+    if runtime["expected_artifacts"] != STAGE2_EXPECTED_ARTIFACTS:
+        raise ValueError("Stage2 runtime expected_artifacts mismatch")
+    declared_input = _stage2_exact_binding(
+        runtime["input_run_contract"],
+        "Stage2 runtime input_run_contract",
+        expected_path=input_binding["path"],
+        expected_sidecar=None,
+    )
+    if declared_input != input_binding:
+        raise ValueError("Stage2 runtime input-run binding mismatch")
+    declared_config = _stage2_exact_binding(
+        runtime["run_config"],
+        "Stage2 runtime run_config",
+        expected_path="config.json",
+        expected_sidecar="config.json.sha256",
+    )
+    if declared_config != config_binding:
+        raise ValueError("Stage2 runtime config binding mismatch")
+    environment_binding = _verify_stage2_adjacent_sidecar(
+        root, "environment.json", "Stage2 environment artifact"
+    )
+    declared_environment = _stage2_exact_binding(
+        runtime["environment_artifact"],
+        "Stage2 runtime environment_artifact",
+        expected_path="environment.json",
+        expected_sidecar="environment.json.sha256",
+    )
+    if declared_environment != environment_binding:
+        raise ValueError("Stage2 runtime environment binding mismatch")
+    environment_path = _stage2_run_file(
+        root,
+        environment_binding["path"],
+        "environment.json",
+        "Stage2 environment artifact",
+    )
+    environment = _load_json_object(environment_path, "Stage2 environment")
+    if environment != execution_fingerprint_payload:
+        raise ValueError("Stage2 resume environment/source fingerprint mismatch")
+    expected = {
+        "run_id": verified_contract["run_id"],
+        "outer_fold_id": verified_contract["outer_fold_id"],
+        "outer_target_domain": verified_contract["outer_target_domain"],
+        "detector_role": verified_contract["detector_role"],
+        "oof_fold_index": verified_contract["oof_fold_index"],
+        "base_seed": verified_contract["base_seed"],
+        "derived_seed": verified_contract["derived_seed"],
+    }
+    for key, value in expected.items():
+        if runtime[key] != value:
+            raise ValueError(f"Stage2 runtime identity mismatch: {key}")
+    bindings = verified_contract.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise ValueError("verified Stage2 run contract lacks bindings")
+    release_artifact = _verify_stage2_release_binding(
+        runtime["release_artifact"], bindings.get("release_artifact")
+    )
+    return {
+        "input_run_contract": input_binding,
+        "run_config": config_binding,
+        "environment_artifact": environment_binding,
+        "runtime_contract": runtime_binding,
+        "release_artifact": release_artifact,
+    }
+
+
+def verify_stage2_checkpoint_provenance(
+    checkpoint: Mapping[str, object],
+    run_dir: str | Path,
+    verified_contract: Mapping[str, object],
+    input_run_contract_sha256: str,
+    run_config_sha256: str,
+    execution_fingerprint_payload: Mapping[str, object],
+    *,
+    input_run_contract_path: str | Path,
+    expected_runtime_artifacts: Mapping[str, object] | None = None,
+) -> Dict[str, object]:
+    """Replay the complete Stage2 checkpoint -> runtime -> disk closure."""
+
+    runtime_artifacts = verify_stage2_runtime_artifacts(
+        run_dir,
+        verified_contract,
+        input_run_contract_sha256,
+        run_config_sha256,
+        execution_fingerprint_payload,
+        input_run_contract_path=input_run_contract_path,
+    )
+    raw_runtime = checkpoint.get("stage2_runtime_artifacts")
+    if not isinstance(raw_runtime, Mapping):
+        raise ValueError("Stage2 checkpoint lacks runtime artifact bindings")
+    if set(raw_runtime) != STAGE2_RUNTIME_ARTIFACT_KEYS:
+        raise ValueError("Stage2 checkpoint runtime-artifact keys mismatch")
+    if any(not isinstance(raw_runtime[key], Mapping) for key in raw_runtime):
+        raise TypeError("Stage2 checkpoint runtime-artifact bindings must be objects")
+    if dict(raw_runtime) != runtime_artifacts:
+        raise ValueError("Stage2 checkpoint/runtime/disk provenance divergence")
+    if expected_runtime_artifacts is not None:
+        if (
+            not isinstance(expected_runtime_artifacts, Mapping)
+            or set(expected_runtime_artifacts) != STAGE2_RUNTIME_ARTIFACT_KEYS
+            or dict(expected_runtime_artifacts) != runtime_artifacts
+        ):
+            raise ValueError("Stage2 expected runtime-artifact closure mismatch")
+    if checkpoint.get("run_contract_sha256") != _stage2_sha256(
+        input_run_contract_sha256, "Stage2 input run-contract SHA-256"
+    ):
+        raise ValueError("Stage2 checkpoint run-contract SHA-256 mismatch")
+    if checkpoint.get("run_config_sha256") != _stage2_sha256(
+        run_config_sha256, "Stage2 run-config SHA-256"
+    ):
+        raise ValueError("Stage2 checkpoint run-config SHA-256 mismatch")
+    if checkpoint.get("checkpoint_selection") != STAGE2_FIXED_LAST_POLICY:
+        raise ValueError("Stage2 checkpoint is not fixed-last")
+    if type(checkpoint.get("official_test_accessed")) is not bool or checkpoint.get(
+        "official_test_accessed"
+    ) is not False:
+        raise TypeError("Stage2 checkpoint official_test_accessed must be exact false")
+    identity = {
+        "outer_fold_id": verified_contract["outer_fold_id"],
+        "outer_target": verified_contract["outer_target_domain"],
+        "detector_role": verified_contract["detector_role"],
+        "oof_fold_index": verified_contract["oof_fold_index"],
+    }
+    for key, expected in identity.items():
+        if checkpoint.get(key) != expected:
+            raise ValueError(f"Stage2 checkpoint identity mismatch: {key}")
+    return runtime_artifacts
+
+
 def canonical_training_command() -> str:
     """Return a directly replayable module invocation for this process."""
 
@@ -1056,10 +1820,14 @@ def _portable_contract_path(path: Path, repository_root: Path) -> str:
 
 
 def _load_json_object(path: Path, label: str) -> Dict[str, object]:
+    before = sha256_file(path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise ValueError(f"{label} is not valid JSON: {path}") from error
+    after = sha256_file(path)
+    if before != after:
+        raise RuntimeError(f"{label} changed while read: {path}")
     if not isinstance(payload, dict):
         raise TypeError(f"{label} must contain one JSON object: {path}")
     return payload
@@ -1864,12 +2632,21 @@ def model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     return model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
 
 
+def serialised_training_args(args: argparse.Namespace) -> Dict[str, object]:
+    """Hide the additive Stage2 None default from every legacy artifact."""
+
+    values = dict(vars(args))
+    if values.get("stage2_run_contract") is None:
+        values.pop("stage2_run_contract", None)
+    return values
+
+
 def resume_contract(args: argparse.Namespace) -> Dict[str, object]:
     """Return the immutable CLI contract that must survive continuation."""
 
     values = {
         key: value
-        for key, value in vars(args).items()
+        for key, value in serialised_training_args(args).items()
         if key not in _RESUME_MUTABLE_ARGUMENTS
     }
     if "held_out_domains" in values:
@@ -1925,7 +2702,12 @@ def _load_model_state_dict(model: nn.Module, state_dict: Mapping[str, torch.Tens
 def _last_metrics_epoch(path: Path) -> int:
     if not path.is_file():
         raise FileNotFoundError(f"resume run is missing metrics.jsonl: {path}")
-    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    before = sha256_file(path)
+    text = path.read_text(encoding="utf-8")
+    after = sha256_file(path)
+    if before != after:
+        raise RuntimeError(f"resume metrics.jsonl changed while read: {path}")
+    lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
         raise ValueError("resume metrics.jsonl is empty")
     payload = json.loads(lines[-1])
@@ -1942,23 +2724,55 @@ def load_resume_checkpoint(
     detector_source_records: List[Dict[str, object]],
     device: torch.device,
     pilot_release_binding: Mapping[str, object] | None = None,
-) -> Tuple[Path, int, str, Dict[str, object]]:
+    stage2_run_contract_sha256: str | None = None,
+    stage2_verified_contract: Mapping[str, object] | None = None,
+    stage2_execution_fingerprint: Mapping[str, object] | None = None,
+    return_stage2_runtime_artifacts: bool = False,
+) -> tuple:
     """Fail closed unless a fixed-last artifact matches the current run exactly."""
 
-    checkpoint_path = Path(args.resume).expanduser().resolve()
-    run_dir = checkpoint_path.parent
     pilot_mode = bool(getattr(args, "aaai27_pilot", False))
-    verify_checkpoint_sha256(checkpoint_path, required=pilot_mode)
-    config_path = run_dir / "config.json"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"resume run is missing config.json: {config_path}")
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(config, dict):
-        raise TypeError("resume config.json must contain an object")
+    stage2_mode = bool(getattr(args, "stage2_run_contract", None))
+    raw_checkpoint_path = Path(args.resume).expanduser()
+    if stage2_mode:
+        run_dir = _stage2_run_directory(raw_checkpoint_path.parent)
+        checkpoint_path = _stage2_run_file(
+            run_dir,
+            raw_checkpoint_path.name,
+            "checkpoint_last.pt",
+            "Stage2 training checkpoint",
+        )
+        checkpoint_sidecar = _stage2_run_file(
+            run_dir,
+            "checkpoint_sha256.txt",
+            "checkpoint_sha256.txt",
+            "Stage2 training checkpoint SHA-256 sidecar",
+        )
+        _verify_stage2_sha256sum_sidecar(
+            checkpoint_path,
+            checkpoint_sidecar,
+            "Stage2 training checkpoint",
+        )
+        config_binding = _verify_stage2_adjacent_sidecar(
+            run_dir, "config.json", "Stage2 run config"
+        )
+        config_path = _stage2_run_file(
+            run_dir, "config.json", "config.json", "Stage2 run config"
+        )
+        config = _load_json_object(config_path, "Stage2 run config")
+        run_config_sha256 = config_binding["sha256"]
+    else:
+        checkpoint_path = raw_checkpoint_path.resolve()
+        run_dir = checkpoint_path.parent
+        verify_checkpoint_sha256(checkpoint_path, required=pilot_mode)
+        config_path = run_dir / "config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"resume run is missing config.json: {config_path}")
+        config = _load_json_object(config_path, "resume config")
+        run_config_sha256 = sha256_file(config_path)
     expected_segmentation_loss = stage1_segmentation_loss_implementation()
     if config.get("segmentation_loss_implementation") != expected_segmentation_loss:
         raise ValueError("resume config segmentation-loss implementation mismatch")
-    run_config_sha256 = sha256_file(config_path)
     run_contract_sha256: str | None = None
     if pilot_mode:
         if pilot_release_binding is None:
@@ -1993,6 +2807,26 @@ def load_resume_checkpoint(
         ):
             raise ValueError("pilot run contract config SHA-256 mismatch")
         run_contract_sha256 = sha256_file(run_contract_path)
+
+    stage2_runtime_artifacts: Dict[str, object] | None = None
+    current_execution_fingerprint = (
+        dict(stage2_execution_fingerprint)
+        if stage2_execution_fingerprint is not None
+        else execution_fingerprint()
+    )
+    if stage2_mode:
+        if stage2_verified_contract is None:
+            raise ValueError("Stage2 resume requires the verified input run contract")
+        if re.fullmatch(r"[0-9a-f]{64}", str(stage2_run_contract_sha256)) is None:
+            raise ValueError("Stage2 resume requires a verified run-contract SHA-256")
+        stage2_runtime_artifacts = verify_stage2_runtime_artifacts(
+            run_dir,
+            stage2_verified_contract,
+            str(stage2_run_contract_sha256),
+            run_config_sha256,
+            current_execution_fingerprint,
+            input_run_contract_path=str(args.stage2_run_contract),
+        )
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if not isinstance(checkpoint, Mapping):
@@ -2041,17 +2875,41 @@ def load_resume_checkpoint(
         raise ValueError("resume risk-objective capability contract mismatch")
     if checkpoint["segmentation_loss_implementation"] != expected_segmentation_loss:
         raise ValueError("resume checkpoint segmentation-loss implementation mismatch")
-    if checkpoint["execution_fingerprint"] != execution_fingerprint():
+    if checkpoint["execution_fingerprint"] != current_execution_fingerprint:
         raise ValueError(
             "resume source-tree/runtime execution fingerprint mismatch"
         )
     if pilot_mode and checkpoint.get("run_contract_sha256") != run_contract_sha256:
         raise ValueError("pilot checkpoint run-contract SHA-256 mismatch")
+    if stage2_mode:
+        assert stage2_verified_contract is not None
+        assert stage2_runtime_artifacts is not None
+        replayed_runtime = verify_stage2_checkpoint_provenance(
+            checkpoint,
+            run_dir,
+            stage2_verified_contract,
+            str(stage2_run_contract_sha256),
+            run_config_sha256,
+            current_execution_fingerprint,
+            input_run_contract_path=str(args.stage2_run_contract),
+            expected_runtime_artifacts=stage2_runtime_artifacts,
+        )
+        if replayed_runtime != stage2_runtime_artifacts:
+            raise RuntimeError("Stage2 runtime closure changed during resume preflight")
 
     completed_epoch = int(checkpoint["epoch"])
     if completed_epoch < 0:
         raise ValueError("resume checkpoint epoch must be non-negative")
-    if _last_metrics_epoch(run_dir / "metrics.jsonl") != completed_epoch:
+    if stage2_mode:
+        _verify_stage2_adjacent_sidecar(
+            run_dir, "metrics.jsonl", "Stage2 metrics artifact"
+        )
+        metrics_path = _stage2_run_file(
+            run_dir, "metrics.jsonl", "metrics.jsonl", "Stage2 metrics artifact"
+        )
+    else:
+        metrics_path = run_dir / "metrics.jsonl"
+    if _last_metrics_epoch(metrics_path) != completed_epoch:
         raise ValueError("resume metrics.jsonl and checkpoint_last.pt epochs disagree")
     start_epoch = completed_epoch + 1
     if args.epochs <= start_epoch:
@@ -2065,7 +2923,12 @@ def load_resume_checkpoint(
     _load_model_state_dict(model, state_dict)
     optimizer.load_state_dict(checkpoint["optimizer"])
     _restore_rng_state(checkpoint["rng_state"])
-    return run_dir, start_epoch, run_config_sha256, config
+    result = (run_dir, start_epoch, run_config_sha256, config)
+    if return_stage2_runtime_artifacts:
+        if not stage2_mode or stage2_runtime_artifacts is None:
+            raise ValueError("Stage2 runtime artifacts were requested outside Stage2 mode")
+        return (*result, stage2_runtime_artifacts)
+    return result
 
 
 def save_checkpoint(
@@ -2080,7 +2943,12 @@ def save_checkpoint(
     run_config_sha256: str,
     execution_fingerprint_payload: Mapping[str, object] | None = None,
     run_contract_sha256: str | None = None,
+    stage2_runtime_artifacts: Mapping[str, object] | None = None,
+    stage2_verified_contract: Mapping[str, object] | None = None,
 ) -> None:
+    checkpoint_execution_fingerprint = dict(
+        execution_fingerprint_payload or execution_fingerprint()
+    )
     payload = {
         "format_version": DETECTOR_CHECKPOINT_FORMAT,
         "state_dict": model_state_dict(model),
@@ -2108,23 +2976,148 @@ def save_checkpoint(
         "detector_capability_contract": detector_capability_contract(args),
         "protocol_scope": protocol_scope(args, names),
         "epoch_metrics": epoch_metrics,
-        "training_args": dict(vars(args)),
+        "training_args": serialised_training_args(args),
         "resume_contract": resume_contract(args),
         "rng_state": _rng_state(),
         "run_config_sha256": run_config_sha256,
-        "execution_fingerprint": dict(
-            execution_fingerprint_payload or execution_fingerprint()
-        ),
+        "execution_fingerprint": checkpoint_execution_fingerprint,
     }
     if run_contract_sha256 is not None:
         if re.fullmatch(r"[0-9a-f]{64}", run_contract_sha256) is None:
             raise ValueError("run_contract_sha256 must be a lowercase SHA-256 digest")
         payload["run_contract_sha256"] = run_contract_sha256
+    if stage2_runtime_artifacts is not None:
+        if stage2_verified_contract is None:
+            raise ValueError("Stage2 checkpoint requires the verified run contract")
+        if run_contract_sha256 is None:
+            raise ValueError("Stage2 checkpoint requires the input run-contract SHA-256")
+        payload.update(
+            {
+                "detector_role": args.stage2_detector_role,
+                "oof_fold_index": args.stage2_oof_fold_index,
+                "official_test_accessed": False,
+                "stage2_runtime_artifacts": dict(stage2_runtime_artifacts),
+            }
+        )
+        verified_runtime = verify_stage2_checkpoint_provenance(
+            payload,
+            run_dir,
+            stage2_verified_contract,
+            run_contract_sha256,
+            run_config_sha256,
+            checkpoint_execution_fingerprint,
+            input_run_contract_path=str(args.stage2_run_contract),
+            expected_runtime_artifacts=stage2_runtime_artifacts,
+        )
+        payload["stage2_runtime_artifacts"] = verified_runtime
     temporary = run_dir / "checkpoint_last.pt.tmp"
     torch.save(payload, temporary)
     checkpoint_path = run_dir / "checkpoint_last.pt"
     os.replace(temporary, checkpoint_path)
     write_checkpoint_sha256(checkpoint_path)
+
+
+def save_stage2_inference_checkpoint(
+    run_dir: Path,
+    model: nn.Module,
+    epoch: int,
+    args: argparse.Namespace,
+    names: List[str],
+    detector_source_records: List[Dict[str, object]],
+    run_config_sha256: str,
+    input_run_contract_sha256: str,
+    stage2_runtime_artifacts: Mapping[str, object],
+    stage2_verified_contract: Mapping[str, object],
+    execution_fingerprint_payload: Mapping[str, object],
+) -> Dict[str, str]:
+    """Write a tensors/primitives-only checkpoint for restricted consumers."""
+
+    if not getattr(args, "stage2_run_contract", None):
+        raise ValueError("restricted Stage2 checkpoint requires contract mode")
+    root = _stage2_run_directory(run_dir)
+    for label, digest in (
+        ("run config", run_config_sha256),
+        ("input run contract", input_run_contract_sha256),
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None:
+            raise ValueError(f"invalid {label} SHA-256")
+    verified_runtime = verify_stage2_runtime_artifacts(
+        root,
+        stage2_verified_contract,
+        input_run_contract_sha256,
+        run_config_sha256,
+        execution_fingerprint_payload,
+        input_run_contract_path=str(args.stage2_run_contract),
+    )
+    if dict(stage2_runtime_artifacts) != verified_runtime:
+        raise ValueError("restricted Stage2 checkpoint runtime closure mismatch")
+    # A plain dict of tensors plus JSON primitives is accepted by the fixed
+    # PyTorch 2.9 restricted unpickler.  Optimizer and RNG objects intentionally
+    # remain only in checkpoint_last.pt and are never needed by W03 inference.
+    payload: Dict[str, object] = {
+        "format_version": "rc-irstd.detector-inference.v1",
+        "state_dict": {
+            str(key): value.detach().cpu()
+            for key, value in model_state_dict(model).items()
+        },
+        "epoch": int(epoch),
+        "seed": int(args.seed),
+        "source_names": list(names),
+        "detector_source_records": detector_source_records,
+        "outer_fold_id": args.outer_fold_id,
+        "outer_target": args.outer_target,
+        "held_out_domains": sorted(set(args.held_out_domains or [])),
+        "detector_role": args.stage2_detector_role,
+        "oof_fold_index": args.stage2_oof_fold_index,
+        "checkpoint_selection": "fixed_last_no_test_or_target_validation",
+        "risk_objective_contract": risk_objective_contract(args),
+        "segmentation_loss_implementation": stage1_segmentation_loss_implementation(),
+        "run_config_sha256": run_config_sha256,
+        "run_contract_sha256": input_run_contract_sha256,
+        "stage2_runtime_artifacts": verified_runtime,
+        "training_args": {
+            "base_size": int(args.base_size),
+            "crop_size": int(args.crop_size),
+            "resize_mode": "resize",
+        },
+        "inference_geometry": {
+            "input_hw": [int(args.base_size), int(args.base_size)],
+            "resize_mode": "resize",
+        },
+        "official_test_accessed": False,
+    }
+    temporary = root / "stage2_inference_checkpoint.pt.tmp"
+    torch.save(payload, temporary)
+    checkpoint = root / "stage2_inference_checkpoint.pt"
+    os.replace(temporary, checkpoint)
+    binding = write_artifact_sha256(checkpoint)
+    # Test the actual production bytes through the restricted loader before
+    # publishing the binding to downstream exporters.
+    published_binding = _verify_stage2_adjacent_sidecar(
+        root,
+        "stage2_inference_checkpoint.pt",
+        "restricted Stage2 inference checkpoint",
+    )
+    if binding != published_binding:
+        raise RuntimeError("restricted Stage2 checkpoint binding changed after publish")
+    replay = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if not isinstance(replay, Mapping) or replay.get("format_version") != payload["format_version"]:
+        raise RuntimeError("restricted Stage2 inference-checkpoint replay failed")
+    if replay.get("run_contract_sha256") != input_run_contract_sha256:
+        raise RuntimeError("restricted Stage2 checkpoint provenance mismatch")
+    replayed_runtime = verify_stage2_checkpoint_provenance(
+        replay,
+        root,
+        stage2_verified_contract,
+        input_run_contract_sha256,
+        run_config_sha256,
+        execution_fingerprint_payload,
+        input_run_contract_path=str(args.stage2_run_contract),
+        expected_runtime_artifacts=verified_runtime,
+    )
+    if replayed_runtime != verified_runtime:
+        raise RuntimeError("restricted Stage2 checkpoint provenance replay drift")
+    return binding
 
 
 def gradient_norm_and_finite(model: nn.Module) -> Tuple[float, bool]:
@@ -2637,6 +3630,13 @@ def train_one_epoch(
 
 def main() -> None:
     args = parse_args()
+    stage2_verified_contract: Mapping[str, object] | None = None
+    stage2_run_contract_sha256: str | None = None
+    if getattr(args, "stage2_run_contract", None):
+        stage2_verified_contract, stage2_run_contract_sha256 = (
+            verify_stage2_run_contract_sidecar(args.stage2_run_contract)
+        )
+        bind_stage2_run_contract_to_args(args, stage2_verified_contract)
     _validate_args(args)
     names = source_names(args)
     held_out_domains = set(args.held_out_domains or [])
@@ -2657,8 +3657,16 @@ def main() -> None:
     seed_everything(args.seed, args.deterministic)
     device = select_device(args.device)
 
-    datasets = build_source_datasets(args, names)
-    detector_source_records = build_detector_source_records(names, datasets)
+    if stage2_verified_contract is None:
+        datasets = build_source_datasets(args, names)
+        detector_source_records = build_detector_source_records(names, datasets)
+    else:
+        datasets = build_source_datasets_from_stage2_contract(
+            args, stage2_verified_contract
+        )
+        detector_source_records = build_stage2_detector_source_records(
+            names, datasets, stage2_verified_contract
+        )
     loader = BalancedDomainLoader(
         datasets,
         args.batch_per_domain,
@@ -2689,7 +3697,7 @@ def main() -> None:
 
     run_execution_fingerprint = execution_fingerprint()
     current_config = {
-        **vars(args),
+        **serialised_training_args(args),
         # Runtime dataset construction resolves these paths internally, but
         # the persisted experiment contract retains the user's portable form.
         "source_dirs": [str(Path(path).expanduser()) for path in args.source_dirs],
@@ -2718,11 +3726,26 @@ def main() -> None:
     }
     if pilot_release_binding is not None:
         current_config["pilot_release_binding"] = pilot_release_binding
+    if stage2_verified_contract is not None:
+        current_config["stage2_input_run_contract"] = {
+            "path": Path(str(args.stage2_run_contract))
+            .expanduser()
+            .resolve()
+            .relative_to(STAGE2_REPOSITORY_ROOT)
+            .as_posix(),
+            "sha256": stage2_run_contract_sha256,
+            "schema_version": stage2_verified_contract["schema_version"],
+            "run_id": stage2_verified_contract["run_id"],
+            "bindings": stage2_verified_contract["bindings"],
+            "official_test_accessed": False,
+        }
     if args.resume is None:
         run_dir = create_run_dir(args)
         config = current_config
         write_json(run_dir / "config.json", config)
         run_config_sha256 = sha256_file(run_dir / "config.json")
+        if stage2_verified_contract is not None:
+            write_artifact_sha256(run_dir / "config.json")
         run_contract_sha256 = (
             write_aaai27_pilot_run_artifacts(
                 run_dir,
@@ -2734,11 +3757,23 @@ def main() -> None:
                 run_execution_fingerprint,
             )
             if pilot_release_binding is not None
+            else stage2_run_contract_sha256
+        )
+        stage2_runtime_artifacts = (
+            write_stage2_runtime_artifacts(
+                run_dir,
+                args,
+                stage2_verified_contract,
+                str(stage2_run_contract_sha256),
+                run_config_sha256,
+                run_execution_fingerprint,
+            )
+            if stage2_verified_contract is not None
             else None
         )
         start_epoch = 0
     else:
-        run_dir, start_epoch, run_config_sha256, config = load_resume_checkpoint(
+        resume_result = load_resume_checkpoint(
             args,
             model,
             optimizer,
@@ -2746,11 +3781,26 @@ def main() -> None:
             detector_source_records,
             device,
             pilot_release_binding,
+            stage2_run_contract_sha256,
+            stage2_verified_contract,
+            run_execution_fingerprint,
+            stage2_verified_contract is not None,
         )
+        if stage2_verified_contract is not None:
+            (
+                run_dir,
+                start_epoch,
+                run_config_sha256,
+                config,
+                stage2_runtime_artifacts,
+            ) = resume_result
+        else:
+            run_dir, start_epoch, run_config_sha256, config = resume_result
+            stage2_runtime_artifacts = None
         run_contract_sha256 = (
             sha256_file(run_dir / "run_contract.json")
             if pilot_release_binding is not None
-            else None
+            else stage2_run_contract_sha256
         )
     # The full content-addressed source records can be hundreds of kilobytes;
     # keep them in config.json without flooding scheduler/stdout logs.
@@ -2782,6 +3832,14 @@ def main() -> None:
         "pilot_run_id": getattr(args, "pilot_run_id", None),
         "run_contract_sha256": run_contract_sha256,
     }
+    if stage2_verified_contract is not None:
+        startup_summary.update(
+            {
+                "stage2_run_id": stage2_verified_contract["run_id"],
+                "stage2_detector_role": stage2_verified_contract["detector_role"],
+                "official_test_accessed": False,
+            }
+        )
     print(json.dumps(startup_summary, indent=2, sort_keys=True))
 
     metrics_path = run_dir / "metrics.jsonl"
@@ -2796,6 +3854,8 @@ def main() -> None:
             epoch,
         )
         append_jsonl(metrics_path, epoch_metrics)
+        if stage2_verified_contract is not None:
+            write_artifact_sha256(metrics_path)
         save_checkpoint(
             run_dir,
             model,
@@ -2808,7 +3868,24 @@ def main() -> None:
             run_config_sha256,
             run_execution_fingerprint,
             run_contract_sha256,
+            stage2_runtime_artifacts,
+            stage2_verified_contract,
         )
+        if stage2_verified_contract is not None:
+            assert stage2_runtime_artifacts is not None
+            save_stage2_inference_checkpoint(
+                run_dir,
+                model,
+                epoch,
+                args,
+                names,
+                detector_source_records,
+                run_config_sha256,
+                str(stage2_run_contract_sha256),
+                stage2_runtime_artifacts,
+                stage2_verified_contract,
+                run_execution_fingerprint,
+            )
         print(json.dumps(epoch_metrics, sort_keys=True))
 
     temporary = run_dir / "weights_last.pt.tmp"

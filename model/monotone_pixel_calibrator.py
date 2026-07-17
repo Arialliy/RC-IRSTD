@@ -419,7 +419,7 @@ class MonotoneNoRejectPixelRiskCalibrator(MonotonePixelBudgetCalibrator):
     points, query labels are consumed only by the separate meta-training loss,
     and deployment emits thresholds rather than an abstention decision.
 
-    This class is the checkpoint-v5 Stage-2 target.  Legacy reject-aware APIs
+    This class is the checkpoint-v6 Stage-2 target.  Legacy reject-aware APIs
     remain separate baselines and retain their original contracts.
     """
 
