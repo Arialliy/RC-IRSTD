@@ -1,5 +1,10 @@
 # RC-IRSTD AAAI-27：完整模型设计冻结与实验执行计划
 
+> **RC5 覆盖警告：本文仅保留为 RC4 历史记录。RC5 的唯一候选设计与冻结门见
+> [RC-IRSTD_AAAI27_RC5_完整模型设计与冻结门_20260717.md](RC-IRSTD_AAAI27_RC5_完整模型设计与冻结门_20260717.md)。
+> 本文中的 fixed Q28、clipped-logit 阈值表示、3107-3140 维输入、checkpoint-v6
+> 以及旧 bootstrap 合同均不得用于 RC5 的训练、恢复、部署、审计或结果解释。**
+
 > 状态：**08:00 前冻结中的 result-free 设计合同**  
 > 仓库：`/home/md0/ly/RC-IRSTD`  
 > 数据：仅 `NUAA-SIRST`、`NUDT-SIRST`、`IRSTD-1K` 的冻结 official-train-derived 划分  

@@ -1,0 +1,16 @@
+id,title,year,venue,cluster,type,relation,insight,completeness,numeric_evidence,risk,url
+1,"Learning for Transductive Threshold Calibration in Open-World Recognition",2024,CVPR,"threshold calibration",method,Conceptual,5,4,5,high,https://openaccess.thecvf.com/content/CVPR2024/html/Zhang_Learning_for_Transductive_Threshold_Calibration_in_Open-World_Recognition_CVPR_2024_paper.html
+2,"ADA-IRSTD: Active Domain Adaptation for Cross-Domain Infrared Small Target Detection",2026,JSTARS,"cross-domain IRSTD",method,Conceptual,4,4,4,high,https://doi.org/10.1109/JSTARS.2026.3702610
+3,"Rethinking Generalizable Infrared Small Target Detection",2025,arXiv,"cross-domain IRSTD","method+benchmark",Contextual,4,4,4,medium,https://arxiv.org/abs/2504.16487
+4,"Rethinking Representations for Cross-Domain IRSTD: A Generalizable Perspective from the Frequency Domain",2026,arXiv,"cross-domain IRSTD",method,Contextual,4,4,3,medium,https://arxiv.org/abs/2604.01934
+5,"Cross-domain Joint Learning with Prototype-guided Mixture-of-Experts for Infrared Moving Small Target Detection",2026,AAAI,"cross-domain moving IRSTD",method,Contextual,4,4,4,medium,https://ojs.aaai.org/index.php/AAAI/article/view/37373
+6,"Rethinking Evaluation of Infrared Small Target Detection",2025,"NeurIPS Datasets and Benchmarks","IRSTD evaluation",benchmark,Contextual,4,5,NA,medium,https://arxiv.org/abs/2509.16888
+7,"Infrared Small Target Detection with Scale and Location Sensitivity",2024,CVPR,"strong IRSTD",method,Contextual,4,4,5,low,https://openaccess.thecvf.com/content/CVPR2024/html/Liu_Infrared_Small_Target_Detection_with_Scale_and_Location_Sensitivity_CVPR_2024_paper.html
+8,"Seeing Through the Noise: Improving Infrared Small Target Detection and Segmentation from Noise Suppression Perspective",2026,CVPR,"false-alarm-oriented IRSTD",method,Contextual,4,4,4,medium,https://openaccess.thecvf.com/content/CVPR2026/html/Yuan_Seeing_Through_the_Noise_Improving_Infrared_Small_Target_Detection_and_CVPR_2026_paper.html
+9,"Fully Test-time Adaptation for Object Detection",2024,CVPRW,"unlabeled TTOD",method,Conceptual,3,3,4,medium,https://openaccess.thecvf.com/content/CVPR2024W/MAT/html/Ruan_Fully_Test-time_Adaptation_for_Object_Detection_CVPRW_2024_paper.html
+10,"Test-time Recalibration of Conformal Predictors Under Distribution Shift Based on Unlabeled Examples",2022,arXiv,"unlabeled recalibration",method,Conceptual,4,3,4,high,https://arxiv.org/abs/2210.04166
+11,"Calibrating Without Labels: Source-Free Conformal Prediction Using Pseudo-Labels",2025,PMLR,"unlabeled conformal",method,Conceptual,4,4,5,high,https://proceedings.mlr.press/v266/angelman25a.html
+12,"Conformal Risk Control",2024,ICLR,"risk control","theory+method",Conceptual,5,5,4,medium,https://openreview.net/forum?id=33XGfHLtZg
+13,"High Probability Risk Control Under Covariate Shift",2025,PMLR,"shifted risk control","theory+method",Conceptual,4,4,4,medium,https://proceedings.mlr.press/v266/almeida25a.html
+14,"Controlling False Positives in Image Segmentation via Conformal Prediction",2025,arXiv,"segmentation FP control",method,Conceptual,4,3,3,high,https://arxiv.org/abs/2511.15406
+15,"Neyman-Pearson Classification under Both Null and Alternative Distributions Shift",2026,ICLR,"transfer NP",theory,Conceptual,5,4,2,medium,https://openreview.net/forum?id=pHckxhmBlI

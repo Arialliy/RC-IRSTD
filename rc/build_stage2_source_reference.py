@@ -807,6 +807,113 @@ def _verify_window_manifest(
     rechecks: list[tuple[Path, str]],
 ) -> dict[str, Any]:
     payload = _read_json_stable(path, expected_sha256, "consumer window manifest")
+    # RC5 is an additive, mutually exclusive consumer contract.  Keep the
+    # original fixed-Q28 branch below byte-for-byte strict; a manifest enters
+    # this branch only by the exact variable-Q schema identifier and is then
+    # replayed by its own public verifier.
+    if payload.get("schema_version") == (
+        "rc-irstd.stage2-role-pure-variable-query-windows.v2"
+    ):
+        from data_ext.stage2_variable_query_window import (
+            verify_stage2_variable_query_window,
+        )
+
+        verified = verify_stage2_variable_query_window(
+            path, expected_sha256, repository_root=root
+        )
+        variable = verified.payload
+        for name, expected in {
+            "outer_fold_id": run_contract["outer_fold_id"],
+            "outer_target_domain": run_contract["outer_target_domain"],
+        }.items():
+            if variable[name] != expected:
+                raise ValueError(
+                    f"variable-Q consumer window {name} must equal {expected!r}"
+                )
+
+        run_sources = tuple(run_contract["source_domains"])
+        domain = _string(variable["domain"], "variable-Q consumer domain")
+        if detector_role == "detector_oof":
+            if variable["episode_role"] != "stage2_oof_fit":
+                raise ValueError(
+                    "OOF variable-Q consumers must be stage2_oof_fit"
+                )
+            if (
+                variable["source_role"] != "detector_fit"
+                or domain not in run_sources
+            ):
+                raise ValueError(
+                    "OOF variable-Q consumer must be a source detector_fit window"
+                )
+            if variable["oof_fold_index"] != oof_fold_index:
+                raise ValueError(
+                    "OOF variable-Q consumer fold differs from the reference detector"
+                )
+        else:
+            if variable["oof_fold_index"] is not None:
+                raise ValueError(
+                    "full-fit variable-Q consumer oof_fold_index must be null"
+                )
+            if variable["source_role"] != "detector_diagnostic":
+                raise ValueError(
+                    "full-fit variable-Q consumers require detector_diagnostic records"
+                )
+            expected_episode = (
+                "source_diagnostic_validation"
+                if domain in run_sources
+                else "outer_target_diagnostic_development"
+            )
+            if variable["episode_role"] != expected_episode:
+                raise ValueError(
+                    "full-fit variable-Q consumer domain/episode role mismatch"
+                )
+            if (
+                expected_episode == "outer_target_diagnostic_development"
+                and domain != run_contract["outer_target_domain"]
+            ):
+                raise ValueError(
+                    "outer-target variable-Q consumer domain mismatch"
+                )
+
+        materialization = run_contract.get("bindings", {}).get(
+            "materialization_artifacts_sha256"
+        )
+        if not isinstance(materialization, Mapping):
+            raise TypeError(
+                "run contract materialization_artifacts_sha256 is missing"
+            )
+        relative = path.relative_to(root).as_posix()
+        if materialization.get(relative) != expected_sha256:
+            raise ValueError(
+                "variable-Q consumer is not bound by the detector run contract"
+            )
+        _window_binding(
+            variable["role_binding"],
+            name="variable-Q consumer role_binding",
+            root=root,
+            materialization_hashes=materialization,
+            rechecks=rechecks,
+        )
+        for name in sorted(variable["bound_inputs"]):
+            _window_binding(
+                variable["bound_inputs"][name],
+                name=f"variable-Q consumer bound_inputs.{name}",
+                root=root,
+                materialization_hashes=None,
+                rechecks=rechecks,
+            )
+        records = tuple(verified.ordered_records)
+        rechecks.append((path, expected_sha256))
+        return {
+            "path": relative,
+            "sha256": expected_sha256,
+            "domain": domain,
+            "episode_role": variable["episode_role"],
+            "complete_window_count": variable["complete_window_count"],
+            "record_count": len(records),
+            "records": records,
+        }
+
     _exact_keys(payload, _WINDOW_TOP_FIELDS, "consumer window manifest")
     exact_values = {
         "schema_version": "rc-irstd.stage2-role-pure-c14q28-windows.v1",

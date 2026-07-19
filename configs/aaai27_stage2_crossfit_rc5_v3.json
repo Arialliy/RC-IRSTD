@@ -1,0 +1,526 @@
+{
+  "schema_version": "rc-irstd.aaai27-stage2-crossfit-config.v3",
+  "artifact_status": "RESULT_FREE_FROZEN_CONFIGURATION",
+  "contains_observed_results": false,
+  "official_test_accessed": false,
+  "context_feature_dim": 93,
+  "development_geometry": {
+    "schema_version": "rc-irstd.stage2-variable-query-geometry.v1",
+    "context_size": 14,
+    "minimum_query_size": 28,
+    "minimum_window_size": 42,
+    "window_count_rule": "floor(N/(context_size+minimum_query_size))",
+    "query_size_policy": "balanced_all_remaining_over_frozen_window_count_v1",
+    "construction": "ordered_non_overlapping_contiguous_variable_query_blocks_context_first_query_second_all_records",
+    "all_records_consumed": true,
+    "per_window_query_size": "dynamic_manifest_bound"
+  },
+  "source_training_episode_contract": {
+    "schema_version": "rc-irstd.stage2-source-cyclic-training-geometry.v1",
+    "scope": "source_oof_training_only",
+    "required_verified_role": "oof_holdout_stage2_fit",
+    "minimum_ordered_role_record_count": 42,
+    "episode_count_rule": "ordered_role_record_count",
+    "cyclic_start_domain": "every_integer_in_[0,N)",
+    "context_size": 14,
+    "query_size": 28,
+    "index_rule": "(cyclic_start + local_offset) % ordered_role_record_count",
+    "within_episode_context_query_disjoint": true,
+    "context_frequency_per_record": 14,
+    "query_frequency_per_record": 28,
+    "forbidden_roles": [
+      "source_diagnostic_validation",
+      "outer_target_diagnostic_development"
+    ],
+    "source_validation_selection_geometry": "source_validation_cyclic_selection_view_c14_q28_all_n_starts",
+    "source_validation_sanity_geometry": "mandatory_variable_query_all_records_consumed_once",
+    "outer_geometry": "mandatory_variable_query_all_records_consumed_once",
+    "three_geometries_interchangeable": false,
+    "pooled_cyclic_episode_count_by_source_domain": {
+      "NUAA-SIRST": 170,
+      "NUDT-SIRST": 509,
+      "IRSTD-1K": 638
+    },
+    "raw_total_by_outer_fold": {
+      "outer_leave_nuaa_sirst": 1147,
+      "outer_leave_nudt_sirst": 808,
+      "outer_leave_irstd_1k": 679
+    },
+    "sampler": {
+      "schema_version": "rc-irstd.stage2-domain-balanced-cyclic-epoch-sampler.v1",
+      "algorithm_id": "sha256_fixed_permutation_rotating_slice_domain_pairs_v1",
+      "name": "equal_source_domain_without_replacement_rotating_subset",
+      "implementation_status": "LIVE_IMPLEMENTED_AND_TRAINER_INTEGRATED_S2_I0",
+      "source_domain_count": 2,
+      "draws_per_domain_per_epoch": "min(total_episodes_across_the_two_source_domains)",
+      "epoch_size_rule": "2*min(total_episodes_across_the_two_source_domains)",
+      "without_replacement_within_domain_epoch": true,
+      "rotating_subset_across_epochs": true,
+      "ordered_unit": "one_episode_per_source_domain_per_domain_pair",
+      "frozen_even_batch_size": 16,
+      "exact_batch_domain_split": "8_per_source_domain",
+      "epoch_tail_domain_balanced": true,
+      "domain_balance_guarantee": "sampler_exact_equal_domain",
+      "seed_source": "verified_training_manifest_only",
+      "python_builtin_hash_forbidden": true,
+      "manual_seed_override_forbidden": true,
+      "ordered_selection_digest": "sha256-canonical-json-domain-balanced-epoch-selection-v1",
+      "dataloader_shuffle_forbidden": true,
+      "trainer_consumes_ordered_selection": true,
+      "resume_order_byte_replay_required": true
+    },
+    "epoch_size_by_outer_fold": {
+      "outer_leave_nuaa_sirst": 1018,
+      "outer_leave_nudt_sirst": 340,
+      "outer_leave_irstd_1k": 340
+    }
+  },
+  "pixel_budget_grid": [
+    0.0001,
+    0.00001,
+    0.000001
+  ],
+  "pixel_budget_exact_rationals": [
+    [
+      1,
+      10000
+    ],
+    [
+      1,
+      100000
+    ],
+    [
+      1,
+      1000000
+    ]
+  ],
+  "budget_integerization_contract": {
+    "count_formula": "(numerator * pixel_count) // denominator",
+    "applies_to": [
+      "T4_analytic_anchor_exact_order_statistic",
+      "oracle_feasible_false_positive_count",
+      "exact_curve_replay_budget_count"
+    ],
+    "float_product_for_count_forbidden": true,
+    "fraction_from_float_forbidden": true,
+    "fa_pixel_denominator": "all_native_resolution_query_pixels",
+    "background_pixels_role": "conservative_estimability_only"
+  },
+  "primary_pixel_budget": 0.00001,
+  "threshold_semantics": "prediction = probability > threshold",
+  "threshold_representation": {
+    "schema_version": "rc-irstd.endpoint-aware-piecewise-tail-coordinate.v2",
+    "coordinate": "piecewise_identity_tail_log_survival",
+    "interior_encode": "p if p <= 0.5 else 0.5 - log(2 * (1 - p))",
+    "interior_decode": "s if s <= 0.5 else 0.5 - 0.5 * expm1(-(s - 0.5))",
+    "coordinate_compute_dtype": "float64",
+    "piecewise_split_probability_hex": "0x1.0000000000000p-1",
+    "piecewise_split_coordinate_hex": "0x1.0000000000000p-1",
+    "max_interior_probability_hex": "0x1.fffffffffffffp-1",
+    "max_interior_coordinate_hex": "0x1.245966f2b4f12p+5",
+    "upper_endpoint_coordinate_hex": "0x1.2c5966f2b4f12p+5",
+    "upper_endpoint_split_hex": "0x1.285966f2b4f12p+5",
+    "raw_coordinate_min_hex": "-0x1.0000000000000p+0",
+    "raw_coordinate_max_hex": "0x1.305966f2b4f12p+5",
+    "endpoint_gap_coordinate_units_hex": "0x1.0000000000000p+0",
+    "canonicalization": "hard_forward_identity_backward_v1",
+    "threshold_semantics": "prediction = probability > threshold",
+    "interior_kind": "interior",
+    "upper_endpoint_kind": "upper_endpoint"
+  },
+  "model": {
+    "hidden_dims": [
+      32
+    ],
+    "activation": "GELU",
+    "dropout": 0.1,
+    "raw_coordinate_bounds_hex": {
+      "minimum": "-0x1.0000000000000p+0",
+      "maximum": "0x1.305966f2b4f12p+5"
+    },
+    "minimum_raw_coordinate_gap": 0.001,
+    "reject_head": false,
+    "missing_episode_fallback": false,
+    "analytic_anchor": {
+      "source": "T4_exact_order_statistic",
+      "coordinate_contract": "required_float64_[batch,3]_canonical_nondecreasing",
+      "budget_order": "pixel_budget_grid_order",
+      "shared_across_methods": [
+        "T6",
+        "T7",
+        "T8"
+      ]
+    },
+    "global_convex_mix": {
+      "rule": "raw=(1-alpha)*anchor_coordinates+alpha*learned_raw",
+      "parameterization": "alpha=sigmoid(global_trainable_scalar_anchor_mix_logit)",
+      "initial_weight": 0.1,
+      "mix_stage": "before_hard_canonicalization_then_decode",
+      "global_across_budgets_and_examples": true,
+      "one_scalar_per_method": true
+    },
+    "methods": {
+      "T6": {
+        "class": "DirectEndpointAwarePixelCalibrator",
+        "objective": "endpoint_aware_coordinate_huber_only",
+        "structural_monotonicity": false,
+        "learned_curve": "direct",
+        "uses_shared_analytic_anchor": true,
+        "expected_trainable_parameters": 3108
+      },
+      "T7": {
+        "class": "MonotoneEndpointAwarePixelCalibrator",
+        "objective": "endpoint_aware_coordinate_huber_only",
+        "structural_monotonicity": true,
+        "learned_curve": "monotone",
+        "uses_shared_analytic_anchor": true,
+        "expected_trainable_parameters": 3141
+      },
+      "T8": {
+        "class": "MonotoneEndpointAwarePixelCalibrator",
+        "objective": "verified_global_exact_event_curve_piecewise_linear_risk_surrogate_plus_oracle_coordinate_huber",
+        "structural_monotonicity": true,
+        "learned_curve": "monotone",
+        "uses_shared_analytic_anchor": true,
+        "expected_trainable_parameters": 3141
+      }
+    }
+  },
+  "ablation_contract": {
+    "schema_version": "rc-irstd.stage2-preregistered-ablation-contract.v1",
+    "artifact_status": "RESULT_FREE_PREREGISTERED_ABLATIONS",
+    "contains_observed_results": false,
+    "claim_bearing_primary_method": "T8",
+    "runtime_method_flag_forbidden": true,
+    "checkpoint_v7_main_method_allowlist": [
+      "T6",
+      "T7",
+      "T8"
+    ],
+    "anchor_variants": {
+      "T4": {
+        "identity": "anchor_only",
+        "implementation": "T4_exact_order_statistic",
+        "analytic_anchor": true,
+        "learned_curve": false,
+        "objective": "not_applicable",
+        "expected_trainable_parameters": 0,
+        "artifact_role": "analytic_baseline",
+        "claim_bearing": false
+      },
+      "T8_NO_ANCHOR": {
+        "identity": "learned_only",
+        "class": "LearnedOnlyMonotoneEndpointAwarePixelCalibrator",
+        "analytic_anchor": false,
+        "learned_curve": true,
+        "objective": "verified_global_exact_event_curve_piecewise_linear_risk_surrogate_plus_oracle_coordinate_huber",
+        "expected_trainable_parameters": 3140,
+        "artifact_role": "risk_aligned_ablation_only",
+        "claim_bearing": false,
+        "checkpoint_v7_supported": false
+      },
+      "T8": {
+        "identity": "combined_anchor_plus_learned",
+        "class": "MonotoneEndpointAwarePixelCalibrator",
+        "analytic_anchor": true,
+        "learned_curve": true,
+        "objective": "verified_global_exact_event_curve_piecewise_linear_risk_surrogate_plus_oracle_coordinate_huber",
+        "expected_trainable_parameters": 3141,
+        "artifact_role": "claim_bearing_primary_method",
+        "claim_bearing": true,
+        "checkpoint_v7_supported": true
+      }
+    },
+    "mechanism_comparison_identities": {
+      "end_to_end_learned_correction": {
+        "contrast": "T8_minus_T4",
+        "question": "combined_learned_correction_value"
+      },
+      "structural_monotonicity": {
+        "contrast": "T7_minus_T6",
+        "question": "monotone_structure_value",
+        "held_fixed": [
+          "T4_analytic_anchor",
+          "endpoint_aware_coordinate_huber_objective",
+          "full_93D_features"
+        ]
+      },
+      "risk_aligned_objective": {
+        "contrast": "T8_minus_T7",
+        "question": "query_risk_aligned_objective_value",
+        "held_fixed": [
+          "T4_analytic_anchor",
+          "monotone_93_to_32_to_4_architecture",
+          "full_93D_features"
+        ]
+      },
+      "analytic_anchor": {
+        "contrast": "T8_minus_T8_NO_ANCHOR",
+        "question": "analytic_anchor_value",
+        "held_fixed": [
+          "verified_global_exact_event_curve_piecewise_linear_risk_surrogate_plus_oracle_coordinate_huber",
+          "monotone_93_to_32_to_4_learned_branch",
+          "full_93D_features"
+        ],
+        "transparent_parameter_difference": 1
+      }
+    },
+    "feature_comparison_identities": {
+      "reference": "C3_T8_full_features_0_92",
+      "fixed_except_feature_slice": [
+        "T8_model_identity",
+        "T8_loss",
+        "T4_analytic_anchor",
+        "outer_fold_seed_window_query_identity"
+      ],
+      "contrasts": [
+        {
+          "contrast": "T8_minus_C4",
+          "variant": "C4",
+          "feature_indices": "0-38",
+          "feature_set": "score_only"
+        },
+        {
+          "contrast": "T8_minus_C5",
+          "variant": "C5",
+          "feature_indices": "0-78",
+          "feature_set": "score_plus_peak"
+        },
+        {
+          "contrast": "T8_minus_C6",
+          "variant": "C6",
+          "feature_indices": "0-86",
+          "feature_set": "score_plus_peak_plus_gray_no_source_distance"
+        }
+      ]
+    },
+    "stage1_by_stage2_comparison_identities": {
+      "stage1_levels": [
+        "D0",
+        "D1",
+        "D2",
+        "D3"
+      ],
+      "stage2_levels": [
+        "T4",
+        "T8"
+      ],
+      "cell_identity": "D{stage1}_x_{stage2}_same_outer_fold_seed_window_query",
+      "stage1_contrasts_at_t8": [
+        "D3_minus_D0",
+        "D3_minus_D1",
+        "D3_minus_D2"
+      ],
+      "stage2_contrasts_within_each_stage1": [
+        "D0_T8_minus_D0_T4",
+        "D1_T8_minus_D1_T4",
+        "D2_T8_minus_D2_T4",
+        "D3_T8_minus_D3_T4"
+      ],
+      "interaction_contrasts": [
+        "(D3_T8_minus_D3_T4)_minus_(D0_T8_minus_D0_T4)",
+        "(D3_T8_minus_D3_T4)_minus_(D1_T8_minus_D1_T4)",
+        "(D3_T8_minus_D3_T4)_minus_(D2_T8_minus_D2_T4)"
+      ],
+      "stage1_segmentation_and_stage2_operating_point_reported_separately": true
+    },
+    "claim_policy": {
+      "one_comparison_one_mechanism_question": true,
+      "primary_gate_cannot_substitute_for_ablation": true,
+      "unsupported_mechanism_claim_must_be_deleted_or_narrowed": true
+    }
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "epsilon": 1e-08,
+    "amsgrad": false,
+    "scheduler": "none",
+    "batch_size": 16,
+    "max_epochs": 100,
+    "early_stopping_patience": 20,
+    "gradient_clip_norm": 5.0,
+    "num_workers": 0,
+    "deterministic_algorithms": true,
+    "amp": false,
+    "shuffle_training": false,
+    "custom_verified_epoch_sampler": true,
+    "drop_last": false
+  },
+  "loss": {
+    "name": "method_routed_endpoint_aware_v1",
+    "T6_T7_objective": "valid_oracle_EATC_coordinate_huber_only",
+    "T8_objective": "verified_global_exact_event_curve_piecewise_linear_differentiable_risk_surrogate_plus_oracle_EATC_coordinate_huber",
+    "exactness_scope": "verified_uncapped_event_set_and_adjacent_prediction_brackets_only",
+    "exact_discrete_risk_claim": false,
+    "coordinate_huber_delta": 1.0,
+    "lambda_violation": 4.0,
+    "lambda_utility": 1.0,
+    "lambda_oracle": 0.1,
+    "lambda_smoothness": 0.01,
+    "lambda_coverage": 0.0,
+    "coverage_term_policy": "removed_under_verified_global_exact_event_curve",
+    "verified_global_exact_event_curve": true,
+    "risk_interpolation": "piecewise_linear_differentiable_surrogate_between_adjacent_verified_events",
+    "cyclic_curve_provider_contract": {
+      "per_image_exact_curve_bank": true,
+      "aggregate_curve_materialization": false,
+      "episode_curve_composition": "live_compose_from_per_image_exact_curves",
+      "implementation_status": "LIVE_PROVIDER_BOUND_AND_AGGREGATE_ABSENT_S2_I0"
+    },
+    "risk_epsilon": 1e-12
+  },
+  "checkpoint_selection": {
+    "record_schema_version": "rc-irstd.calibrator-source-selection-record.v2",
+    "selection_geometry": "source_validation_cyclic_selection_view_c14_q28_all_n_starts",
+    "source_domain_weighting": "equal_one_half",
+    "within_domain_bsr": "equal_exhaustive_cyclic_start_mean",
+    "within_domain_log_excess": "equal_exhaustive_cyclic_start_mean",
+    "within_domain_pd": "pooled_tp_divided_by_pooled_gt_across_all_cyclic_starts",
+    "source_variable_query_sanity_excluded_from_epoch_ranking": true,
+    "cyclic_starts_claimed_independent": false,
+    "cyclic_start_confidence_interval_reported": false,
+    "rank": [
+      "macro_source_BSR_max",
+      "macro_source_LogExcess_min",
+      "macro_source_Pd_max",
+      "earlier_epoch_on_exact_tie"
+    ],
+    "outer_target_accessed": false
+  },
+  "collection_contract": {
+    "schema_version": "rc-irstd.stage2-source-cyclic-training-collection.v1",
+    "commit_schema_version": "rc-irstd.stage2-source-cyclic-training-collection-commit.v1",
+    "training_geometry_schema_version": "rc-irstd.stage2-source-cyclic-training-geometry.v1",
+    "source_selection_geometry_schema_version": "rc-irstd.stage2-source-validation-cyclic-selection-view.v1",
+    "source_sanity_and_outer_geometry_schema_version": "rc-irstd.stage2-variable-query-geometry.v1",
+    "three_geometries_interchangeable": false,
+    "required_bundle_members": [
+      "npy_mmap_arrays",
+      "identity_only_jsonl",
+      "manifest",
+      "commit_last"
+    ],
+    "external_sha256_required_for_every_member": true,
+    "statistics_config_external_sha256_required": true,
+    "statistics_config_shared_object_train_validation": true,
+    "train_role": "oof_holdout_stage2_fit",
+    "validation_role": "source_diagnostic_validation_detector_full_fit_only",
+    "both_source_domains_required": true,
+    "outer_target_absent": true,
+    "per_image_exact_curve_materialized_once": true,
+    "aggregate_cyclic_curve_materialized": false,
+    "cyclic_episode_jsonl_payload": "C14_Q28_identity_references_only",
+    "score_authority": "VerifiedStage2RC5ScoreBundleV2_replayed",
+    "run_complete_identity_bound": true,
+    "episode_weighting": "verified_equal_source_domain_sampler",
+    "standardizer_fit_scope": "training_contexts_only",
+    "standardizer_dtype": "float64",
+    "standardizer_scale_floor": 1e-08
+  },
+  "checkpoint_contract": {
+    "schema_version": "rc-irstd.calibrator.v7",
+    "artifact_kind": "immutable_endpoint_aware_deployment_state",
+    "deployment_state_only": true,
+    "training_state_fields_forbidden": [
+      "optimizer",
+      "epoch",
+      "rank",
+      "history",
+      "python_numpy_torch_cuda_dataloader_rng"
+    ],
+    "generation_commit_schema_version": "rc-irstd.calibrator-generation-commit.v2",
+    "run_commit_schema_version": "rc-irstd.calibrator-run-commit.v2",
+    "serialization": "torch_tensors_and_primitives_weights_only",
+    "immutable_epoch_generations": true,
+    "commit_published_last": true,
+    "resume_requires_external_generation_commit_sha256": true,
+    "threshold_representation_schema": "rc-irstd.endpoint-aware-piecewise-tail-coordinate.v2",
+    "reject_head": false,
+    "official_test_accessed": false
+  },
+  "seed_contract": {
+    "training_manifest_schema_version": "rc-irstd.stage2-seed-derivation-manifest.v1",
+    "bootstrap_factor_manifest_schema_version": "rc-irstd.stage2-bootstrap-factor-seed-manifest.v1",
+    "algorithm_id": "sha256_domain_separated_seed_v1",
+    "base_seeds": [
+      42,
+      123,
+      3407
+    ],
+    "method_roles": {
+      "T6": "baseline_t6_direct_mlp::not_applicable",
+      "T7": "baseline_t7_monotone_oracle::not_applicable",
+      "T8": "stage2_calibrator_t8::not_applicable"
+    },
+    "bootstrap_factor_roots": "separate_seed_factor_and_window_query_factor_per_domain",
+    "python_builtin_hash_forbidden": true,
+    "manual_seed_override_forbidden": true
+  },
+  "bootstrap_contract": {
+    "schema_version": "rc-irstd.stage2-crossed-paired-bootstrap.v1",
+    "protocol_id": "outer_fixed_seed_x_window_query_crossed_paired_bootstrap_v1",
+    "comparison": "T8_minus_T4",
+    "resamples": 10000,
+    "confidence_interval": {
+      "confidence_level": 0.95,
+      "method": "two_sided_percentile_hyndman_fan_type_7",
+      "quantiles": [
+        0.025,
+        0.975
+      ]
+    },
+    "domain_resampling": "none_fixed_equal_one_third",
+    "seed_factor": "resample_three_training_seeds_with_replacement",
+    "window_factor": "resample_frozen_window_count_with_replacement_once_per_domain_replicate",
+    "query_factor": "resample_actual_query_size_with_replacement_within_selected_window",
+    "factor_relation": "seed_crossed_with_window_query_hierarchy",
+    "shared_window_query_draw_across_selected_seed_slots": true,
+    "paired_methods": [
+      "T8",
+      "T4"
+    ],
+    "paired_indices_byte_identical": true,
+    "method_id_in_draw_preimage": false,
+    "selected_seed_in_window_query_preimage": false
+  },
+  "estimability_contract": {
+    "primary_budget": 0.00001,
+    "expected_background_false_positives_formula": "primary_budget * total_background_pixels",
+    "minimum_expected_background_false_positives": 20.0,
+    "comparison_operator": ">=",
+    "background_pixels_used_only_for_estimability": true,
+    "primary_fa_pixel_denominator": "all_native_resolution_query_pixels",
+    "inestimable_primary_cell_policy": "primary_gate_false_no_imputation"
+  },
+  "primary_gate": {
+    "comparison": "T8_minus_T4",
+    "confidence_interval_source": "crossed_paired_bootstrap",
+    "delta_macro_bsr": {
+      "point_estimate": {
+        "operator": ">=",
+        "value": 0.05
+      },
+      "confidence_interval_lower": {
+        "operator": ">",
+        "value": 0.0
+      }
+    },
+    "delta_macro_pd": {
+      "point_estimate": {
+        "operator": ">=",
+        "value": -0.02
+      },
+      "confidence_interval_lower": {
+        "operator": ">=",
+        "value": -0.02
+      }
+    },
+    "missing_or_nonfinite_policy": "gate_false_no_imputation"
+  }
+}
